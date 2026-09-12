@@ -55,7 +55,12 @@ export class ClaudeCodeJob extends ToolJob {
         (args) => this.externalTool(definition.name, args),
       );
     }
-    const workspace: McpSdkServerConfigWithInstance = { type: "sdk", name: "workspace", instance };
+    const workspace: McpSdkServerConfigWithInstance = {
+      type: "sdk",
+      name: "workspace",
+      instance,
+      timeout: Math.max(1000, this.execution.deadline - Date.now()),
+    };
     const session = query({
       prompt: this.execution.input
         .flatMap((message) => message.content.map((part) => part.text))

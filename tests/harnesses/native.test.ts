@@ -209,10 +209,17 @@ it.each<HarnessName>(["codex", "claude-code", "opencode"])(
         operationId: "cancel",
         command: { type: "cancel" },
       });
-      expect(
-        ((await (await fetch(`${server.url}/jobs/${cancelled.turnId}`)).json()) as RuntimeBatch)
-          .status,
-      ).toBe("cancelled");
+      await expect
+        .poll(
+          async () => {
+            const batch = (await (
+              await fetch(`${server.url}/jobs/${cancelled.turnId}`)
+            ).json()) as RuntimeBatch;
+            return batch.status;
+          },
+          { timeout: 5000, interval: 50 },
+        )
+        .toBe("cancelled");
     } finally {
       await supervisor?.stop();
       await server.close();
