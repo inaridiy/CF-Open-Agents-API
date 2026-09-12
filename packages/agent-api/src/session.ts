@@ -197,6 +197,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       turnId: id,
       generation: record.generation,
       agent: record.agent,
+      harness: record.driver,
       model: record.model,
       input,
       checkpoint: record.checkpoint,

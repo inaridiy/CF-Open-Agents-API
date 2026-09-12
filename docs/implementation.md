@@ -10,14 +10,16 @@ repository. No cloud resources were deployed and no paid model calls were made.
   deployable Worker example. Apache-2.0, contributor guide, and CI are included.
 - HTTP and Service Binding entrypoints sharing tenant catalogs and SessionDO state.
   Inputs, required actions, turns, output items and replayable events are durable.
-- Codex app-server in a harness Container and native exec-server in a separate
-  Sandbox SDK Container. Model credentials remain in a private Worker binding.
+- Codex app-server, Claude Agent SDK, or OpenCode server in a harness Container;
+  execution stays in a separate Sandbox SDK Container. Codex uses native exec-server;
+  Claude/OpenCode replace their execution tools. Model credentials remain in a private Worker binding.
 - Kysely `0.29.5` for every SQLite query and schema. Its compile-only components
   feed a synchronous execution bridge so `transactionSync` can roll back complete
   state transitions. `kysely-durable-objects@0.2.2` was probed and rejected because
   its async transaction boundary and SqlStorage types do not fit this runtime.
-- AI SDK 7 model factories, a concrete Workers AI provider example, bounded model
-  steps, external functions, and R2 message checkpoints.
+- Independent model adapters: instantiated AI SDK models (including Workers AI),
+  OpenAI-compatible endpoints, and native protocol passthrough. AI SDK performs
+  one inference; native harnesses retain their loops and R2 conversation checkpoints.
 - Common typed tools, web/corpus search presets, immutable skill bundles, integrity
   checks, progressive skill reads and a fresh-workspace provisioning hook.
 
@@ -36,7 +38,13 @@ repository. No cloud resources were deployed and no paid model calls were made.
    retries. Checkpoint references commit before a completed turn is published.
 6. Input validation and outbox writes share a transaction. Common expected RPC
    validation failures use result envelopes, avoiding platform error logs.
-7. SSE reads persisted pages under backpressure. Public item IDs are scoped to the
+7. Claude SDK's bundled Zod parser rejected current Zod optional/default properties
+   in a real MCP call. An installed official MCP server connected through the SDK
+   uses the matching parser and preserves one shared workspace schema.
+8. OpenCode background dependency installation is skipped for read-only config
+   directories. Its plugin and providers are already bundled; package caches are
+   excluded from durable native snapshots.
+9. SSE reads persisted pages under backpressure. Public item IDs are scoped to the
    turn even if a provider reuses its native IDs.
 
 ## Dependency and verification basis
@@ -45,12 +53,13 @@ Registry artifacts and actual exports were inspected on 2026-09-12. Versions are
 pinned in the lockfile. Sandbox package/image versions match exactly. The Workers
 Vitest pool requires Vitest 4.1; the runtime override aligns its workerd with Wrangler.
 
-Verified locally on 2026-09-12: 14 workerd integration tests passed, the native Codex
-protocol test passed (including external functions), and the two-Container smoke
-passed with skill provisioning and destruction/restore. Typecheck, lint, declaration
+Verified locally on 2026-09-12: 13 workerd integration tests, 10 native harness/model
+gateway tests, and the native Codex exec-server protocol test passed. The Container
+smoke passed for Codex, Claude Code and OpenCode, including write/edit/read/bash
+replacement for Claude/OpenCode, skill provisioning, and destruction/restore. Typecheck, lint, declaration
 builds, generated bindings, package assembly and the Worker deployment dry run passed.
 The packed tarball was also installed in a separate temporary consumer project;
-its Worker/Codex/AI SDK factory types compiled and its Node-compatible schema export
+its Worker, three-harness registry and AI SDK model factory types compiled and its Node-compatible schema export
 loaded successfully. The checked-in CI workflow repeats the main gates; hosted
 results are available in [GitHub Actions](https://github.com/inaridiy/CF-Open-Agents-API/actions).
 
@@ -61,7 +70,10 @@ Acceptance commands:
   local scripted Responses, native shell and external function calls, history
   restoration after deleting the original home. The shell reads a marker available
   only in the exec-server environment.
-- `pnpm test:containers`: real Worker and two Containers, native shell isolation,
+- `pnpm test:harnesses`: the actual three native harnesses, external tool waiting and
+  cancellation, checkpoint restoration, official SDK protocol clients, AI SDK model
+  instances, OpenAI-compatible/native presets, input limits and incomplete output.
+- `pnpm test:containers`: real Worker and two Containers per harness, native tool isolation,
   skill provisioning and R2 restore after destroying both Containers. A local
   scripted model supplies protocol responses; this is not model-quality evidence.
 - `pnpm types`, `pnpm deploy:check`, and `pnpm --filter cf-open-agents-api pack`: binding
@@ -71,6 +83,6 @@ The Container smoke runs in rootlesskit's actual network namespace on the initia
 Linux development host. Reproduction is in [deployment.md](deployment.md). Upstream
 local warnings are scoped in [known-issues.md](known-issues.md).
 
-Claude Code/OpenCode adapters, upstream subagent and artifact APIs, cross-harness
-forks, and managed knowledge indexing remain outside this alpha. The driver/tool
+Upstream subagent and artifact APIs, cross-harness forks, and managed knowledge
+indexing remain outside this alpha. The driver/tool
 interfaces and design explain how to add them; unsupported wire fields are rejected.

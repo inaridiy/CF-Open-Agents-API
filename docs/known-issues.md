@@ -5,7 +5,6 @@ blanket exemption for errors with a similar message.
 
 | Component | Reproduction / scope | Treatment / removal condition |
 | --- | --- | --- |
-| `@workflow/serde@4.1.0` through AI SDK 7 | `pnpm test` reports a sourcemap pointing to omitted source files in this dependency. | Dependency packaging issue; no runtime substitution or global log filtering. Remove this entry after a provider upgrade with complete maps. |
 | workerd `1.20260911.1` | Cancelling an SSE response after an SDK turn finishes can log `abortRead() has been called`. | API tests assert the complete turn and all streamed text before cancellation. Investigate any occurrence before completion; recheck on workerd upgrade. |
 | Sandbox `0.13.0-next.751.1` | Destroying a sandbox with a live exec-server process handle during the Container restore smoke can report an RPC stub not disposed. | The SDK's public `SandboxProcess` interface has no dispose method. The smoke explicitly destroys its Containers; no private SDK fields are accessed. Recheck the process-handle lifecycle on SDK upgrade. |
 | Containers local emulation | Wrangler prints FUSE / SYS_ADMIN / AppArmor privilege warnings. | These come from Cloudflare's Docker emulation. They are not production Worker privileges. Recheck when the SDK changes local backup requirements. |

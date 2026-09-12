@@ -6,6 +6,7 @@ const config = z
   .object({
     PORT: z.coerce.number().int().min(1).max(65_535).default(8080),
     CODEX_BINARY: z.string().default("codex"),
+    OPENCODE_BINARY: z.string().default("opencode"),
     STATE_DIRECTORY: z.string().default("/app/state"),
     MODEL_BASE_URL: z.url().default("http://model.internal/v1"),
     SANDBOX_URL: z.url().default("ws://sandbox.internal"),
@@ -13,6 +14,8 @@ const config = z
   .parse(process.env);
 const supervisor = createSupervisor({
   binary: config.CODEX_BINARY,
+  opencodeBinary: config.OPENCODE_BINARY,
+  supervisorUrl: `http://127.0.0.1:${config.PORT}`,
   directory: config.STATE_DIRECTORY,
   modelBaseUrl: config.MODEL_BASE_URL,
   sandboxUrl: config.SANDBOX_URL,

@@ -16,17 +16,13 @@
       {
         "name": "SCRIPTED",
         "class_name": "ScriptedHarness"
-      },
-      {
-        "name": "AI_HARNESS",
-        "class_name": "AIHarnessDO"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["SessionDO", "CatalogDO", "ScriptedHarness", "AIHarnessDO"]
+      "new_sqlite_classes": ["SessionDO", "CatalogDO", "ScriptedHarness"]
     }
   ],
   "r2_buckets": [

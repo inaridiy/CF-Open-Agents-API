@@ -116,6 +116,7 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
     sessionId: "sess_test",
     turnId: "turn_test",
     generation: 1,
+    harness: "codex",
     model: "gpt-5.4",
     agent: {
       model: "test",

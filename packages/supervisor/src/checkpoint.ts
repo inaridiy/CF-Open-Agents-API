@@ -17,13 +17,26 @@ export async function capture(home: string, threadId: string): Promise<NativeBun
   async function visit(relative: string): Promise<void> {
     for (const entry of await readdir(join(home, relative), { withFileTypes: true })) {
       const path = relative ? `${relative}/${entry.name}` : entry.name;
-      if (["config.toml", "environments.toml", "auth.json", "logs", "log", "tmp"].includes(path))
+      if (
+        [
+          "config.toml",
+          "environments.toml",
+          "auth.json",
+          "logs",
+          "log",
+          "tmp",
+          "cache",
+          ".npm",
+          ".cache",
+          "node_modules",
+        ].includes(entry.name)
+      )
         continue;
       if (entry.isDirectory()) await visit(path);
       else if (entry.isFile()) {
         const data = await readFile(join(home, path));
         bytes += data.length;
-        if (bytes > MAX_BYTES) throw new Error("Native checkpoint exceeds 32 MiB");
+        if (bytes > MAX_BYTES) throw new Error(`Native checkpoint exceeds 32 MiB at ${path}`);
         files[path] = Buffer.from(data).toString("base64");
       }
     }

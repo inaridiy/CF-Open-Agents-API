@@ -1,8 +1,11 @@
 import { Container } from "@cloudflare/containers";
 import { getSandbox, type ISandbox, Sandbox } from "@cloudflare/sandbox";
+import { HARNESSES, type HarnessName } from "./harnesses.js";
+import { readModelBody } from "./models/body.js";
 import { ApiError } from "./protocol.js";
 import type { Checkpoint, Execution, RuntimeCommand, RuntimeDriver } from "./runtime.js";
 import { batchSchema } from "./runtime.js";
+import { executeWorkspaceTool } from "./sandbox-tools.js";
 
 export interface ContainerBindings {
   HARNESS: DurableObjectNamespace<HarnessContainer>;
@@ -17,6 +20,7 @@ interface Assignment {
   generation: number;
   turnId: string;
   model: string;
+  harness: HarnessName;
   dispatched: boolean;
   sandbox: boolean;
 }
@@ -37,6 +41,7 @@ export class HarnessContainer<
   override sleepAfter = "10m";
   override enableInternet = false;
   private starting?: { turnId: string; promise: Promise<void> };
+  private workspaceOperation: Promise<unknown> = Promise.resolve();
   protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
   private async assignment(): Promise<Assignment> {
     const assignment = await this.ctx.storage.get<Assignment>("assignment");
@@ -51,17 +56,30 @@ export class HarnessContainer<
   private async sandboxRequest(request: Request): Promise<Response> {
     const assignment = await this.assignment();
     if (!assignment.sandbox) return new Response("No sandbox assigned", { status: 403 });
+    if (new URL(request.url).pathname === "/tools" && request.method === "POST") {
+      const input = await request.json();
+      const operation = this.workspaceOperation.then(() =>
+        executeWorkspaceTool(getSandbox(this.env.SANDBOX, assignment.sessionId), input),
+      );
+      this.workspaceOperation = operation.catch(() => {});
+      try {
+        return Response.json(await operation);
+      } catch {
+        return Response.json({ error: "Workspace operation failed" }, { status: 422 });
+      }
+    }
     return this.env.SANDBOX.getByName(assignment.sessionId).fetch(request);
   }
   async modelRequest(request: Request): Promise<Response> {
     const assignment = await this.assignment();
     const url = new URL(request.url);
-    if (request.method !== "POST" || url.pathname !== "/v1/responses")
+    if (request.method !== "POST" || url.pathname !== HARNESSES[assignment.harness].protocol)
       return new Response("Unsupported model request", { status: 403 });
-    const body = await request.clone().json<{ model?: string }>();
+    const bytes = await readModelBody(request);
+    const body = JSON.parse(new TextDecoder().decode(bytes)) as { model?: string };
     if (body.model !== assignment.model)
       return new Response("Model is not assigned to this execution", { status: 403 });
-    return this.env.MODEL_GATEWAY.fetch(request);
+    return this.env.MODEL_GATEWAY.fetch(new Request(request, { body: bytes }));
   }
   async startExecution(execution: Execution, operationId: string): Promise<void> {
     if (this.starting) {
@@ -76,6 +94,19 @@ export class HarnessContainer<
     return promise;
   }
   private async startAttempt(execution: Execution, operationId: string): Promise<void> {
+    if (!Object.hasOwn(HARNESSES, execution.harness))
+      throw new ApiError(400, "unsupported_harness", "Unknown Container harness");
+    const harness = execution.harness as HarnessName;
+    if (
+      execution.checkpoint &&
+      (execution.checkpoint.driver !== harness ||
+        execution.checkpoint.revision !== HARNESSES[harness].revision)
+    )
+      throw new ApiError(
+        409,
+        "checkpoint_incompatible",
+        "Checkpoint belongs to another harness version",
+      );
     const previous = await this.ctx.storage.get<Assignment>("assignment");
     if (previous && execution.generation < previous.generation)
       throw new ApiError(409, "stale_generation", "Execution was superseded");
@@ -91,6 +122,7 @@ export class HarnessContainer<
       generation: execution.generation,
       turnId: execution.turnId,
       model: execution.model,
+      harness,
       dispatched: false,
       sandbox: execution.sandbox,
     };
@@ -105,13 +137,15 @@ export class HarnessContainer<
         await sandbox.mkdir("/workspace", { recursive: true });
         await this.prepareSandbox(sandbox, execution);
       }
-      const executor = await sandbox.exec([
-        "codex",
-        "exec-server",
-        "--listen",
-        "ws://0.0.0.0:4500",
-      ]);
-      await executor.waitForPort(4500);
+      if (harness === "codex") {
+        const executor = await sandbox.exec([
+          "codex",
+          "exec-server",
+          "--listen",
+          "ws://0.0.0.0:4500",
+        ]);
+        await executor.waitForPort(4500);
+      }
     }
     let checkpoint: unknown;
     if (execution.checkpoint) {
@@ -172,8 +206,8 @@ export class HarnessContainer<
       : undefined;
     const checkpoint: Checkpoint = {
       version: 1,
-      driver: "codex",
-      revision: "0.154.0",
+      driver: assignment.harness,
+      revision: HARNESSES[assignment.harness].revision,
       native: key,
       ...(workspace ? { workspace } : {}),
     };
@@ -201,7 +235,7 @@ HarnessContainer.outboundByHost = {
 };
 
 /** Deployment-owned provisioning runs once per fresh workspace, before any model call. */
-export function createCodexHarness<Env extends ContainerBindings>(
+export function createHarness<Env extends ContainerBindings>(
   prepare: (sandbox: ISandbox, execution: Execution, env: Env) => Promise<void>,
 ): typeof HarnessContainer<Env> {
   class ConfiguredHarness extends HarnessContainer<Env> {
@@ -214,12 +248,12 @@ export function createCodexHarness<Env extends ContainerBindings>(
   return ConfiguredHarness;
 }
 
-export function codexDriver(env: ContainerBindings): RuntimeDriver {
+export function containerDriver(env: ContainerBindings, harness: HarnessName): RuntimeDriver {
   const stub = (execution: Execution) => env.HARNESS.getByName(execution.sessionId);
   return {
-    name: "codex",
-    revision: "0.154.0",
-    capabilities: { steer: true, functions: true, sandbox: true },
+    name: harness,
+    revision: HARNESSES[harness].revision,
+    capabilities: { steer: HARNESSES[harness].steer, functions: true, sandbox: true },
     start: async (execution, operationId) => {
       await stub(execution).startExecution(execution, operationId);
     },
@@ -234,3 +268,14 @@ export function codexDriver(env: ContainerBindings): RuntimeDriver {
     },
   };
 }
+
+export const codexDriver = (env: ContainerBindings): RuntimeDriver => containerDriver(env, "codex");
+export const claudeCodeDriver = (env: ContainerBindings): RuntimeDriver =>
+  containerDriver(env, "claude-code");
+export const openCodeDriver = (env: ContainerBindings): RuntimeDriver =>
+  containerDriver(env, "opencode");
+export const containerHarnesses = (env: ContainerBindings): Record<HarnessName, RuntimeDriver> => ({
+  codex: codexDriver(env),
+  "claude-code": claudeCodeDriver(env),
+  opencode: openCodeDriver(env),
+});

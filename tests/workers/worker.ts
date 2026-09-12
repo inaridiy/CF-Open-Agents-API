@@ -1,10 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { MockLanguageModelV4 } from "ai/test";
-import {
-  type AIHarnessBindings,
-  aiSDKDriver,
-  createAIHarness,
-} from "../../packages/agent-api/src/ai-sdk.js";
+
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
 import type {
   Execution,
@@ -14,7 +9,7 @@ import type {
 } from "../../packages/agent-api/src/runtime.js";
 import { type AgentBindings, createAgentService } from "../../packages/agent-api/src/service.js";
 
-export interface TestEnv extends AgentBindings, AIHarnessBindings {
+export interface TestEnv extends AgentBindings {
   SCRIPTED: DurableObjectNamespace<ScriptedHarness>;
   ASSETS: R2Bucket;
 }
@@ -105,11 +100,10 @@ function fixture(env: TestEnv): RuntimeDriver {
   };
 }
 const service = createAgentService<TestEnv>({
-  models: {
-    test: { driver: "fixture", model: "fixture-model" },
-    ai: { driver: "ai-sdk", model: "scripted-v4" },
+  agents: {
+    test: { harness: "fixture", model: "fixture-model" },
   },
-  drivers: (env) => ({ fixture: fixture(env), "ai-sdk": aiSDKDriver(env) }),
+  harnesses: (env) => ({ fixture: fixture(env) }),
   authenticate: async (request) =>
     request.headers.get("authorization")?.replace("Bearer ", "") ?? null,
   pollIntervalMs: 60_000,
@@ -117,37 +111,3 @@ const service = createAgentService<TestEnv>({
 export class SessionDO extends service.SessionDO {}
 export class CatalogDO extends CatalogObject {}
 export default class TestWorker extends service.AgentWorker {}
-
-const AIHarness = createAIHarness<TestEnv>(
-  () =>
-    new MockLanguageModelV4({
-      doGenerate: async ({ prompt, tools }) => {
-        const hasResult = prompt.some((message) => message.role === "tool");
-        const needsTool = (tools?.length ?? 0) > 0 && !hasResult;
-        return {
-          content: needsTool
-            ? [
-                {
-                  type: "tool-call",
-                  toolCallId: "call_ai",
-                  toolName: "lookup",
-                  input: '{"query":"cloudflare"}',
-                },
-              ]
-            : [
-                {
-                  type: "text",
-                  text: hasResult ? "Result received; history restored." : "AI SDK output.",
-                },
-              ],
-          finishReason: { unified: needsTool ? "tool-calls" : "stop", raw: undefined },
-          usage: {
-            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
-            outputTokens: { total: 5, text: 5, reasoning: 0 },
-          },
-          warnings: [],
-        };
-      },
-    }),
-);
-export class AIHarnessDO extends AIHarness {}

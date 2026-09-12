@@ -1,7 +1,7 @@
 # Compatibility profile
 
 Profile: `cf-agents-v1-alpha`. Reference SDK: `openai@7.15.0`, `agents=v1`.
-Native Codex protocol: `0.154.0`. Query `/cf/v1/capabilities` for deployed models
+Native runtimes: Codex `0.154.0`, Claude Agent SDK `0.3.268`, OpenCode `1.18.30`. Query `/cf/v1/capabilities` for deployed models
 and harness capabilities. This profile is a subset, not hosted-service parity.
 
 | Surface | Current implementation |
@@ -9,15 +9,15 @@ and harness capabilities. This profile is a subset, not hosted-service parity.
 | Agents | Create, retrieve, list, delete |
 | Sessions | Create, retrieve, list, metadata update, delete when inactive |
 | Inputs | Text messages, cancellation, string function results |
-| Active input | Steers the existing Codex turn; AI SDK rejects active steering |
+| Active input | Steers the existing Codex turn; Claude Code and OpenCode reject active steering |
 | Output | Assistant text, function calls, command execution items |
 | Streaming | Live SSE; durable replay is a separate `/cf/v1` extension |
 | Turns | Retrieve and cursor-paginated list |
 | Idempotency | Session creation and submitted input batches; conflicting reuse is 409 |
 | Environment | `none`, or managed Cloudflare compute using the `openai_hosted` wire spelling |
-| Native resume | Codex home/checkpoint; AI SDK provider message history |
+| Native resume | Native history checkpoints for all three harnesses |
 | Tools | Client function tools; schemas and helpers for application-owned tools |
-| Harnesses | Codex and AI SDK; others require an installed driver |
+| Harnesses | Codex, Claude Code, OpenCode; additional harnesses require a driver |
 | Skills | Immutable R2 publishing/integrity checks, progressive read tool, sandbox provisioning hook |
 
 Only fields described by exported Zod schemas are accepted. Unknown fields,
@@ -30,6 +30,7 @@ to their assigned exec-server through a private Worker route.
 A `model` in this API is a deploy-owned registry alias. Clients cannot select an
 arbitrary provider URL, secret, container image, filesystem root, or harness binary.
 Changing an alias does not migrate an existing session's pinned driver revision.
+The model registry stores connection aliases; version them to preserve an old model mapping.
 
 HTTP API errors follow the OpenAI error envelope. Common input/reservation validation failures cross DO RPC as result data.
 Other API errors preserve a structured error name because Workers does not preserve
@@ -48,10 +49,13 @@ and native history are discarded.
 Function results, metadata and inputs are session-scoped. Tenant catalogs isolate
 session discovery. Service Binding callers are trusted to provide the correct tenant.
 
-Request bodies are limited to 2 MB, native Codex snapshots to 32 MiB, and the
+Request bodies are limited to 2 MB, native snapshots to 32 MiB, and the
 supervisor's unacknowledged output buffer to 8 MB. Turns have a 15-minute default deadline, including external tool waiting.
-AI SDK defaults to at most 32 model steps and 8,192 output tokens per call; the
-model factory accepts deployment-owned overrides. Incomplete model output fails.
+Claude Code/OpenCode cap native turns at 32 steps. The AI SDK model adapter performs
+one inference per native request, with 8,192 output tokens and a 120-second timeout
+by default. The private gateway caps input at 4 MiB and output at 8 MiB. Incomplete
+model output fails. See [model protocols](extending.md#model-protocols) for the portable
+text/function profile and native reasoning passthrough.
 SSE keeps a 64 KiB buffer per listener (plus at most one event) and reads persisted
 events under backpressure; each session allows up to 64 listeners. Workspace backup TTL is 30 days; SDK restore expiry does not by itself
 delete R2 objects. Configure retention/garbage collection explicitly before production.

@@ -1,65 +1,123 @@
 # Extending the service
 
-A deployment owns its model registry and runtime drivers. Requests name registry
-aliases; they never serialize JavaScript provider objects or configuration secrets.
-A session pins the selected driver name/revision and underlying model at creation.
+A deployment selects a native harness and model separately. Session requests name
+agent presets; model instances and credentials stay inside the private Worker gateway.
+The session pins the harness revision and model-registry name. Changing a registry
+entry changes that name's upstream connection; version registry names when old
+sessions must keep their original model configuration.
 
-## AI SDK and Workers AI
-
-The optional `cf-open-agents-api/ai-sdk` entrypoint accepts any supported AI SDK
-`LanguageModel` through an environment-aware factory:
+## Native harnesses and AI SDK models
 
 ```ts
-import { aiSDKDriver, createAIHarness } from "cf-open-agents-api/ai-sdk";
+import { createOpenAI } from "@ai-sdk/openai";
+import { containerHarnesses, createAgentService } from "cf-open-agents-api/cloudflare";
+import { aiSDKModel, createModelGateway } from "cf-open-agents-api/models";
 
-const BaseAIHarness = createAIHarness<Bindings>((env, model) => {
-  return yourProviderFactory(env)(model);
+const service = createAgentService<Bindings>({
+  agents: {
+    coding: { harness: "codex", model: "primary" },
+    claude: { harness: "claude-code", model: "primary" },
+    opencode: { harness: "opencode", model: "primary" },
+  },
+  harnesses: containerHarnesses,
+  authenticate: yourAuthenticator,
 });
-export class AIHarnessDO extends BaseAIHarness {}
+const gateway = createModelGateway<Bindings>((env) => {
+  const openai = createOpenAI({ apiKey: env.OPENAI_API_KEY });
+  return { primary: aiSDKModel(openai("gpt-6-astra")) };
+});
+// A private WorkerEntrypoint delegates fetch(request) to gateway.fetch(request, this.env).
 ```
 
-Bind `AI_HARNESS` to that class and add it to a SQLite DO migration. Register
-`"assistant": { driver: "ai-sdk", model: "your-provider-model" }` and include
-`"ai-sdk": aiSDKDriver(env)` in the `drivers` factory. `CHECKPOINTS` is its R2 binding.
+The AI SDK call performs one inference. It has no tool implementations and starts
+no second agent loop. Codex app-server, Claude Agent SDK, or OpenCode owns tool
+selection, continuation, and native conversation history. Switching `harness` changes
+new sessions; it does not convert an existing native checkpoint.
 
-The example uses `workers-ai-provider@4.0.0` with AI SDK 7:
+Workers AI uses the same model adapter:
 
 ```ts
 import { createWorkersAI } from "workers-ai-provider";
-const BaseAIHarness = createAIHarness<Bindings>(
-  (env, model) => createWorkersAI({ binding: env.AI })(model),
-  { maxSteps: 32, maxOutputTokens: 8192 },
-);
+const model = aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash"));
 ```
 
-The instance lives only inside AIHarnessDO; its registry name and message checkpoint
-are durable. The example's `assistant` alias selects
-[GLM-4.7-Flash](https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/).
-See the [official SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
-Other AI SDK providers use the same factory; providers remain optional dependencies.
+The deployment supplies its AI SDK provider package. See the runnable
+[Worker composition](../examples/worker/src/index.ts) and Cloudflare's
+[AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
 
-AI SDK calls are single durable model steps. Function calls suspend the session;
-submitted results become model messages before the next step. A process lost during
-a model call is treated as an unknown outcome rather than silently making another
-billable request. The AI SDK driver has no shell sandbox or steering capability.
+## Model protocols
+
+`aiSDKModel(instance, options)` exposes Responses, Anthropic Messages, and Chat
+Completions to native harnesses. `openAICompatibleModel({ baseURL, apiKey, model })`
+uses the same translation with an OpenAI-compatible Chat Completions upstream.
+Options bound output tokens and request time and forward deployment-owned AI SDK
+`providerOptions`. Model credentials are never sent to the harness or Sandbox.
+
+This portable profile carries text and function calls, including Codex namespaces
+and custom text tools wrapped as an `input` string. It **does not replay provider
+reasoning blocks or signatures**; reasoning can occur within an inference, but only
+text and function calls return to the harness. Media, encrypted input reasoning,
+server-side response references, hosted tools and structured response formats are
+rejected. Provider-specific sampling/effort/cache options are not a portable contract;
+set supported upstream options in the deployment. Tool use quality and context limits
+still depend on the selected model. Output truncation or model failure fails the turn.
+
+Use `nativeModel` when native reasoning, signatures, caching or other extensions
+must survive unchanged:
+
+```ts
+import { nativeModel } from "cf-open-agents-api/models";
+const model = nativeModel({
+  protocol: "anthropic", // "responses" or "chat-completions" also available
+  baseURL: "https://api.anthropic.com/v1",
+  apiKey: env.ANTHROPIC_API_KEY,
+  model: env.CLAUDE_MODEL,
+});
+```
+
+Native presets enforce the harness's protocol and replace the registry alias with
+the actual upstream model. They preserve the payload and stream instead of applying
+AI SDK translation. Base URLs and credentials belong to deployment code.
+
+Claude Code is designed for Claude models. Anthropic does not officially support
+routing it to other model families; our protocol tests establish transport/tool
+behavior with scripted models, not quality or provider approval for every model.
+See [Claude Code LLM gateways](https://code.claude.com/docs/en/llm-gateway).
+
+## Sandbox replacement
+
+| Harness | Actual integration | Native state |
+| --- | --- | --- |
+| Codex 0.154.0 | Native remote `exec-server` in Sandbox Container | Isolated CODEX_HOME |
+| Claude Agent SDK 0.3.268 | `toolAliases` redirect Bash/Read/Write/Edit to SDK MCP tools that call the assigned Sandbox | Isolated CLAUDE_CONFIG_DIR |
+| OpenCode 1.18.30 | Same-name plugin tools replace bash/read/write/edit and call the assigned Sandbox | Isolated XDG data/state directories |
+
+Claude's `sandbox` option configures local OS isolation; it is not a generic remote
+Sandbox provider. `spawnClaudeCodeProcess` replaces the whole subprocess launcher.
+The included adapter uses `toolAliases` plus an SDK-connected MCP server and disables
+native local tools. Its server comes from the installed MCP SDK so current Zod
+optional/default fields are parsed by a compatible version. This was verified against the installed SDK and its actual CLI.
+
+OpenCode explicitly supports [overriding built-in tool names](https://opencode.ai/docs/custom-tools/#name-collisions-with-built-in-tools).
+Our bundled plugin replaces four native tools. Other builtins, project config,
+default plugins, subagents, model discovery and automatic updates are disabled.
+The fixed config directory is read-only while OpenCode runs so its background
+plugin dependency installer does not require network access. Provider SDKs are
+already bundled in the pinned native CLI; caches are excluded from checkpoints.
+
+Both adapters route external function tools to the session's required-action
+boundary. The client submits their results through the Agents API. Builtin web
+search is disabled; expose deployment-owned search as an ordinary function tool.
+Codex supports active steering; Claude Code and OpenCode reject it. All support
+cancellation, external tools, and native checkpoint/restore.
 
 ## Additional harnesses
 
-Implement `RuntimeDriver` and register its name. The interface separates start,
-poll, control, checkpoint, and stop. Drivers must deduplicate operation IDs, fence
+Implement `RuntimeDriver` and register its name in `harnesses`. Start, poll, control,
+checkpoint, and stop are separate. Drivers must deduplicate operation IDs, fence
 old attempts, preserve native history, and contain old executors before replacing
 them. A missing acknowledged job is a failure, not permission to start again.
-
-A Claude Code/OpenCode driver must either support remote native tool execution or
-run its tool-executing process inside the sandbox boundary. Merely adding an MCP
-shell tool does not redirect its built-in shell. DeepSeek is a model-provider choice
-unless a concrete DeepSeek harness implementation is installed. Unsupported harness
-names fail capability validation before a session is created.
-
-For Codex, the native model gateway expects Responses API semantics. An arbitrary
-Chat Completions model or AI SDK instance is not automatically compatible. Use the
-AI SDK driver for those models; do not translate only the easiest request fields
-and advertise full Codex compatibility.
+A DeepSeek model can use the model gateway; a DeepSeek harness needs its own driver.
 
 ## Tools and assets
 
@@ -75,7 +133,7 @@ const search = webSearch(async (query, signal) => {
   return yourSearchProvider(query, { signal });
 });
 const session = await client.beta.agents.sessions.create({
-  agent: { model: "assistant", tools: [search.spec] },
+  agent: { model: "coding", tools: [search.spec] },
   environment: { type: "none" },
 });
 const stream = client.beta.agents.sessions.stream(session.id, {
@@ -100,13 +158,13 @@ It requires `SKILL.md`, rejects traversal/absolute paths, and caps bundle size.
 `loadSkill` verifies integrity. `skillReader(bucket, allowedReferences)` exposes a
 portable `read_skill` function restricted to a deployment-owned allowlist.
 
-Provision files before native execution with the Codex factory:
+Provision files before native execution with the shared harness factory:
 
 ```ts
-import { createCodexHarness } from "cf-open-agents-api/cloudflare";
+import { createHarness } from "cf-open-agents-api/cloudflare";
 import { installSkill } from "cf-open-agents-api/tools";
 
-const Harness = createCodexHarness<Bindings>(async (sandbox, execution, env) => {
+const Harness = createHarness<Bindings>(async (sandbox, execution, env) => {
   // Resolve a deployment-owned immutable reference, never an arbitrary client URL.
   const reference = await yourSkillCatalog(env, execution.agent.model);
   await installSkill(env.CHECKPOINTS, reference, sandbox);
@@ -120,7 +178,7 @@ skip provisioning. `installSkill` writes `/workspace/.agents/skills/<name>`; scr
 execute only when the sandbox runs them. Use `read_skill` when explicit progressive
 loading is preferable to harness-specific discovery.
 
-Export the returned Codex class directly as shown. Outbound handlers are registered
+Export the returned harness class directly as shown. Outbound handlers are registered
 by concrete class name using the Container SDK's static setter. An unregistered
 subclass does not inherit the SDK's handler registration.
 

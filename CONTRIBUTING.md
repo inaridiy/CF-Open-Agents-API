@@ -1,7 +1,8 @@
 # Contributing
 
 Use Node 24+ and the pinned pnpm version. Run `pnpm install --frozen-lockfile`, then
-`pnpm check`. Run `pnpm test:codex` when changing the supervisor or Codex protocol.
+`pnpm check`. Run `pnpm test:codex` and `pnpm test:harnesses` when changing the
+supervisor, model gateway, or native protocols.
 Container transport changes also require the Docker smoke described in deployment
 notes. Clearly distinguish local scripted providers from real provider evidence.
 
@@ -12,12 +13,15 @@ notes. Clearly distinguish local scripted providers from real provider evidence.
 - `storage.ts`: Kysely queries with a synchronous SQLite execution bridge.
 - `runtime.ts`: the common execution driver contract.
 - `containers.ts`: Container lifecycle, model egress, and workspace snapshots.
-- `ai-sdk.ts`: optional AI SDK harness, model factory injected by the deployment.
+- `models.ts`, `models/`: single-inference model adapters and bounded wire translation.
+- `workspace.ts`, `sandbox-tools.ts`: shared remote tool contracts and Sandbox SDK execution.
 - `tools.ts`: tool contracts, provider-neutral presets, and immutable assets.
-- `packages/supervisor/src`: the Node process that owns Codex app-server.
+- `packages/supervisor/src`: native Codex, Claude Code and OpenCode lifecycle adapters.
 - `examples/worker`: deployable composition; no test fixture enters this build.
 - `tests/workers`: real workerd/SQLite integration with a scripted harness.
 - `tests/codex`: real Codex app-server/exec-server with a scripted model endpoint.
+- `tests/harnesses`: real native runtimes and official SDK clients through the model gateway.
+- `tests/containers`: production Worker/Container/R2 paths with scripted inference.
 
 ## Changes worth discussing
 

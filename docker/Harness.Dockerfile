@@ -8,7 +8,7 @@ RUN pnpm install --frozen-lockfile && pnpm build && pnpm --filter cf-open-agents
 
 FROM node:24.15.0-bookworm-slim
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git && rm -rf /var/lib/apt/lists/*
-RUN npm install --global @openai/codex@0.154.0
+RUN npm install --global @openai/codex@0.154.0 opencode-ai@1.18.30
 WORKDIR /app
 COPY --from=build /out /app
 RUN mkdir -p /app/state && chown node:node /app/state

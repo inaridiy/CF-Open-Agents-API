@@ -1,18 +1,27 @@
-import { canonicalJSON, commandSchema, executionSchema } from "cf-open-agents-api";
+import {
+  canonicalJSON,
+  commandSchema,
+  executionSchema,
+  HARNESSES,
+  workspaceRequestSchema,
+} from "cf-open-agents-api";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
+import { ClaudeCodeJob } from "./claude-code.js";
 import { CodexJob, type CodexOptions } from "./codex.js";
+import type { NativeJob, NativeOptions } from "./job.js";
+import { OpenCodeJob } from "./opencode.js";
 
 /** Private Container HTTP API. Its owning HarnessDO is the authorization boundary. */
-export function createSupervisor(options: CodexOptions) {
-  let active: { job: CodexJob; fingerprint: string; started: Promise<void> } | undefined;
+export function createSupervisor(options: CodexOptions & NativeOptions) {
+  let active: { job: NativeJob; fingerprint: string; started: Promise<void> } | undefined;
   const app = new Hono();
   app.use("*", bodyLimit({ maxSize: 48 * 1024 * 1024 }));
   app.onError((error) =>
     Response.json({ error: error.message }, { status: error instanceof z.ZodError ? 400 : 409 }),
   );
-  app.get("/health", () => Response.json({ codex: "0.154.0", ready: true }));
+  app.get("/health", () => Response.json({ harnesses: HARNESSES, ready: true }));
   app.post("/jobs", async (c) => {
     const body = z
       .strictObject({
@@ -33,7 +42,11 @@ export function createSupervisor(options: CodexOptions) {
     if (active && !["completed", "cancelled", "failed"].includes(active.job.poll(0).status))
       return Response.json({ error: "active_execution" }, { status: 409 });
     const previous = active;
-    const job = new CodexJob(body.execution, options);
+    const constructors = { codex: CodexJob, "claude-code": ClaudeCodeJob, opencode: OpenCodeJob };
+    if (!Object.hasOwn(constructors, body.execution.harness))
+      return Response.json({ error: "unsupported_harness" }, { status: 400 });
+    const Job = constructors[body.execution.harness as keyof typeof constructors];
+    const job: NativeJob = new Job(body.execution, options);
     // Publish ownership before the first await; duplicate HTTP requests join this start.
     const started = (async () => {
       try {
@@ -41,6 +54,7 @@ export function createSupervisor(options: CodexOptions) {
         await job.start(body.checkpoint);
       } catch (error) {
         job.failStart(error);
+        await job.stop();
         throw error;
       }
     })();
@@ -74,6 +88,17 @@ export function createSupervisor(options: CodexOptions) {
     if (!active || active.job.execution.turnId !== c.req.param("turn"))
       return Response.json({ error: "missing" }, { status: 404 });
     return Response.json(await active.job.checkpoint());
+  });
+  app.all("/jobs/:turn/mcp", async (c) => {
+    if (!active?.job.mcp || active.job.execution.turnId !== c.req.param("turn"))
+      return c.body(null, 404);
+    return active.job.mcp(c.req.raw);
+  });
+  app.post("/jobs/:turn/workspace", async (c) => {
+    if (!active?.job.workspace || active.job.execution.turnId !== c.req.param("turn"))
+      return c.body(null, 404);
+    const input = workspaceRequestSchema.parse(await c.req.json());
+    return Response.json(await active.job.workspace(input.tool, input.arguments));
   });
   app.post("/stop", async (c) => {
     await active?.job.stop();

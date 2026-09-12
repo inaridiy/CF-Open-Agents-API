@@ -425,7 +425,9 @@ CodexAdapterはこの形式へのmaterializeを担当し、ClaudeやOpenCodeへ�
 OpenCodeはHTTP serverとSDKを公開している。
 Claude Agent SDKはcustom toolのMCP登録と内蔵tool一覧の制限を提供する。
 DeepSeek Harnessの公式previewはモデル、Sandbox、session、storageなどをpluginに分けている。
-これらは統合の入口が存在する根拠であり、全ハーネスの実行分離が確認済みという意味ではない。
+実装ではClaude SDKの `toolAliases` とOpenCodeの同名plugin toolを使って、Bash・Read・Write・Editを別Sandboxへの呼び出しに差し替える。
+固定バージョンの実プロセスで確認しており、対応範囲と検証方法は [extending.md](extending.md#sandbox-replacement) に記載する。
+DeepSeek HarnessとThinkは引き続き追加候補である。
 [OpenCode server](https://opencode.ai/docs/server/)、[Claude custom tools](https://code.claude.com/docs/en/agent-sdk/custom-tools)、[DeepSeek Harness](https://www.deepseek.com/harness/en/)。
 
 Cloudflareの `@cloudflare/think` も追加候補になる。
@@ -550,7 +552,8 @@ root turnのcancel、子1体のinterrupt、session全体の停止を別操作と
 
 最初に難所を実証し、その結果から公開APIの細部を確定する。
 4種類のハーネスを同時に実装するより、Codexでnative機能を使い、もう1種類で抽象化を検証する順がよい。
-第2ハーネスはDeepSeekのplugin境界とOpenCodeのserver APIを短く比較し、リモート実行とcheckpointを少ない変更で実現できる方を選ぶ。
+実装済みのハーネスはCodex、Claude Code、OpenCodeである。
+DeepSeek Harnessを追加する場合も、既存の実行・checkpoint境界を満たすadapterとして接続する。
 
 | 段階 | 作るもの | 合格条件 |
 | --- | --- | --- |

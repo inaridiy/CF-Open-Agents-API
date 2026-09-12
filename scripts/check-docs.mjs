@@ -40,4 +40,30 @@ assert(
   dockerfile.includes(`cloudflare/sandbox:${library.dependencies["@cloudflare/sandbox"]}\n`),
   "Sandbox package and Docker image versions must match",
 );
+const supervisor = JSON.parse(
+  await readFile(new URL("../packages/supervisor/package.json", import.meta.url), "utf8"),
+);
+const harnessSource = await readFile(
+  new URL("../packages/agent-api/src/harnesses.ts", import.meta.url),
+  "utf8",
+);
+const harnessImage = await readFile(
+  new URL("../docker/Harness.Dockerfile", import.meta.url),
+  "utf8",
+);
+for (const [name, version] of [
+  ["codex", /codex:\s*\{\s*revision: "([^"]+)"/.exec(harnessSource)?.[1]],
+  ["opencode", supervisor.dependencies["@opencode-ai/sdk"]],
+  ["claude-code", supervisor.dependencies["@anthropic-ai/claude-agent-sdk"]],
+]) {
+  assert(
+    version && harnessSource.includes(`revision: "${version}"`),
+    `${name}: checkpoint revision must match the native runtime`,
+  );
+  if (name === "codex") assert(harnessImage.includes(`@openai/codex@${version}`));
+  if (name === "opencode") {
+    assert(harnessImage.includes(`opencode-ai@${version}`));
+    assert.equal(manifest.devDependencies["opencode-ai"], version);
+  }
+}
 console.log("Project names, documented entrypoints, commands, bindings and image pins agree.");

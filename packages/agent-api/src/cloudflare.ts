@@ -2,9 +2,13 @@ export { ContainerProxy } from "@cloudflare/sandbox";
 export { CatalogObject } from "./catalog.js";
 export {
   type ContainerBindings,
+  claudeCodeDriver,
   codexDriver,
-  createCodexHarness,
+  containerDriver,
+  containerHarnesses,
+  createHarness,
   HarnessContainer,
+  openCodeDriver,
   SandboxContainer,
 } from "./containers.js";
 export { type AgentBindings, bearerTenant, createAgentService } from "./service.js";

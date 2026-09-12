@@ -18,19 +18,20 @@
       "types": "./dist/cloudflare.d.ts",
       "default": "./dist/cloudflare.js"
     },
-    "./ai-sdk": {
-      "types": "./dist/ai-sdk.d.ts",
-      "default": "./dist/ai-sdk.js"
-    },
     "./tools": {
       "types": "./dist/tools.d.ts",
       "default": "./dist/tools.js"
+    },
+    "./models": {
+      "types": "./dist/models.d.ts",
+      "default": "./dist/models.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
+    "@ai-sdk/openai-compatible": "3.0.47",
     "@cloudflare/containers": "0.3.7",
     "@cloudflare/sandbox": "0.13.0-next.751.1",
     "hono": "4.13.7",

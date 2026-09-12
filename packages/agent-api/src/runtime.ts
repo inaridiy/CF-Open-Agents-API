@@ -15,6 +15,7 @@ export const executionSchema = z.strictObject({
   sessionId: z.string().regex(/^sess_[a-zA-Z0-9]+$/),
   turnId: z.string().regex(/^turn_[a-zA-Z0-9]+$/),
   generation: z.number().int().positive(),
+  harness: z.string(),
   model: z.string(),
   agent: agentConfigSchema,
   input: z.array(inputMessageSchema),
@@ -38,6 +39,7 @@ export interface Execution {
   sessionId: string;
   turnId: string;
   generation: number;
+  harness: string;
   model: string;
   agent: AgentConfig;
   input: InputMessage[];
@@ -110,15 +112,15 @@ export interface RuntimeDriver {
   stop(execution: Execution): Promise<void>;
 }
 
-export interface ModelRegistration {
-  driver: string;
+export interface AgentRegistration {
+  harness: string;
   model: string;
 }
 
 export interface ServiceOptions<Env> {
   /** Deploy-owned names are persisted, never JavaScript provider instances. */
-  models: Record<string, ModelRegistration>;
-  drivers: (env: Env) => Record<string, RuntimeDriver>;
+  agents: Record<string, AgentRegistration>;
+  harnesses: (env: Env) => Record<string, RuntimeDriver>;
   /** HTTP authentication resolves a tenant; Service Binding callers supply it directly. */
   authenticate: (request: Request, env: Env) => Promise<string | null>;
   maxTurnMs?: number;

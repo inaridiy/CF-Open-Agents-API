@@ -1,37 +1,39 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { type AIHarnessBindings, aiSDKDriver, createAIHarness } from "cf-open-agents-api/ai-sdk";
+import { createOpenAI } from "@ai-sdk/openai";
 import {
   type AgentBindings,
   bearerTenant,
   CatalogObject,
   type ContainerBindings,
   ContainerProxy,
-  codexDriver,
+  containerHarnesses,
   createAgentService,
   HarnessContainer,
   SandboxContainer,
 } from "cf-open-agents-api/cloudflare";
+import { aiSDKModel, createModelGateway } from "cf-open-agents-api/models";
 import { createWorkersAI } from "workers-ai-provider";
 
-interface Bindings extends AgentBindings, ContainerBindings, AIHarnessBindings {
+interface Bindings extends AgentBindings, ContainerBindings {
   AI: Ai;
   API_TOKEN: string;
   OPENAI_API_KEY: string;
 }
 const service = createAgentService<Bindings>({
-  // The public alias is stable even when a deployment changes its upstream model.
-  models: {
-    coding: { driver: "codex", model: "gpt-5.4" },
-    assistant: { driver: "ai-sdk", model: "@cf/zai-org/glm-4.7-flash" },
+  agents: {
+    coding: { harness: "codex", model: "primary" },
+    claude: { harness: "claude-code", model: "primary" },
+    opencode: { harness: "opencode", model: "primary" },
+    workers: { harness: "codex", model: "workers" },
   },
-  drivers: (env) => ({ codex: codexDriver(env), "ai-sdk": aiSDKDriver(env) }),
+  harnesses: containerHarnesses,
   authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
 });
 
-const AIHarness = createAIHarness<Bindings>((env, model) =>
-  createWorkersAI({ binding: env.AI })(model),
-);
-export class AIHarnessDO extends AIHarness {}
+const gateway = createModelGateway<Bindings>((env) => ({
+  primary: aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+  workers: aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+}));
 
 export class SessionDO extends service.SessionDO {}
 export class TenantCatalogDO extends CatalogObject {}
@@ -40,23 +42,9 @@ export class SandboxDO extends SandboxContainer {}
 export { ContainerProxy };
 export default class AgentWorker extends service.AgentWorker {}
 
-/** Only the harness's private outbound handler can call this Service Binding. */
+/** Private Service Binding: model instances and provider credentials stay in Workers. */
 export class Models extends WorkerEntrypoint<Bindings> {
-  override async fetch(request: Request): Promise<Response> {
-    if (!this.env.OPENAI_API_KEY)
-      return new Response("Model credentials are not configured", { status: 503 });
-    const url = new URL(request.url);
-    if (url.pathname !== "/v1/responses" || request.method !== "POST")
-      return new Response("Unsupported endpoint", { status: 404 });
-    return fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      body: request.body,
-      headers: {
-        authorization: `Bearer ${this.env.OPENAI_API_KEY}`,
-        "content-type": "application/json",
-        accept: "text/event-stream",
-      },
-      redirect: "error",
-    });
+  override fetch(request: Request): Promise<Response> {
+    return gateway.fetch(request, this.env);
   }
 }

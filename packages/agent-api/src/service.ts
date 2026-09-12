@@ -55,7 +55,7 @@ export function createAgentService<Env extends AgentBindings>(
   class SessionDO extends SessionObject<Env> {
     protected override dependencies() {
       return {
-        drivers: options.drivers(this.env),
+        drivers: options.harnesses(this.env),
         maxTurnMs: options.maxTurnMs ?? 15 * 60_000,
         pollIntervalMs: options.pollIntervalMs ?? 1_000,
       };
@@ -77,8 +77,8 @@ export function createAgentService<Env extends AgentBindings>(
       return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
     }
     private validateModel(model: string, tools: number, sandbox: boolean) {
-      const registration = options.models[model];
-      const driver = registration && options.drivers(this.env)[registration.driver];
+      const registration = options.agents[model];
+      const driver = registration && options.harnesses(this.env)[registration.harness];
       if (!registration || !driver)
         throw new ApiError(422, "unsupported_model", "Model is not registered in this deployment");
       if (
@@ -240,9 +240,9 @@ export function createAgentService<Env extends AgentBindings>(
       app.get("/cf/v1/capabilities", () =>
         Response.json({
           ...COMPATIBILITY,
-          models: options.models,
+          agents: options.agents,
           harnesses: Object.fromEntries(
-            Object.values(options.drivers(this.env)).map((driver) => [
+            Object.values(options.harnesses(this.env)).map((driver) => [
               driver.name,
               { revision: driver.revision, ...driver.capabilities },
             ]),

@@ -18,15 +18,19 @@
     "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts",
     "deploy:check": "wrangler deploy --dry-run --config examples/worker/wrangler.jsonc",
     "test:containers": "node scripts/test-containers.mjs",
-    "check:docs": "node scripts/check-docs.mjs"
+    "check:docs": "node scripts/check-docs.mjs",
+    "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts"
   },
   "devDependencies": {
+    "@ai-sdk/openai": "4.0.65",
+    "@anthropic-ai/sdk": "0.125.0",
     "@biomejs/biome": "2.5.13",
     "@cloudflare/vitest-pool-workers": "0.22.0",
     "@cloudflare/workers-types": "5.20260911.1",
     "@types/node": "24.13.4",
     "ai": "7.0.97",
     "openai": "7.15.0",
+    "opencode-ai": "1.18.30",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
     "wrangler": "4.131.1"

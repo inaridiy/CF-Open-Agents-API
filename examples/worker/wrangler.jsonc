@@ -27,23 +27,13 @@
       {
         "name": "SANDBOX",
         "class_name": "SandboxDO"
-      },
-      {
-        "name": "AI_HARNESS",
-        "class_name": "AIHarnessDO"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": [
-        "SessionDO",
-        "TenantCatalogDO",
-        "HarnessDO",
-        "SandboxDO",
-        "AIHarnessDO"
-      ]
+      "new_sqlite_classes": ["SessionDO", "TenantCatalogDO", "HarnessDO", "SandboxDO"]
     }
   ],
   "containers": [

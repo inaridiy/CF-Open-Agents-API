@@ -39,67 +39,74 @@ async function remember() {
   for (const name of await containers()) if (!before.has(name)) owned.add(name);
 }
 try {
-  const session = await sessions.create({
-    agent: { model: "coding" },
-    environment: { type: "openai_hosted" },
-    input: "create-proof: write the sandbox proof.",
-  });
-  sessionId = session.id;
-  await complete();
-  await remember();
-  const items = (await sessions.items.list(sessionId)).data;
-  assert(
-    items.some(
-      (item) =>
-        item.type === "command_execution" && item.exit_code === 0 && item.output === "sandbox-only",
-    ),
-  );
-  const harness = [...owned].find(
-    (name) => name.includes("-HarnessDO-") && !name.endsWith("-proxy"),
-  );
-  const sandbox = [...owned].find(
-    (name) => name.includes("-SandboxDO-") && !name.endsWith("-proxy"),
-  );
-  assert(harness && sandbox, "Expected two distinct runtime containers");
-  await docker("exec", harness, "test", "!", "-e", "/workspace/proof.txt");
-  assert.equal(await docker("exec", sandbox, "cat", "/workspace/proof.txt"), "sandbox-only");
-  // Destroy compute after checkpoint commit. The next turn must restore from R2.
-  await docker("rm", "--force", harness, sandbox);
-  await sessions.events.create(sessionId, {
-    events: [
-      {
-        type: "agent.session.input.message",
-        input: [
-          {
-            role: "user",
-            content: [{ type: "input_text", text: "verify-restored: read the previous proof." }],
-          },
-        ],
-      },
-    ],
-  });
-  await complete();
-  await remember();
-  const resumed = (await sessions.items.list(sessionId, { limit: 100 })).data;
-  const commands = resumed.filter((item) => item.type === "command_execution");
-  assert.equal(commands.length, 2);
-  assert(commands.every((item) => item.exit_code === 0 && item.output === "sandbox-only"));
-  assert(
-    resumed.some(
-      (item) =>
-        item.type === "message" &&
-        item.role === "assistant" &&
-        JSON.stringify(item.content).includes("Native history restored"),
-    ),
-  );
-  assert.equal(
-    (await sessions.turns.list(sessionId)).data.filter((turn) => turn.status === "completed")
-      .length,
-    2,
-  );
-  console.log(
-    "PASS: Worker → Codex Container → sandbox Container; native command isolation; R2 restore after destroying both containers.",
-  );
+  for (const harnessName of ["codex", "claude-code", "opencode"]) {
+    const iterationBefore = new Set(await containers());
+    const session = await sessions.create({
+      agent: { model: harnessName },
+      environment: { type: "openai_hosted" },
+      input: "create-proof: write the sandbox proof.",
+    });
+    sessionId = session.id;
+    await complete();
+    await remember();
+    const items = (await sessions.items.list(sessionId)).data;
+    assert(
+      items.some(
+        (item) =>
+          item.type === "command_execution" &&
+          item.exit_code === 0 &&
+          item.output === "sandbox-only",
+      ),
+    );
+    const harness = [...owned].find(
+      (name) =>
+        !iterationBefore.has(name) && name.includes("-HarnessDO-") && !name.endsWith("-proxy"),
+    );
+    const sandbox = [...owned].find(
+      (name) =>
+        !iterationBefore.has(name) && name.includes("-SandboxDO-") && !name.endsWith("-proxy"),
+    );
+    assert(harness && sandbox, "Expected two distinct runtime containers");
+    await docker("exec", harness, "test", "!", "-e", "/workspace/proof.txt");
+    assert.equal(await docker("exec", sandbox, "cat", "/workspace/proof.txt"), "sandbox-only");
+    // Destroy compute after checkpoint commit. The next turn must restore from R2.
+    await docker("rm", "--force", harness, sandbox);
+    await sessions.events.create(sessionId, {
+      events: [
+        {
+          type: "agent.session.input.message",
+          input: [
+            {
+              role: "user",
+              content: [{ type: "input_text", text: "verify-restored: read the previous proof." }],
+            },
+          ],
+        },
+      ],
+    });
+    await complete();
+    await remember();
+    const resumed = (await sessions.items.list(sessionId, { limit: 100 })).data;
+    const commands = resumed.filter((item) => item.type === "command_execution");
+    assert.equal(commands.length, 2);
+    assert(commands.every((item) => item.exit_code === 0 && item.output === "sandbox-only"));
+    assert(
+      resumed.some(
+        (item) =>
+          item.type === "message" &&
+          item.role === "assistant" &&
+          JSON.stringify(item.content).includes("Native history restored"),
+      ),
+    );
+    assert.equal(
+      (await sessions.turns.list(sessionId)).data.filter((turn) => turn.status === "completed")
+        .length,
+      2,
+    );
+    console.log(
+      `PASS: Worker → ${harnessName} Container → Sandbox Container; native tool isolation; AI SDK gateway; R2 restore after destroying both containers.`,
+    );
+  }
 } finally {
   await remember();
   if (sessionId) {

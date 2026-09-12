@@ -13,6 +13,7 @@ minimumReleaseAgeExclude:
   - '@cloudflare/workerd-windows-64@1.20260911.1'
 allowBuilds:
   esbuild: true
+  opencode-ai: true
   workerd: true
 # The test pool pins an August workerd; use the deployment runtime for both.
 overrides:

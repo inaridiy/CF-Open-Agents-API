@@ -67,6 +67,7 @@ export class CodexJob {
         `model = ${JSON.stringify(this.execution.model)}`,
         'approval_policy = "never"',
         'sandbox_mode = "danger-full-access"',
+        'web_search = "disabled"',
         "[features]",
         "multi_agent = false",
         "plugins = false",

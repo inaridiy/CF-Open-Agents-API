@@ -46,6 +46,8 @@ external deployment or payment happened exactly once.
 SQLite DOs and a deliberately scripted runtime driver. `pnpm test:codex` exercises
 native Codex with an isolated home and a local scripted Responses server. It never
 uses the operator's Codex login or a real provider key.
+`pnpm test:harnesses` additionally exercises Claude Code and OpenCode, native history
+restoration, and instantiated AI SDK model connections through official SDK clients.
 
 Run the complete local smoke with:
 
@@ -54,8 +56,9 @@ pnpm test:containers
 ```
 
 It uses a fresh persistence directory and a scripted local model. It verifies native
-shell execution, skill provisioning, isolation from the harness filesystem, and a
-second turn after both Containers are destroyed. It cleans up the Containers it
+shell execution for all three harnesses, Claude/OpenCode write/edit/read replacements,
+skill provisioning, isolation from the harness filesystem, and a second turn after
+both Containers are destroyed. It cleans up the Containers it
 created. Logs and local R2/SQLite evidence remain in the printed temporary directory.
 No Cloudflare deployment, provider secret, or paid inference is involved.
 

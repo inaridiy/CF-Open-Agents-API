@@ -1,27 +1,34 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { simulateReadableStream } from "ai";
+import { MockLanguageModelV4 } from "ai/test";
 import {
   type AgentBindings,
   CatalogObject,
   type ContainerBindings,
   ContainerProxy,
-  codexDriver,
+  containerHarnesses,
   createAgentService,
-  createCodexHarness,
+  createHarness,
   SandboxContainer,
 } from "../../packages/agent-api/src/cloudflare.js";
+import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/models.js";
 import { installSkill, publishSkill } from "../../packages/agent-api/src/tools.js";
 
 interface Bindings extends AgentBindings, ContainerBindings {}
 const service = createAgentService<Bindings>({
-  models: { coding: { driver: "codex", model: "gpt-5.4" } },
-  drivers: (env) => ({ codex: codexDriver(env) }),
+  agents: {
+    codex: { harness: "codex", model: "fixture" },
+    "claude-code": { harness: "claude-code", model: "fixture" },
+    opencode: { harness: "opencode", model: "fixture" },
+  },
+  harnesses: containerHarnesses,
   authenticate: async (request) =>
     request.headers.get("authorization") === "Bearer local-container-test" ? "local" : null,
   maxTurnMs: 120_000,
 });
 export class SessionDO extends service.SessionDO {}
 export class TenantCatalogDO extends CatalogObject {}
-const Harness = createCodexHarness<Bindings>(async (sandbox, _execution, env) => {
+const Harness = createHarness<Bindings>(async (sandbox, _execution, env) => {
   const reference = await publishSkill(env.CHECKPOINTS, {
     name: "smoke",
     description: "Container smoke skill",
@@ -35,69 +42,109 @@ export class SandboxDO extends SandboxContainer {}
 export { ContainerProxy };
 export default class AgentWorker extends service.AgentWorker {}
 
-/** Local protocol fixture. No external network request or API key is used. */
-export class Models extends WorkerEntrypoint {
-  override async fetch(request: Request): Promise<Response> {
-    const body = await request.json<{
-      input: { type: string; role?: string; output?: unknown }[];
-      tools: { name?: string }[];
-    }>();
-    const lastInput = body.input.findLastIndex(
-      (item) => item.type === "message" && item.role === "user",
-    );
-    const outputs = body.input
-      .slice(lastInput + 1)
-      .filter((item) => item.type === "function_call_output");
-    const restore = JSON.stringify(body.input).includes("verify-restored");
-    if (!body.tools.some((tool) => tool.name === "exec_command"))
-      return new Response("Native exec_command is missing", { status: 500 });
-    const id = `step_${lastInput}`;
-    const item = outputs.length
-      ? {
-          type: "message",
-          id: `msg_${id}`,
-          role: "assistant",
-          status: "completed",
-          content: [
-            {
-              type: "output_text",
-              text: restore ? "Native history restored." : "Container execution complete.",
-            },
-          ],
-        }
-      : {
-          type: "function_call",
-          id: `fc_${id}`,
-          call_id: `call_${id}`,
-          name: "exec_command",
-          arguments: JSON.stringify({
-            cmd: restore
-              ? "cat /workspace/proof.txt"
-              : "test -f /workspace/.agents/skills/smoke/SKILL.md && printf sandbox-only > /workspace/proof.txt && cat /workspace/proof.txt",
-            workdir: "/workspace",
-            max_output_tokens: 100,
+/** Actual AI SDK model boundary; inference is scripted and makes no paid request. */
+const gateway = createModelGateway(() => ({
+  fixture: aiSDKModel(
+    new MockLanguageModelV4({
+      doStream: async ({ prompt, tools }) => {
+        const lastUser = prompt.findLastIndex((message) => message.role === "user");
+        const history = JSON.stringify(prompt);
+        const restored = history.includes("verify-restored");
+        if (restored && !history.includes("Container execution complete"))
+          throw new Error("Missing native history");
+        const toolResults = prompt.slice(lastUser + 1).filter((message) => message.role === "tool");
+        const definitions = tools?.filter((tool) => tool.type === "function") ?? [];
+        const codex = definitions.find((tool) => tool.name === "exec_command");
+        const external = (name: string) =>
+          definitions.find((tool) => tool.name === name || tool.name.endsWith(`__${name}`));
+        const claude = definitions.some((tool) => tool.name.startsWith("mcp__"));
+        const file = claude
+          ? { file_path: "/workspace/proof.txt" }
+          : { filePath: "/workspace/proof.txt" };
+        const edit = claude
+          ? { old_string: "before-edit", new_string: "sandbox-only" }
+          : { oldString: "before-edit", newString: "sandbox-only" };
+        const steps = codex
+          ? [
+              {
+                name: codex.name,
+                input: {
+                  cmd: restored
+                    ? "cat /workspace/proof.txt"
+                    : "test -f /workspace/.agents/skills/smoke/SKILL.md && printf sandbox-only > /workspace/proof.txt && cat /workspace/proof.txt",
+                  workdir: "/workspace",
+                  max_output_tokens: 100,
+                },
+              },
+            ]
+          : restored
+            ? [
+                {
+                  name: external("bash")?.name,
+                  input: {
+                    command: "cat /workspace/proof.txt",
+                    description: "Read the restored proof",
+                  },
+                },
+              ]
+            : [
+                { name: external("write")?.name, input: { ...file, content: "before-edit" } },
+                { name: external("edit")?.name, input: { ...file, ...edit } },
+                { name: external("read")?.name, input: { ...file } },
+                {
+                  name: external("bash")?.name,
+                  input: {
+                    command:
+                      "test -f /workspace/.agents/skills/smoke/SKILL.md && cat /workspace/proof.txt",
+                    description: "Verify the separate workspace",
+                  },
+                },
+              ];
+        const step = steps[toolResults.length];
+        if (step && !step.name) throw new Error("Native workspace tool is missing");
+        if (!step && !JSON.stringify(toolResults).includes("sandbox-only"))
+          throw new Error(`Missing sandbox proof: ${JSON.stringify(toolResults)}`);
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "stream-start", warnings: [] },
+              ...(step
+                ? [
+                    {
+                      type: "tool-call" as const,
+                      toolCallId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
+                      toolName: step.name ?? "missing-tool",
+                      input: JSON.stringify(step.input),
+                    },
+                  ]
+                : [
+                    { type: "text-start" as const, id: "answer" },
+                    {
+                      type: "text-delta" as const,
+                      id: "answer",
+                      delta: restored
+                        ? "Native history restored."
+                        : "Container execution complete.",
+                    },
+                    { type: "text-end" as const, id: "answer" },
+                  ]),
+              {
+                type: "finish",
+                finishReason: { unified: step ? "tool-calls" : "stop", raw: undefined },
+                usage: {
+                  inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 5, text: 5, reasoning: 0 },
+                },
+              },
+            ],
           }),
         };
-    const events = [
-      {
-        type: "response.created",
-        response: { id: "resp_local", object: "response", status: "in_progress", output: [] },
       },
-      { type: "response.output_item.done", output_index: 0, item },
-      {
-        type: "response.completed",
-        response: {
-          id: "resp_local",
-          object: "response",
-          status: "completed",
-          output: [item],
-          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-        },
-      },
-    ];
-    return new Response(
-      events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
-      { headers: { "content-type": "text/event-stream" } },
-    );
+    }),
+  ),
+}));
+export class Models extends WorkerEntrypoint {
+  override fetch(request: Request): Promise<Response> {
+    return gateway.fetch(request, {});
   }
 }
