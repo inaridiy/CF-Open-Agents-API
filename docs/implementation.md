@@ -51,8 +51,8 @@ passed with skill provisioning and destruction/restore. Typecheck, lint, declara
 builds, generated bindings, package assembly and the Worker deployment dry run passed.
 The packed tarball was also installed in a separate temporary consumer project;
 its Worker/Codex/AI SDK factory types compiled and its Node-compatible schema export
-loaded successfully. The checked-in CI workflow repeats the main gates; hosted CI
-has not yet run.
+loaded successfully. The checked-in CI workflow repeats the main gates; hosted
+results are available in [GitHub Actions](https://github.com/inaridiy/CF-Open-Agents-API/actions).
 
 Acceptance commands:
 
