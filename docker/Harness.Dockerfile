@@ -1,0 +1,17 @@
+FROM node:24.15.0-bookworm-slim AS build
+WORKDIR /app
+RUN npm install --global pnpm@11.1.2
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
+COPY packages ./packages
+COPY examples/worker/package.json ./examples/worker/package.json
+RUN pnpm install --frozen-lockfile && pnpm build && pnpm --filter cf-open-agents-api-supervisor deploy --prod --legacy /out
+
+FROM node:24.15.0-bookworm-slim
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git && rm -rf /var/lib/apt/lists/*
+RUN npm install --global @openai/codex@0.154.0
+WORKDIR /app
+COPY --from=build /out /app
+RUN mkdir -p /app/state && chown node:node /app/state
+USER node
+EXPOSE 8080
+CMD ["node", "dist/main.js"]

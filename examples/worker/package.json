@@ -1,0 +1,12 @@
+{
+  "name": "cf-open-agents-api-example-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/provider": "4.0.13",
+    "cf-open-agents-api": "workspace:*",
+    "ai": "7.0.97",
+    "workers-ai-provider": "4.0.0",
+    "zod": "4.6.2"
+  }
+}

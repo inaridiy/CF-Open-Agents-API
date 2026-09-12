@@ -1,0 +1,19 @@
+packages:
+  - packages/*
+  - examples/*
+autoInstallPeers: false
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - wrangler@4.131.1
+  - miniflare@5.20260911.0-alpha
+  - workerd@1.20260911.1
+  - '@cloudflare/workerd-linux-64@1.20260911.1'
+  - '@cloudflare/workerd-linux-arm64@1.20260911.1'
+  - '@cloudflare/workerd-darwin-arm64@1.20260911.1'
+  - '@cloudflare/workerd-windows-64@1.20260911.1'
+allowBuilds:
+  esbuild: true
+  workerd: true
+# The test pool pins an August workerd; use the deployment runtime for both.
+overrides:
+  workerd: 1.20260911.1

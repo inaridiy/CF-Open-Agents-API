@@ -1,0 +1,42 @@
+{
+  "name": "cf-open-agents-api-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.2",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run",
+    "test:codex": "vitest run --config vitest.codex.config.ts",
+    "check": "pnpm check:docs && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+    "dev": "wrangler dev --config examples/worker/wrangler.jsonc",
+    "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts",
+    "deploy:check": "wrangler deploy --dry-run --config examples/worker/wrangler.jsonc",
+    "test:containers": "node scripts/test-containers.mjs",
+    "check:docs": "node scripts/check-docs.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.13",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260911.1",
+    "@types/node": "24.13.4",
+    "ai": "7.0.97",
+    "openai": "7.15.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.131.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inaridiy/CF-Open-Agents-API.git"
+  },
+  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
+  "bugs": {
+    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
+  }
+}

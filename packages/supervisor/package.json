@@ -1,0 +1,17 @@
+{
+  "name": "cf-open-agents-api-supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "cf-open-agents-api": "workspace:*",
+    "@hono/node-server": "2.1.1",
+    "hono": "4.13.7",
+    "zod": "4.6.2"
+  }
+}

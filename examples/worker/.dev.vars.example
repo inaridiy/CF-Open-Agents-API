@@ -1,0 +1,3 @@
+API_TOKEN=replace-with-at-least-32-random-characters
+OPENAI_API_KEY=replace-with-your-api-key
+LOCAL_BACKUPS=true

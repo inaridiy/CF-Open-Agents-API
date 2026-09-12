@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["@cloudflare/workers-types", "node"],
+    "paths": {
+      "cf-open-agents-api": ["./packages/agent-api/src/index.ts"],
+      "cf-open-agents-api/*": ["./packages/agent-api/src/*.ts"]
+    }
+  },
+  "include": ["packages/**/*.ts", "examples/**/*.ts", "tests/**/*.ts", "*.config.ts"],
+  "exclude": ["**/dist", "node_modules", "examples/worker/env.d.ts"]
+}

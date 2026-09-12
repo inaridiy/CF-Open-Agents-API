@@ -1,0 +1,88 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "cf-open-agents-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SESSIONS",
+        "class_name": "SessionDO"
+      },
+      {
+        "name": "CATALOG",
+        "class_name": "TenantCatalogDO"
+      },
+      {
+        "name": "HARNESS",
+        "class_name": "HarnessDO"
+      },
+      {
+        "name": "SANDBOX",
+        "class_name": "SandboxDO"
+      },
+      {
+        "name": "AI_HARNESS",
+        "class_name": "AIHarnessDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "SessionDO",
+        "TenantCatalogDO",
+        "HarnessDO",
+        "SandboxDO",
+        "AIHarnessDO"
+      ]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "HarnessDO",
+      "image": "../../docker/Harness.Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "basic",
+      "max_instances": 10
+    },
+    {
+      "class_name": "SandboxDO",
+      "image": "../../docker/Sandbox.Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "standard-1",
+      "max_instances": 10
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CHECKPOINTS",
+      "bucket_name": "cf-open-agents-api-checkpoints"
+    },
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "cf-open-agents-api-workspaces"
+    }
+  ],
+  "services": [
+    {
+      "binding": "MODEL_GATEWAY",
+      "service": "cf-open-agents-api",
+      "entrypoint": "Models"
+    }
+  ],
+  "vars": {
+    "BACKUP_BUCKET_NAME": "cf-open-agents-api-workspaces"
+  },
+  "ai": {
+    "binding": "AI"
+  }
+}
