@@ -8,7 +8,7 @@ import type {
 } from "./protocol.js";
 import { identifier } from "./protocol.js";
 import type { RuntimeEvent } from "./runtime.js";
-import type { SessionRecord } from "./session.js";
+import type { ActiveSession, SessionRecord } from "./session.js";
 import type { SqlStore } from "./storage.js";
 
 type OutputItem = JsonWire<UpstreamOutputItem>;
@@ -19,9 +19,12 @@ interface OutputPosition {
 }
 
 /** Called inside the SessionDO transition transaction. Emits no network I/O. */
-export function acceptRuntimeEvent(db: SqlStore, record: SessionRecord, event: RuntimeEvent): void {
-  const turnId = record.execution?.turnId;
-  if (!turnId) return;
+export function acceptRuntimeEvent(
+  db: SqlStore,
+  record: ActiveSession,
+  event: RuntimeEvent,
+): ActiveSession {
+  const turnId = record.execution.turnId;
   const context = { session_id: record.session.id, turn_id: turnId };
   const emit = (event: AgentSessionEvent) => {
     db.append(event);
@@ -122,7 +125,7 @@ export function acceptRuntimeEvent(db: SqlStore, record: SessionRecord, event: R
       });
     }
     save(item);
-    return;
+    return record;
   }
   const item: OutputItem =
     event.type === "function_call"
@@ -156,28 +159,35 @@ export function acceptRuntimeEvent(db: SqlStore, record: SessionRecord, event: R
     output_index: index,
   });
   if (event.type === "function_call") {
-    if (
-      !record.session.required_actions.some(
-        (action) => action.type === "function_call" && action.call_id === event.callId,
-      )
+    const required_actions = record.session.required_actions.some(
+      (action) => action.type === "function_call" && action.call_id === event.callId,
     )
-      record.session.required_actions.push({
-        type: "function_call",
-        turn_id: turnId,
-        call_id: event.callId,
-        name: event.name,
-        arguments: event.arguments,
-      });
-    record.session.status = "requires_action";
+      ? record.session.required_actions
+      : [
+          ...record.session.required_actions,
+          {
+            type: "function_call" as const,
+            turn_id: turnId,
+            call_id: event.callId,
+            name: event.name,
+            arguments: event.arguments,
+          },
+        ];
+    const next: ActiveSession = {
+      ...record,
+      session: { ...record.session, required_actions, status: "requires_action" },
+    };
     const turn = db.require<Turn>("turn", turnId);
     turn.status = "waiting";
     db.put("turn", turnId, turn);
     emit({
       type: "agent.session.requires_action",
       event_id: identifier("evt"),
-      session: record.session,
+      session: next.session,
     });
+    return next;
   }
+  return record;
 }
 
 export function recordToolResult(

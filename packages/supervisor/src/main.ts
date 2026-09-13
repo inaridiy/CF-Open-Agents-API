@@ -1,29 +1,57 @@
 import { serve } from "@hono/node-server";
-import { z } from "zod";
+import { io, runPromise } from "cf-open-agents-api";
+import { Config, Effect } from "effect";
 import { createSupervisor } from "./server.js";
 
-const config = z
-  .object({
-    PORT: z.coerce.number().int().min(1).max(65_535).default(8080),
-    CODEX_BINARY: z.string().default("codex"),
-    OPENCODE_BINARY: z.string().default("opencode"),
-    STATE_DIRECTORY: z.string().default("/app/state"),
-    MODEL_BASE_URL: z.url().default("http://model.internal/v1"),
-    SANDBOX_URL: z.url().default("ws://sandbox.internal"),
-  })
-  .parse(process.env);
-const supervisor = createSupervisor({
-  binary: config.CODEX_BINARY,
-  opencodeBinary: config.OPENCODE_BINARY,
-  supervisorUrl: `http://127.0.0.1:${config.PORT}`,
-  directory: config.STATE_DIRECTORY,
-  modelBaseUrl: config.MODEL_BASE_URL,
-  sandboxUrl: config.SANDBOX_URL,
-  diagnostics: (line) => console.error(line),
+const config = Config.all({
+  port: Config.integer("PORT").pipe(
+    Config.withDefault(8080),
+    Config.validate({
+      message: "PORT must be between 1 and 65535",
+      validation: (value) => value >= 1 && value <= 65535,
+    }),
+  ),
+  binary: Config.string("CODEX_BINARY").pipe(Config.withDefault("codex")),
+  opencodeBinary: Config.string("OPENCODE_BINARY").pipe(Config.withDefault("opencode")),
+  directory: Config.string("STATE_DIRECTORY").pipe(Config.withDefault("/app/state")),
+  modelBaseUrl: Config.url("MODEL_BASE_URL").pipe(
+    Config.withDefault(new URL("http://model.internal/v1")),
+  ),
+  sandboxUrl: Config.url("SANDBOX_URL").pipe(Config.withDefault(new URL("ws://sandbox.internal"))),
 });
-const server = serve({ fetch: supervisor.app.fetch, port: config.PORT });
-for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.once(signal, () => {
-    void supervisor.stop().finally(() => server.close());
+const shutdown = Effect.async<void>((resume) => {
+  const stop = () => resume(Effect.void);
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  return Effect.sync(() => {
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
   });
-}
+});
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const settings = yield* config;
+    const supervisor = createSupervisor({
+      ...settings,
+      modelBaseUrl: settings.modelBaseUrl.href.replace(/\/$/, ""),
+      sandboxUrl: settings.sandboxUrl.href,
+      supervisorUrl: `http://127.0.0.1:${settings.port}`,
+      diagnostics: (line) => console.error(line),
+    });
+    yield* Effect.acquireRelease(
+      Effect.sync(() => serve({ fetch: supervisor.app.fetch, port: settings.port })),
+      (server) =>
+        io("supervisor.shutdown", async () => {
+          try {
+            await supervisor.stop();
+          } finally {
+            await new Promise<void>((resolve, reject) =>
+              server.close((error) => (error ? reject(error) : resolve())),
+            );
+          }
+        }).pipe(Effect.orDie),
+    );
+    yield* shutdown;
+  }),
+);
+await runPromise(program);

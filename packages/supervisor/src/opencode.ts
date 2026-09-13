@@ -15,7 +15,7 @@ export class OpenCodeJob extends ToolJob {
     super(execution, options);
     this.home = join(options.directory, "opencode");
   }
-  async start(bundle?: unknown): Promise<void> {
+  protected async open(bundle?: unknown): Promise<void> {
     const previous = await this.prepare(bundle);
     // Native OpenCode installs plugin dependencies into writable config directories.
     // Our plugin is already bundled: a read-only config keeps startup offline.

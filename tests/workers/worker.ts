@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
 import type {
   Execution,
@@ -7,6 +6,7 @@ import type {
   RuntimeCommand,
   RuntimeDriver,
 } from "../../packages/agent-api/src/runtime.js";
+import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import { type AgentBindings, createAgentService } from "../../packages/agent-api/src/service.js";
 
 export interface TestEnv extends AgentBindings {
@@ -74,7 +74,7 @@ export class ScriptedHarness extends DurableObject {
 }
 function fixture(env: TestEnv): RuntimeDriver {
   const stub = (execution: Execution) => env.SCRIPTED.getByName(execution.turnId);
-  return {
+  return fromPromiseDriver({
     name: "fixture",
     revision: "test-v1",
     capabilities: { steer: true, functions: true, sandbox: false },
@@ -97,7 +97,7 @@ function fixture(env: TestEnv): RuntimeDriver {
     stop: async (execution) => {
       await stub(execution).stop();
     },
-  };
+  });
 }
 const service = createAgentService<TestEnv>({
   agents: {

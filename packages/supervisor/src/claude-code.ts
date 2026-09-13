@@ -17,7 +17,7 @@ export class ClaudeCodeJob extends ToolJob {
     super(execution, options);
     this.home = join(options.directory, "claude-code");
   }
-  async start(bundle?: unknown): Promise<void> {
+  protected async open(bundle?: unknown): Promise<void> {
     const previous = await this.prepare(bundle);
     const aliases = this.execution.sandbox
       ? Object.fromEntries(

@@ -1,9 +1,11 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { Effect } from "effect";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource } from "./catalog.js";
+import { attempt, io, runPromise } from "./effect.js";
 import type {
   Agent,
   AgentSession,
@@ -71,10 +73,14 @@ export function createAgentService<Env extends AgentBindings>(
         );
       return this.env.CATALOG.getByName(tenant);
     }
-    private async session(tenant: string, id: string) {
-      if (!(await this.catalog(tenant).owns(id)))
-        throw new ApiError(404, "not_found", "Session not found");
-      return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
+    private session(tenant: string, id: string) {
+      return runPromise(
+        Effect.gen(this, function* () {
+          if (!(yield* io("api.session", () => this.catalog(tenant).owns(id))))
+            return yield* Effect.fail(new ApiError(404, "not_found", "Session not found"));
+          return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
+        }),
+      );
     }
     private validateModel(model: string, tools: number, sandbox: boolean) {
       const registration = options.agents[model];
@@ -92,115 +98,159 @@ export function createAgentService<Env extends AgentBindings>(
         );
       return { registration, driver };
     }
-    async createSession(
+    createSession(
       tenant: string,
       parameters: CreateSession,
       idempotencyKey = identifier("key"),
     ): Promise<AgentSession> {
-      const input = parse(createSessionSchema, parameters);
-      const catalog = this.catalog(tenant);
-      const saved: Agent | undefined = input.agent_id
-        ? await catalog.agent(input.agent_id)
-        : undefined;
-      const agent = parse(agentConfigSchema, {
-        ...(saved
-          ? { model: saved.model, instructions: saved.instructions, tools: saved.tools }
-          : {}),
-        ...input.agent,
-      });
-      const { registration, driver } = this.validateModel(
-        agent.model,
-        agent.tools?.length ?? 0,
-        input.environment.type !== "none",
+      return runPromise(
+        Effect.gen(this, function* () {
+          const input = yield* attempt("api.validate", () =>
+            parse(createSessionSchema, parameters),
+          );
+          const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
+          const fingerprint = canonicalJSON(input);
+          const previous = unwrap(
+            JSON.parse(
+              yield* io("api.reservation", () => catalog.reservation(idempotencyKey, fingerprint)),
+            ) as RpcResult<Reservation | null>,
+          );
+          const reservation =
+            previous ??
+            (yield* Effect.gen(this, function* () {
+              const agentId = input.agent_id;
+              const saved: Agent | undefined = agentId
+                ? yield* io("api.createSession", () => catalog.agent(agentId))
+                : undefined;
+              const agent = parse(agentConfigSchema, {
+                ...(saved
+                  ? { model: saved.model, instructions: saved.instructions, tools: saved.tools }
+                  : {}),
+                ...input.agent,
+              });
+              const { registration, driver } = this.validateModel(
+                agent.model,
+                agent.tools?.length ?? 0,
+                input.environment.type !== "none",
+              );
+              const resource = agentResource({
+                ...agent,
+                name: saved?.name,
+                tools: (agent.tools ?? []).map((tool) => ({ ...tool, defer_loading: false })),
+              });
+              if (saved) resource.id = saved.id;
+              const now = Math.floor(Date.now() / 1_000);
+              const session: AgentSession = {
+                id: identifier("sess"),
+                object: "agent.session",
+                agent: {
+                  id: resource.id,
+                  instructions: resource.instructions,
+                  model: resource.model,
+                  name: resource.name,
+                  multi_agent: resource.multi_agent,
+                  reasoning: resource.reasoning,
+                  service_tier: resource.service_tier,
+                  text: resource.text,
+                  tools: (agent.tools ?? []).map((tool) => ({ ...tool, defer_loading: false })),
+                },
+                created_at: now,
+                last_active_at: now,
+                status: "idle",
+                error: null,
+                required_actions: [],
+                metadata: input.metadata ?? {},
+                usage: null,
+                vault_ids: [],
+                environment:
+                  input.environment.type === "none"
+                    ? { type: "none" }
+                    : {
+                        type: "openai_hosted",
+                        id: identifier("env"),
+                        capability_directories: [],
+                        files: [],
+                        plugins: [],
+                        skills: [],
+                        network: { access: "enabled", allowed_domains: [] },
+                        packages: { npm: [], python: [], system: [] },
+                      },
+              };
+              const record: SessionRecord = {
+                tenant,
+                session,
+                agent,
+                driver: driver.name,
+                revision: driver.revision,
+                model: registration.model,
+                generation: 0,
+                checkpoint: null,
+                execution: null,
+                cursor: 0,
+                phase: "idle",
+                deleted: false,
+              };
+              return unwrap(
+                JSON.parse(
+                  yield* io("api.createSession", () =>
+                    catalog.reserve(idempotencyKey, fingerprint, record),
+                  ),
+                ) as RpcResult<Reservation>,
+              );
+            }));
+          const stub = this.env.SESSIONS.getByName(JSON.stringify([tenant, reservation.id]));
+          if (reservation.ready) return yield* io("api.createSession", () => stub.retrieve());
+          yield* io("api.createSession", () => stub.initialize(reservation.record));
+          const initialInput = input.input;
+          if (initialInput)
+            unwrap(
+              yield* io<RpcResult<null>>("api.createSession", () =>
+                stub.submit(
+                  [{ type: "agent.session.input.message", input: inputMessages(initialInput) }],
+                  `${idempotencyKey}:initial`,
+                ),
+              ),
+            );
+          yield* io("api.createSession", () => catalog.commit(idempotencyKey));
+          return yield* io("api.createSession", () => stub.retrieve());
+        }),
       );
-      const resource = agentResource({
-        ...agent,
-        name: saved?.name,
-        tools: (agent.tools ?? []).map((tool) => ({ ...tool, defer_loading: false })),
-      });
-      if (saved) resource.id = saved.id;
-      const now = Math.floor(Date.now() / 1_000);
-      const session: AgentSession = {
-        id: identifier("sess"),
-        object: "agent.session",
-        agent: {
-          id: resource.id,
-          instructions: resource.instructions,
-          model: resource.model,
-          name: resource.name,
-          multi_agent: resource.multi_agent,
-          reasoning: resource.reasoning,
-          service_tier: resource.service_tier,
-          text: resource.text,
-          tools: (agent.tools ?? []).map((tool) => ({ ...tool, defer_loading: false })),
-        },
-        created_at: now,
-        last_active_at: now,
-        status: "idle",
-        error: null,
-        required_actions: [],
-        metadata: input.metadata ?? {},
-        usage: null,
-        vault_ids: [],
-        environment:
-          input.environment.type === "none"
-            ? { type: "none" }
-            : {
-                type: "openai_hosted",
-                id: identifier("env"),
-                capability_directories: [],
-                files: [],
-                plugins: [],
-                skills: [],
-                network: { access: "enabled", allowed_domains: [] },
-                packages: { npm: [], python: [], system: [] },
-              },
-      };
-      const record: SessionRecord = {
-        tenant,
-        session,
-        agent,
-        driver: driver.name,
-        revision: driver.revision,
-        model: registration.model,
-        generation: 0,
-        checkpoint: null,
-        execution: null,
-        cursor: 0,
-        phase: "idle",
-        deleted: false,
-      };
-      const reservation = unwrap(
-        JSON.parse(
-          await catalog.reserve(idempotencyKey, canonicalJSON(input), record),
-        ) as RpcResult<Reservation>,
+    }
+    retrieveSession(tenant: string, id: string): Promise<AgentSession> {
+      return runPromise(
+        Effect.gen(this, function* () {
+          const stub = yield* io("api.retrieveSession", () => this.session(tenant, id));
+          return yield* io("api.retrieveSession", () => stub.retrieve());
+        }),
       );
-      const stub = this.env.SESSIONS.getByName(JSON.stringify([tenant, reservation.id]));
-      if (reservation.ready) return stub.retrieve();
-      await stub.initialize(reservation.record);
-      if (input.input)
-        unwrap(
-          await stub.submit(
-            [{ type: "agent.session.input.message", input: inputMessages(input.input) }],
-            `${idempotencyKey}:initial`,
-          ),
-        );
-      await catalog.commit(idempotencyKey);
-      return stub.retrieve();
     }
-    async retrieveSession(tenant: string, id: string): Promise<AgentSession> {
-      return (await this.session(tenant, id)).retrieve();
+    submitEvents(tenant: string, id: string, events: InputEvent[], key = identifier("key")) {
+      return runPromise(
+        Effect.gen(this, function* () {
+          const parsed = parse(eventsSchema, { events });
+          const stub = yield* io("api.submitEvents", () => this.session(tenant, id));
+          unwrap(
+            yield* io<RpcResult<null>>("api.submitEvents", () => stub.submit(parsed.events, key)),
+          );
+        }),
+      );
     }
-    async submitEvents(tenant: string, id: string, events: InputEvent[], key = identifier("key")) {
-      const parsed = parse(eventsSchema, { events });
-      unwrap(await (await this.session(tenant, id)).submit(parsed.events, key));
-    }
-    async listSessions(tenant: string, query: PageQuery): Promise<ListPage<AgentSession>> {
-      const page = await this.catalog(tenant).sessions(parse(pageSchema, query));
-      return {
-        ...page,
-        data: await Promise.all(page.data.map(({ id }) => this.retrieveSession(tenant, id))),
-      };
+    listSessions(tenant: string, query: PageQuery): Promise<ListPage<AgentSession>> {
+      return runPromise(
+        Effect.gen(this, function* () {
+          const page = yield* io("api.listSessions", () =>
+            this.catalog(tenant).sessions(parse(pageSchema, query)),
+          );
+          return {
+            ...page,
+            data: yield* Effect.forEach(
+              page.data,
+              ({ id }) => io("api.retrieveSession", () => this.retrieveSession(tenant, id)),
+              { concurrency: 8 },
+            ),
+          };
+        }),
+      );
     }
     override async fetch(request: Request): Promise<Response> {
       const app = new Hono<{ Variables: { tenant: string } }>();

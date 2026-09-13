@@ -14,6 +14,20 @@ export interface Reservation {
 /** One catalog per authenticated tenant, never one global object. */
 export class CatalogObject extends DurableObject {
   readonly db = new SqlStore(this.ctx.storage);
+  reservation(key: string, fingerprint: string): string {
+    try {
+      const previous = this.db.get<Reservation>("reservation", key);
+      if (previous && previous.fingerprint !== fingerprint)
+        throw new ApiError(
+          409,
+          "idempotency_conflict",
+          "Key was used with different session parameters",
+        );
+      return JSON.stringify({ ok: true, value: previous ?? null });
+    } catch (error) {
+      return JSON.stringify(rpcFailure(error));
+    }
+  }
   reserve(key: string, fingerprint: string, record: SessionRecord): string {
     try {
       const value = this.db.transaction(() => {
@@ -39,8 +53,8 @@ export class CatalogObject extends DurableObject {
   commit(key: string): void {
     this.db.transaction(() => {
       const reservation = this.db.require<Reservation>("reservation", key);
-      reservation.ready = true;
-      this.db.put("reservation", key, reservation);
+      if (reservation.ready) return;
+      this.db.put("reservation", key, { ...reservation, ready: true });
       this.db.put("session", reservation.id, {
         id: reservation.id,
         agent_id: reservation.record.session.agent.id,

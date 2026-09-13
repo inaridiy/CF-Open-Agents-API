@@ -1,6 +1,8 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { jsonSchema, type LanguageModel, type LanguageModelUsage, streamText, tool } from "ai";
-import { readModelBody } from "./models/body.js";
+import { Context, Effect, Layer } from "effect";
+import { attempt, io, runPromise, type ServiceError } from "./effect.js";
+import { readModelBodyEffect } from "./models/body.js";
 import { decodeModelRequest } from "./models/input.js";
 import { encodeModelResponse, type ModelChunk } from "./models/output.js";
 import { ApiError } from "./protocol.js";
@@ -10,6 +12,14 @@ export interface ModelAdapter {
   fetch(request: Request): Promise<Response>;
 }
 
+export interface EffectModelAdapter extends ModelAdapter {
+  readonly effect: (request: Request) => Effect.Effect<Response, ServiceError>;
+}
+export const modelAdapter = (effect: EffectModelAdapter["effect"]): EffectModelAdapter => ({
+  effect,
+  fetch: (request) => runPromise(effect(request)),
+});
+
 export interface AIModelOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
@@ -17,10 +27,10 @@ export interface AIModelOptions {
 }
 
 /** Accepts an already instantiated AI SDK model, including Workers AI providers. */
-export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): ModelAdapter {
-  return {
-    async fetch(request) {
-      const input = await decodeModelRequest(request);
+export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): EffectModelAdapter {
+  return modelAdapter((request) =>
+    Effect.gen(function* () {
+      const input = yield* io("model.decode", () => decodeModelRequest(request));
       const controller = new AbortController();
       const result = streamText({
         model,
@@ -77,9 +87,11 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
           }
         }
       }
-      return encodeModelResponse(input, chunks(), () => controller.abort());
-    },
-  };
+      return yield* io("model.encode", () =>
+        encodeModelResponse(input, chunks(), () => controller.abort()),
+      ).pipe(Effect.onError(() => Effect.sync(() => controller.abort())));
+    }),
+  );
 }
 
 export interface OpenAICompatibleOptions extends AIModelOptions {
@@ -91,7 +103,7 @@ export interface OpenAICompatibleOptions extends AIModelOptions {
 }
 
 /** Chat Completions upstream; the gateway translates the harness's wire protocol. */
-export function openAICompatibleModel(options: OpenAICompatibleOptions): ModelAdapter {
+export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectModelAdapter {
   const provider = createOpenAICompatible({
     name: "compatible",
     baseURL: options.baseURL,
@@ -109,7 +121,7 @@ export function nativeModel(options: {
   apiKey: string;
   model: string;
   fetch?: typeof globalThis.fetch;
-}): ModelAdapter {
+}): EffectModelAdapter {
   if (!options.apiKey?.trim() || !options.model?.trim())
     throw new Error("A model and API key are required");
   const paths = {
@@ -120,16 +132,16 @@ export function nativeModel(options: {
   const base = new URL(options.baseURL.endsWith("/") ? options.baseURL : `${options.baseURL}/`);
   if (base.username || base.password || !["https:", "http:"].includes(base.protocol))
     throw new Error("Invalid model base URL");
-  return {
-    async fetch(request) {
+  return modelAdapter((request) =>
+    Effect.gen(function* () {
       const path = new URL(request.url).pathname.replace(/^\/v1/, "");
       if (path !== paths[options.protocol])
-        throw new ApiError(
+        return yield* new ApiError(
           400,
           "model_protocol_mismatch",
           "Model preset does not support this harness protocol",
         );
-      const body = await request.json<Record<string, unknown>>();
+      const body = yield* io("model.body", () => request.json<Record<string, unknown>>());
       const headers = new Headers({ "content-type": "application/json" });
       if (options.protocol === "anthropic") {
         headers.set("x-api-key", options.apiKey);
@@ -137,48 +149,75 @@ export function nativeModel(options: {
         const beta = request.headers.get("anthropic-beta");
         if (beta) headers.set("anthropic-beta", beta);
       } else headers.set("authorization", `Bearer ${options.apiKey}`);
-      return (options.fetch ?? globalThis.fetch)(new URL(path.slice(1), base), {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ ...body, model: options.model }),
-        signal: request.signal,
-        redirect: "error",
-      });
-    },
-  };
+      return yield* io("model.fetch", (signal) =>
+        (options.fetch ?? globalThis.fetch)(new URL(path.slice(1), base), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...body, model: options.model }),
+          signal: AbortSignal.any([request.signal, signal]),
+          redirect: "error",
+        }),
+      );
+    }),
+  );
 }
+
+class Models extends Context.Tag("agent-api/Models")<
+  Models,
+  Readonly<Record<string, ModelAdapter>>
+>() {}
 
 /** Compose behind a private Service Binding, never a public unauthenticated route. */
 export function createModelGateway<Env>(models: (env: Env) => Record<string, ModelAdapter>): {
   fetch(request: Request, env: Env): Promise<Response>;
 } {
   return {
-    async fetch(request, env) {
-      try {
-        if (request.method !== "POST") return new Response(null, { status: 405 });
-        const bytes = await readModelBody(request);
-        const body = JSON.parse(new TextDecoder().decode(bytes)) as { model?: unknown } | null;
-        const registry = models(env);
-        if (!body || typeof body.model !== "string" || !Object.hasOwn(registry, body.model))
-          throw new ApiError(404, "model_not_found", "No model is registered with this name");
-        const adapter = registry[body.model];
-        if (!adapter)
-          throw new ApiError(404, "model_not_found", "No model is registered with this name");
-        return await adapter.fetch(new Request(request, { body: bytes }));
-      } catch (error) {
-        const status = error instanceof ApiError ? error.status : 400;
-        return Response.json(
-          {
-            error: {
-              type: "model_gateway_error",
-              message:
-                error instanceof ApiError ? error.message : "Invalid or unsupported model request",
-            },
-          },
-          { status },
-        );
-      }
-    },
+    fetch: (request, env) =>
+      runPromise(
+        Effect.gen(function* () {
+          if (request.method !== "POST") return new Response(null, { status: 405 });
+          const bytes = yield* readModelBodyEffect(request);
+          const body = yield* attempt(
+            "model.json",
+            () => JSON.parse(new TextDecoder().decode(bytes)) as { model?: unknown } | null,
+          );
+          const registry = yield* Models;
+          if (!body || typeof body.model !== "string" || !Object.hasOwn(registry, body.model))
+            return yield* new ApiError(
+              404,
+              "model_not_found",
+              "No model is registered with this name",
+            );
+          const adapter = registry[body.model];
+          if (!adapter)
+            return yield* new ApiError(
+              404,
+              "model_not_found",
+              "No model is registered with this name",
+            );
+          return yield* io("model.inference", () =>
+            adapter.fetch(new Request(request, { body: bytes })),
+          );
+        }).pipe(
+          Effect.provide(Layer.sync(Models, () => models(env))),
+          Effect.catchAll((error) =>
+            Effect.succeed(
+              Response.json(
+                {
+                  error: {
+                    type: "model_gateway_error",
+                    message:
+                      error instanceof ApiError
+                        ? error.message
+                        : "Invalid or unsupported model request",
+                  },
+                },
+                { status: error instanceof ApiError ? error.status : 400 },
+              ),
+            ),
+          ),
+        ),
+      ),
   };
 }
 

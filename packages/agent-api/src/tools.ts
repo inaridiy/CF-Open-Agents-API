@@ -1,4 +1,5 @@
-import { z } from "zod";
+import { Effect, JSONSchema, Schema } from "effect";
+import { decode, decodeEffect, io, runPromise, type ServiceError } from "./effect.js";
 import { ApiError } from "./protocol.js";
 
 export interface ToolContext {
@@ -7,50 +8,65 @@ export interface ToolContext {
   operationId: string;
   signal: AbortSignal;
 }
-export interface ToolDefinition<Input = unknown, Output = unknown> {
+export interface ToolDefinition<
+  Input = unknown,
+  Output = unknown,
+  E = ServiceError,
+  EncodedInput = Input,
+  EncodedOutput = Output,
+> {
   name: string;
   description: string;
-  input: z.ZodType<Input>;
-  output: z.ZodType<Output>;
+  input: Schema.Schema<Input, EncodedInput>;
+  output: Schema.Schema<Output, EncodedOutput>;
   effects: "read" | "write";
   retry: "safe" | "reconcile" | "never";
-  execute: (input: Input, context: ToolContext) => Promise<Output>;
+  execute: (input: Input, context: ToolContext) => Effect.Effect<Output, E>;
 }
 
-export function defineTool<Input, Output>(definition: ToolDefinition<Input, Output>) {
+export function defineTool<Input, Output, E, EncodedInput, EncodedOutput>(
+  definition: ToolDefinition<Input, Output, E, EncodedInput, EncodedOutput>,
+) {
+  const effect = (input: unknown, context: ToolContext) =>
+    Effect.gen(function* () {
+      const value = yield* decodeEffect(definition.input, input);
+      const output = yield* definition.execute(value, context);
+      return yield* decodeEffect(Schema.typeSchema(definition.output), output);
+    });
   return {
     ...definition,
-    async call(input: unknown, context: ToolContext): Promise<Output> {
-      return definition.output.parse(
-        await definition.execute(definition.input.parse(input), context),
-      );
-    },
+    effect,
+    call: (input: unknown, context: ToolContext): Promise<Output> =>
+      runPromise(effect(input, context)),
     spec: {
       type: "function" as const,
       name: definition.name,
       description: definition.description,
-      parameters: z.toJSONSchema(definition.input),
+      parameters: JSONSchema.make(definition.input),
     },
   };
 }
 
-const searchResult = z.strictObject({
-  title: z.string(),
-  url: z.url(),
-  snippet: z.string(),
+const searchResult = Schema.Struct({
+  title: Schema.String,
+  url: Schema.String.pipe(Schema.filter((value) => URL.canParse(value))),
+  snippet: Schema.String,
 });
-export type SearchResult = z.infer<typeof searchResult>;
+export type SearchResult = typeof searchResult.Type;
 export function webSearch(
   provider: (query: string, signal: AbortSignal) => Promise<SearchResult[]>,
 ) {
   return defineTool({
     name: "web_search",
     description: "Search the public web. Results include URLs for citations.",
-    input: z.strictObject({ query: z.string().min(1).max(2_000) }),
-    output: z.array(searchResult).max(50),
+    input: Schema.Struct({
+      query: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(2000)),
+    }),
+    output: Schema.mutable(Schema.Array(searchResult)).pipe(Schema.maxItems(50)),
     effects: "read",
     retry: "safe",
-    execute: ({ query }, { signal }) => provider(query, signal),
+    execute: ({ query }, { signal }) =>
+      io("tool.search", (interrupted) => provider(query, AbortSignal.any([signal, interrupted]))),
   });
 }
 
@@ -69,10 +85,10 @@ export function knowledgeSearch(
   };
 }
 
-export const skillManifestSchema = z.strictObject({
-  name: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/),
-  description: z.string().min(1).max(1_024),
-  files: z.record(z.string(), z.string().max(512_000)),
+export const skillManifestSchema = Schema.Struct({
+  name: Schema.String.pipe(Schema.pattern(/^[a-z0-9][a-z0-9-]{0,63}$/)),
+  description: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(1024)),
+  files: Schema.Record({ key: Schema.String, value: Schema.String.pipe(Schema.maxLength(512000)) }),
 });
 
 export interface SkillReference {
@@ -90,7 +106,7 @@ export async function publishSkill(bucket: R2Bucket, input: unknown): Promise<Sk
 }
 
 function serializeSkill(input: unknown) {
-  const manifest = skillManifestSchema.parse(input);
+  const manifest = decode(skillManifestSchema, input);
   for (const path of Object.keys(manifest.files)) {
     if (
       path.startsWith("/") ||
@@ -139,18 +155,22 @@ export function skillReader(bucket: R2Bucket, allowed: Record<string, SkillRefer
   return defineTool({
     name: "read_skill",
     description: `Read an installed skill file. Start with SKILL.md. Available skills: ${Object.keys(allowed).join(", ")}`,
-    input: z.strictObject({ name: z.string(), path: z.string().default("SKILL.md") }),
-    output: z.string().max(512_000),
+    input: Schema.Struct({
+      name: Schema.String,
+      path: Schema.optionalWith(Schema.String, { default: () => "SKILL.md" }),
+    }),
+    output: Schema.String.pipe(Schema.maxLength(512000)),
     effects: "read",
     retry: "safe",
-    execute: async ({ name, path }) => {
-      const reference = Object.hasOwn(allowed, name) ? allowed[name] : undefined;
-      if (!reference) throw new ApiError(404, "skill_missing", "Skill is not installed");
-      const manifest = await loadSkill(bucket, reference);
-      if (!Object.hasOwn(manifest.files, path))
-        throw new ApiError(404, "skill_file_missing", "Skill file not found");
-      return manifest.files[path] as string;
-    },
+    execute: ({ name, path }) =>
+      Effect.gen(function* () {
+        const reference = Object.hasOwn(allowed, name) ? allowed[name] : undefined;
+        if (!reference) return yield* new ApiError(404, "skill_missing", "Skill is not installed");
+        const manifest = yield* io("skill.load", () => loadSkill(bucket, reference));
+        if (!Object.hasOwn(manifest.files, path))
+          return yield* new ApiError(404, "skill_file_missing", "Skill file not found");
+        return manifest.files[path] as string;
+      }),
   });
 }
 

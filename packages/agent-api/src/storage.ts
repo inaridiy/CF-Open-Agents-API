@@ -1,3 +1,4 @@
+import type { Effect } from "effect";
 import {
   type Compilable,
   DummyDriver,
@@ -9,6 +10,23 @@ import {
 } from "kysely";
 import type { PageQuery } from "./protocol.js";
 import { ApiError } from "./protocol.js";
+
+// Leave space for SQLite's row metadata below the platform's 2 MB row limit.
+const MAX_ROW_BYTES = 1_900_000;
+function encodeRow(value: unknown, ...keys: string[]): string {
+  const serialized = JSON.stringify(value);
+  const encoder = new TextEncoder();
+  const size =
+    encoder.encode(serialized).byteLength +
+    keys.reduce((total, key) => total + encoder.encode(key).byteLength, 0);
+  if (size > MAX_ROW_BYTES)
+    throw new ApiError(
+      413,
+      "storage_record_too_large",
+      "Serialized record exceeds 1,900,000 bytes",
+    );
+  return serialized;
+}
 
 interface Database {
   records: { kind: string; id: string; seq: number; value: string };
@@ -97,11 +115,12 @@ export class SqlStore {
       this.queries.selectFrom("records").select("seq").orderBy("seq", "desc").limit(1),
     )[0]?.seq ?? 0) + 1,
   ): void {
+    const encoded = encodeRow(value, kind, id);
     this.execute(
       this.queries
         .insertInto("records")
-        .values({ kind, id, seq, value: JSON.stringify(value) })
-        .onConflict((c) => c.columns(["kind", "id"]).doUpdateSet({ value: JSON.stringify(value) })),
+        .values({ kind, id, seq, value: encoded })
+        .onConflict((c) => c.columns(["kind", "id"]).doUpdateSet({ value: encoded })),
     );
   }
   remove(kind: string, id: string): void {
@@ -161,7 +180,7 @@ export class SqlStore {
     const row = this.execute(
       this.queries
         .insertInto("events")
-        .values({ value: JSON.stringify(value) })
+        .values({ value: encodeRow(value) })
         .returning("seq"),
     )[0];
     if (!row) throw new Error("SQLite did not return the event sequence");
@@ -184,7 +203,10 @@ export class SqlStore {
       )[0]?.seq ?? 0
     );
   }
-  transaction<T>(callback: () => T): T {
+  transaction<T>(
+    callback: () => T &
+      (T extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown),
+  ): T {
     return this.storage.transactionSync(callback);
   }
 }

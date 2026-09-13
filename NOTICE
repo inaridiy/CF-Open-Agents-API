@@ -1,0 +1,25 @@
+CF-Open-Agents-API
+Copyright 2026 inaridiy and contributors
+
+This project is licensed under Apache-2.0 (see LICENSE).
+
+The repository includes development guidance derived from the following projects.
+These files are not included in the npm package. License copies are kept alongside
+each installed skill; skills-lock.json retains installer provenance.
+
+Cloudflare skills — https://github.com/cloudflare/skills
+  License: Apache-2.0
+  Files: .agents/skills/durable-objects/, sandbox-next/,
+         workers-best-practices/, wrangler/
+  License verified at b052c32bab7dd493513260228a36c88294f343f1.
+  These installed copies include adaptations to this project's versions, testing
+  guidance and runtime conventions; they are not unmodified upstream releases.
+
+Effect-TS skills — https://github.com/Effect-TS/skills
+  License: MIT
+  Files: .agents/skills/effect-ts/
+  License verified at 2309e6f27d9955b434c0e3f394b945c136e89fd2.
+  The full copyright and permission notice is retained in that directory's LICENSE.
+
+Runtime dependencies are distributed separately under their own package licenses.
+No ownership of upstream trademarks or endorsement by their owners is implied.

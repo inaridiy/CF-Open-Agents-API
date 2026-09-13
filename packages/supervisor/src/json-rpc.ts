@@ -1,6 +1,9 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { attempt, runPromise, runSync } from "cf-open-agents-api";
+import { Deferred, Effect, Ref } from "effect";
 import { z } from "zod";
+import { once } from "./lifecycle.js";
 
 const envelope = z.object({
   id: z.union([z.string(), z.number()]).optional(),
@@ -15,15 +18,22 @@ export type RpcMessage = z.infer<typeof envelope>;
 export class AppServer {
   private readonly child: ChildProcessWithoutNullStreams;
   private nextId = 0;
-  private readonly pending = new Map<
-    number,
-    {
-      resolve: (value: unknown) => void;
-      reject: (error: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
+  private readonly pending = Ref.unsafeMake(new Map<number, Deferred.Deferred<unknown, Error>>());
+  private readonly exited = runSync(Deferred.make<void>());
   private closed = false;
+  private readonly stopped = once("app-server.stop", () =>
+    runPromise(
+      Effect.gen(this, function* () {
+        if (this.closed) return;
+        this.child.kill("SIGTERM");
+        yield* Deferred.await(this.exited).pipe(Effect.timeoutOption("3 seconds"));
+        if (!this.closed) {
+          this.child.kill("SIGKILL");
+          yield* Deferred.await(this.exited);
+        }
+      }),
+    ),
+  );
   constructor(options: {
     binary: string;
     directory: string;
@@ -52,33 +62,53 @@ export class AppServer {
         return;
       }
       if (typeof message.id === "number" && !message.method) {
-        const request = this.pending.get(message.id);
+        const request = runSync(Ref.get(this.pending)).get(message.id);
         if (!request) return;
-        this.pending.delete(message.id);
-        clearTimeout(request.timer);
-        if (message.error) request.reject(new Error(message.error.message));
-        else request.resolve(message.result);
+        if (message.error) runSync(Deferred.fail(request, new Error(message.error.message)));
+        else runSync(Deferred.succeed(request, message.result));
       } else options.onMessage(message);
     });
     createInterface({ input: this.child.stderr }).on("line", options.onDiagnostic);
-    this.child.on("error", (error) => this.fail(error));
+    this.child.on("error", (error) => {
+      this.closed = true;
+      this.fail(error);
+      runSync(Deferred.succeed(this.exited, undefined));
+    });
     this.child.on("exit", () => {
       this.closed = true;
       this.fail(new Error("App-server exited"));
+      runSync(Deferred.succeed(this.exited, undefined));
       options.onExit();
     });
   }
   request(method: string, params: unknown): Promise<unknown> {
-    if (this.closed) return Promise.reject(new Error("App-server is closed"));
-    const id = ++this.nextId;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`App-server request timed out: ${method}`));
-      }, 60_000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.write({ id, method, params });
-    });
+    return runPromise(
+      Effect.gen(this, function* () {
+        if (this.closed) return yield* Effect.fail(new Error("App-server is closed"));
+        const id = ++this.nextId;
+        return yield* Effect.acquireUseRelease(
+          Effect.gen(this, function* () {
+            const result = yield* Deferred.make<unknown, Error>();
+            yield* Ref.update(this.pending, (pending) => new Map(pending).set(id, result));
+            return result;
+          }),
+          (result) =>
+            attempt("app-server.write", () => this.write({ id, method, params })).pipe(
+              Effect.zipRight(Deferred.await(result)),
+              Effect.timeoutFail({
+                duration: "60 seconds",
+                onTimeout: () => new Error(`App-server request timed out: ${method}`),
+              }),
+            ),
+          () =>
+            Ref.update(this.pending, (pending) => {
+              const next = new Map(pending);
+              next.delete(id);
+              return next;
+            }),
+        );
+      }),
+    );
   }
   notify(method: string, params?: unknown): void {
     this.write({ method, params });
@@ -93,21 +123,10 @@ export class AppServer {
     this.child.stdin.write(`${JSON.stringify(value)}\n`);
   }
   private fail(error: Error): void {
-    for (const { reject, timer } of this.pending.values()) {
-      clearTimeout(timer);
-      reject(error);
-    }
-    this.pending.clear();
+    const pending = runSync(Ref.getAndSet(this.pending, new Map()));
+    for (const request of pending.values()) runSync(Deferred.fail(request, error));
   }
-  async stop(): Promise<void> {
-    if (this.closed) return;
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => this.child.kill("SIGKILL"), 3_000);
-      this.child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      this.child.kill("SIGTERM");
-    });
+  stop(): Promise<void> {
+    return runPromise(this.stopped);
   }
 }

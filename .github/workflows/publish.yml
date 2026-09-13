@@ -1,0 +1,49 @@
+name: Publish npm alpha
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag whose commit passed CI (for example v0.1.0)
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Verify release tag and CI
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$RELEASE_TAG" = "v$(node -p "require('./packages/agent-api/package.json').version")"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(gh api "repos/$REPOSITORY" --jq .private)" = false
+          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$(git rev-parse HEAD)&status=success" --jq '.workflow_runs | any(.event == "push")' | grep -qx true
+          test "$(gh api "repos/$REPOSITORY/private-vulnerability-reporting" --jq .enabled)" = true
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24.15.0'
+          package-manager-cache: false
+      - run: npm install --global pnpm@11.1.2 npm@11.12.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test:package
+      - run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          pnpm --filter cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
+      - name: Publish alpha with npm trusted publishing
+        run: npm publish "$RUNNER_TEMP"/release/*.tgz --access public --tag alpha --provenance

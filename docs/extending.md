@@ -41,6 +41,12 @@ import { createWorkersAI } from "workers-ai-provider";
 const model = aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash"));
 ```
 
+Both example IDs are listed in the providers' official catalogs:
+[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and
+[GLM-4.7-Flash](https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/)
+(checked September 13, 2026). Availability to a particular account and inference
+quality are separate from the scripted integration tests.
+
 The deployment supplies its AI SDK provider package. See the runnable
 [Worker composition](../examples/worker/src/index.ts) and Cloudflare's
 [AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
@@ -114,14 +120,22 @@ cancellation, external tools, and native checkpoint/restore.
 ## Additional harnesses
 
 Implement `RuntimeDriver` and register its name in `harnesses`. Start, poll, control,
-checkpoint, and stop are separate. Drivers must deduplicate operation IDs, fence
+checkpoint, and stop return `Effect<A, ServiceError>` and compose without starting
+a Promise. `fromPromiseDriver` adapts existing Promise implementations. Runtime
+schemas are Effect schemas; decode with `decodeEffect(schema, value)` inside a
+program or `decode(schema, value)` at a synchronous boundary.
+Drivers must deduplicate operation IDs, fence
 old attempts, preserve native history, and contain old executors before replacing
 them. A missing acknowledged job is a failure, not permission to start again.
 A DeepSeek model can use the model gateway; a DeepSeek harness needs its own driver.
 
+See [Effect architecture](effect.md) for ownership, errors and migration details.
+
 ## Tools and assets
 
-`defineTool` validates both arguments and results with Zod. It records the tool's
+`defineTool` validates arguments and results with Effect Schema and accepts an
+Effect-valued `execute`. Use its `effect` method for composition and its `call`
+Promise adapter in SDK tool handlers. It records the tool's
 effects and retry policy for application orchestration. `webSearch` and
 `knowledgeSearch` accept provider functions and return source URLs; a corpus search
 is not presented as a public-web search provider.

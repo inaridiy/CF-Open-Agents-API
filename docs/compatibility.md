@@ -42,14 +42,21 @@ A completed turn means its native checkpoint and, when applicable, workspace
 snapshot were uploaded and their references committed. Container processes, PTYs,
 open sockets, and external side effects are not checkpointed. A lost acknowledged
 execution fails with `outcome_unknown`; it is not restarted from the input log.
-Cancellation stops the current execution and returns the session to idle. The next
+Cancellation supersedes queued steering and function results, stops the current
+execution, and returns the session to idle after its native terminal outcome is
+confirmed. A durable cancellation operation survives retries and object eviction. The next
 turn restores the last completed checkpoint, so uncommitted cancelled-turn files
 and native history are discarded.
 
 Function results, metadata and inputs are session-scoped. Tenant catalogs isolate
 session discovery. Service Binding callers are trusted to provide the correct tenant.
 
-Request bodies are limited to 2 MB, native snapshots to 32 MiB, and the
+Request bodies are limited to 2 MB. Serialized SQLite records (including keys) are
+limited to 1,900,000 UTF-8 bytes, reserving space below the platform's
+[2 MB SQL row limit](https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits).
+Internal state can repeat input fields, so a smaller HTTP body can still produce
+`413 storage_record_too_large`; its SQL transaction rolls back. The same storage
+budget applies to Service Binding calls. Native snapshots are limited to 32 MiB, and the
 supervisor's unacknowledged output buffer to 8 MB. Turns have a 15-minute default deadline, including external tool waiting.
 Claude Code/OpenCode cap native turns at 32 steps. The AI SDK model adapter performs
 one inference per native request, with 8,192 output tokens and a 120-second timeout

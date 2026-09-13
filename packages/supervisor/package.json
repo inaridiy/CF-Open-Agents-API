@@ -15,6 +15,7 @@
     "@modelcontextprotocol/sdk": "1.30.0",
     "@opencode-ai/sdk": "1.18.30",
     "cf-open-agents-api": "workspace:*",
+    "effect": "3.22.2",
     "hono": "4.13.7",
     "zod": "4.6.2"
   }

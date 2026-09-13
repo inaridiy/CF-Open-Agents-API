@@ -13,13 +13,16 @@
     "format": "biome check --write .",
     "test": "vitest run",
     "test:codex": "vitest run --config vitest.codex.config.ts",
-    "check": "pnpm check:docs && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+    "check": "pnpm check:docs && pnpm check:harness && pnpm test:scripts && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
     "dev": "wrangler dev --config examples/worker/wrangler.jsonc",
     "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts",
     "deploy:check": "wrangler deploy --dry-run --config examples/worker/wrangler.jsonc",
     "test:containers": "node scripts/test-containers.mjs",
     "check:docs": "node scripts/check-docs.mjs",
-    "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts"
+    "check:harness": "node scripts/check-harness.mjs",
+    "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts",
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:package": "pnpm build && node scripts/test-package.mjs"
   },
   "devDependencies": {
     "@ai-sdk/openai": "4.0.65",
@@ -29,6 +32,7 @@
     "@cloudflare/workers-types": "5.20260911.1",
     "@types/node": "24.13.4",
     "ai": "7.0.97",
+    "effect": "3.22.2",
     "openai": "7.15.0",
     "opencode-ai": "1.18.30",
     "typescript": "7.0.2",

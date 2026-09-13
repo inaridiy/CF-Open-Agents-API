@@ -1,12 +1,15 @@
 # CF-Open-Agents-API
 
 An OSS Agents API built on Cloudflare Workers, SQLite Durable Objects, R2, and Containers.
-Call it over HTTP with the OpenAI SDK, or through a typed Worker Service Binding.
-The TypeScript package is `cf-open-agents-api`.
+Use `cf-open-agents-api` over HTTP with the OpenAI SDK or a typed Worker Service Binding.
 
 **Alpha.** Targets the `agents=v1` contract in `openai@7.15.0`. See the
 [compatibility profile](docs/compatibility.md) for supported fields and limitations.
 This is an independent implementation; it is not an OpenAI or Cloudflare product.
+
+**Preview dependency:** `@cloudflare/sandbox@0.13.0-next.751.1` requires its matching Docker image.
+Preview upgrades can break APIs or restore behavior; validate all harnesses and backups.
+See [deployment](docs/deployment.md) and [security](SECURITY.md).
 
 ## How it works
 
@@ -28,13 +31,14 @@ SessionDO owns the durable input log, turns, events, required actions, and execu
 state. A Container is replaceable compute. Native harness state and workspace
 checkpoints are committed together before a completed turn becomes visible.
 Unknown execution outcomes fail explicitly instead of silently replaying side effects.
+Effect provides typed runtime contracts, dependency layers, immutable execution
+states and scoped concurrency. See the [Effect architecture and migration guide](docs/effect.md).
 
 ## Develop
 
 Requires Node **24+** and **pnpm 11.1.2**. Docker is required for the Container example.
 The native harness tests require **Codex 0.154.0** on `PATH`; the pinned Claude Code
 and OpenCode runtimes are installed by pnpm.
-The Container smoke runner supports Linux/macOS and uses local port 8799.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -59,9 +63,8 @@ cp examples/worker/.dev.vars.example examples/worker/.dev.vars
 pnpm dev
 ```
 
-The example registers `coding` (Codex), `claude` (Claude Code), and `opencode` against
-the same AI SDK OpenAI model. `workers` connects Codex to Workers AI. Harness and model
-registrations are independent in [the Worker composition root](examples/worker/src/index.ts).
+The example registers `coding`, `claude`, and `opencode` against one AI SDK model;
+`workers` uses Workers AI. See [the composition root](examples/worker/src/index.ts).
 Local sandbox backups use Wrangler's emulated R2 binding.
 All three harnesses support `none` or an assigned Sandbox. Workers AI calls use your
 Cloudflare account, including during local development. The portable model gateway
@@ -88,17 +91,15 @@ console.log(session.id);
 **this deployment provisions Cloudflare Containers**. `none` disables the execution
 environment. Unsupported environment provisioning fields are rejected.
 
-Retrieve the session until it becomes `idle`, `requires_action`, or `failed`;
-inspect `sessions.items.list(session.id)` and `sessions.turns.list(session.id)`.
+Poll until `idle`, `requires_action`, or `failed`, then inspect items and turns.
 For one streamed turn, use `client.beta.agents.sessions.stream(session.id, { input: "Hello" })`
 on an idle session. It subscribes before submitting input and can run tool handlers.
 Disconnecting does not cancel execution.
 
 ## Service Binding
 
-Bind a caller Worker's `AGENTS` service to the deployed Worker. HTTP and RPC share
-the same session implementation. Service Bindings are trusted deployment boundaries:
-the calling Worker authenticates its own users and supplies their tenant IDs.
+Bind the caller's `AGENTS` service to the deployed Worker. The caller authenticates
+its users and supplies tenant IDs; Service Bindings are a trusted boundary.
 
 ```ts
 const session = await env.AGENTS.createSession("tenant-123", {
@@ -117,15 +118,20 @@ await env.AGENTS.submitEvents("tenant-123", session.id, [{
   and the driver contract for additional harnesses.
 - [Tools and assets](docs/extending.md#tools-and-assets): typed tools, web/corpus search,
   and immutable skill bundles.
-- [Architecture](docs/architecture.md): design rationale and future capabilities.
+- [Architecture](docs/architecture.md): current service boundaries, persistence and recovery.
 - [Contributing](CONTRIBUTING.md): code layout, validation, and compatibility changes.
+- [Development agent guidance](docs/development-harness.md): selected Skills, task briefs,
+  instruction ownership and checks.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `pnpm check` | Documentation checks, typecheck, lint, tests and builds |
+| `pnpm check` | Documentation/agent harness checks, typecheck, lint, tests and builds |
 | `pnpm check:docs` | Verify project names, entrypoints, commands, bindings and image pins |
+| `pnpm check:harness` | Check documentation links, agent entrypoints, skills and licenses |
+| `pnpm test:scripts` | Checker failure fixtures |
+| `pnpm test:package` | Packed library installation and consumer type checks |
 | `pnpm typecheck` | Check TypeScript without emitting files |
 | `pnpm lint` | Check formatting and lint rules |
 | `pnpm test` | Worker, SQLite, streaming and asset tests |
@@ -140,4 +146,5 @@ await env.AGENTS.submitEvents("tenant-123", session.id, [{
 
 ## License
 
-Apache-2.0. Contributions are welcome; no contributor agreement is required.
+Apache-2.0; bundled development skills retain the licenses listed in [NOTICE](NOTICE).
+See [CHANGELOG.md](CHANGELOG.md), [contributing](CONTRIBUTING.md) and [release instructions](docs/releasing.md).

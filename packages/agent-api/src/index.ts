@@ -1,3 +1,13 @@
+export {
+  attempt,
+  decode,
+  decodeEffect,
+  io,
+  OperationError,
+  runPromise,
+  runSync,
+  type ServiceError,
+} from "./effect.js";
 export { HARNESSES, type HarnessName } from "./harnesses.js";
 export * from "./protocol.js";
 export type * from "./runtime.js";
@@ -6,6 +16,7 @@ export {
   checkpointSchema,
   commandSchema,
   executionSchema,
+  fromPromiseDriver,
   runtimeEventSchema,
 } from "./runtime.js";
 export {

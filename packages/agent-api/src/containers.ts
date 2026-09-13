@@ -1,10 +1,12 @@
 import { Container } from "@cloudflare/containers";
 import { getSandbox, type ISandbox, Sandbox } from "@cloudflare/sandbox";
+import { Effect } from "effect";
+import { decode, io, runPromise } from "./effect.js";
 import { HARNESSES, type HarnessName } from "./harnesses.js";
 import { readModelBody } from "./models/body.js";
 import { ApiError } from "./protocol.js";
 import type { Checkpoint, Execution, RuntimeCommand, RuntimeDriver } from "./runtime.js";
-import { batchSchema } from "./runtime.js";
+import { batchSchema, fromPromiseDriver } from "./runtime.js";
 import { executeWorkspaceTool } from "./sandbox-tools.js";
 
 export interface ContainerBindings {
@@ -40,28 +42,43 @@ export class HarnessContainer<
   override defaultPort = 8080;
   override sleepAfter = "10m";
   override enableInternet = false;
-  private starting?: { turnId: string; promise: Promise<void> };
-  private workspaceOperation: Promise<unknown> = Promise.resolve();
+  private readonly lifecycle = Effect.unsafeMakeSemaphore(1);
+  private readonly workspace = Effect.unsafeMakeSemaphore(1);
   protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
-  private async assignment(): Promise<Assignment> {
-    const assignment = await this.ctx.storage.get<Assignment>("assignment");
-    if (!assignment)
-      throw new ApiError(409, "unassigned_container", "Container has no session assignment");
-    return assignment;
+  private assignment() {
+    return Effect.gen(this, function* () {
+      const assignment = yield* io("assignment", () =>
+        this.ctx.storage.get<Assignment>("assignment"),
+      );
+      if (!assignment)
+        return yield* Effect.fail(
+          new ApiError(409, "unassigned_container", "Container has no session assignment"),
+        );
+      return assignment;
+    });
   }
   override async fetch(request: Request): Promise<Response> {
     if (new URL(request.url).hostname === "sandbox.internal") return this.sandboxRequest(request);
     return super.fetch(request);
   }
   private async sandboxRequest(request: Request): Promise<Response> {
-    const assignment = await this.assignment();
+    const assignment = await runPromise(this.assignment());
     if (!assignment.sandbox) return new Response("No sandbox assigned", { status: 403 });
     if (new URL(request.url).pathname === "/tools" && request.method === "POST") {
       const input = await request.json();
-      const operation = this.workspaceOperation.then(() =>
-        executeWorkspaceTool(getSandbox(this.env.SANDBOX, assignment.sessionId), input),
+      const operation = runPromise(
+        this.workspace.withPermits(1)(
+          io("workspace.tool", async () => {
+            const current = await runPromise(this.assignment());
+            if (
+              current.turnId !== assignment.turnId ||
+              current.generation !== assignment.generation
+            )
+              throw new ApiError(409, "stale_generation", "Execution was superseded");
+            return executeWorkspaceTool(getSandbox(this.env.SANDBOX, assignment.sessionId), input);
+          }),
+        ),
       );
-      this.workspaceOperation = operation.catch(() => {});
       try {
         return Response.json(await operation);
       } catch {
@@ -70,155 +87,227 @@ export class HarnessContainer<
     }
     return this.env.SANDBOX.getByName(assignment.sessionId).fetch(request);
   }
-  async modelRequest(request: Request): Promise<Response> {
-    const assignment = await this.assignment();
-    const url = new URL(request.url);
-    if (request.method !== "POST" || url.pathname !== HARNESSES[assignment.harness].protocol)
-      return new Response("Unsupported model request", { status: 403 });
-    const bytes = await readModelBody(request);
-    const body = JSON.parse(new TextDecoder().decode(bytes)) as { model?: string };
-    if (body.model !== assignment.model)
-      return new Response("Model is not assigned to this execution", { status: 403 });
-    return this.env.MODEL_GATEWAY.fetch(new Request(request, { body: bytes }));
+  modelRequest(request: Request): Promise<Response> {
+    return runPromise(
+      Effect.gen(this, function* () {
+        const assignment = yield* this.assignment();
+        const url = new URL(request.url);
+        if (request.method !== "POST" || url.pathname !== HARNESSES[assignment.harness].protocol)
+          return new Response("Unsupported model request", { status: 403 });
+        const bytes = yield* io("modelRequest", () => readModelBody(request));
+        const body = JSON.parse(new TextDecoder().decode(bytes)) as { model?: string };
+        if (!body || body.model !== assignment.model)
+          return new Response("Model is not assigned to this execution", { status: 403 });
+        const current = yield* this.assignment();
+        if (current.turnId !== assignment.turnId || current.generation !== assignment.generation)
+          return new Response("Execution was superseded", { status: 409 });
+        return yield* io("modelRequest", () =>
+          this.env.MODEL_GATEWAY.fetch(new Request(request, { body: bytes })),
+        );
+      }),
+    );
   }
-  async startExecution(execution: Execution, operationId: string): Promise<void> {
-    if (this.starting) {
-      if (this.starting.turnId !== execution.turnId)
-        throw new ApiError(409, "active_execution", "Another execution is starting");
-      return this.starting.promise;
-    }
-    const promise = this.startAttempt(execution, operationId).finally(() => {
-      this.starting = undefined;
-    });
-    this.starting = { turnId: execution.turnId, promise };
-    return promise;
+  startExecution(execution: Execution, operationId: string): Promise<void> {
+    return runPromise(
+      this.lifecycle.withPermits(1)(
+        this.workspace.withPermits(1)(this.startAttempt(execution, operationId)),
+      ),
+    );
   }
-  private async startAttempt(execution: Execution, operationId: string): Promise<void> {
-    if (!Object.hasOwn(HARNESSES, execution.harness))
-      throw new ApiError(400, "unsupported_harness", "Unknown Container harness");
-    const harness = execution.harness as HarnessName;
-    if (
-      execution.checkpoint &&
-      (execution.checkpoint.driver !== harness ||
-        execution.checkpoint.revision !== HARNESSES[harness].revision)
-    )
-      throw new ApiError(
-        409,
-        "checkpoint_incompatible",
-        "Checkpoint belongs to another harness version",
+  private startAttempt(execution: Execution, operationId: string) {
+    return Effect.gen(this, function* () {
+      if (!Object.hasOwn(HARNESSES, execution.harness))
+        return yield* Effect.fail(
+          new ApiError(400, "unsupported_harness", "Unknown Container harness"),
+        );
+      const harness = execution.harness as HarnessName;
+      if (
+        execution.checkpoint &&
+        (execution.checkpoint.driver !== harness ||
+          execution.checkpoint.revision !== HARNESSES[harness].revision)
+      )
+        return yield* Effect.fail(
+          new ApiError(
+            409,
+            "checkpoint_incompatible",
+            "Checkpoint belongs to another harness version",
+          ),
+        );
+      const previous = yield* io("startAttempt", () =>
+        this.ctx.storage.get<Assignment>("assignment"),
       );
-    const previous = await this.ctx.storage.get<Assignment>("assignment");
-    if (previous && execution.generation < previous.generation)
-      throw new ApiError(409, "stale_generation", "Execution was superseded");
-    if (previous?.turnId === execution.turnId && previous.dispatched) return;
-    if (previous && previous.sessionId !== execution.sessionId)
-      throw new ApiError(
-        409,
-        "assignment_conflict",
-        "Container already belongs to another session",
+      if (
+        previous &&
+        (execution.generation < previous.generation ||
+          (execution.generation === previous.generation && execution.turnId !== previous.turnId))
+      )
+        return yield* Effect.fail(
+          new ApiError(409, "stale_generation", "Execution was superseded"),
+        );
+      if (previous?.turnId === execution.turnId && previous.dispatched) return;
+      if (previous && previous.sessionId !== execution.sessionId)
+        return yield* Effect.fail(
+          new ApiError(409, "assignment_conflict", "Container already belongs to another session"),
+        );
+      const assignment: Assignment = {
+        sessionId: execution.sessionId,
+        generation: execution.generation,
+        turnId: execution.turnId,
+        model: execution.model,
+        harness,
+        dispatched: false,
+        sandbox: execution.sandbox,
+      };
+      yield* io("startAttempt", () => this.ctx.storage.put("assignment", assignment));
+      const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
+      const previousCheckpoint = execution.checkpoint;
+      const previousWorkspace = previousCheckpoint?.workspace;
+      if (execution.sandbox) {
+        // Every new attempt starts from the last committed filesystem checkpoint.
+        yield* io("startAttempt", () => sandbox.destroy());
+        if (previousWorkspace)
+          yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
+        else {
+          yield* io("startAttempt", () => sandbox.mkdir("/workspace", { recursive: true }));
+          yield* io("startAttempt", () => this.prepareSandbox(sandbox, execution));
+        }
+        if (harness === "codex") {
+          const executor = yield* io("startAttempt", () =>
+            sandbox.exec(["codex", "exec-server", "--listen", "ws://0.0.0.0:4500"]),
+          );
+          yield* io("startAttempt", () => executor.waitForPort(4500));
+        }
+      }
+      let checkpoint: unknown;
+      if (previousCheckpoint) {
+        const object = yield* io("startAttempt", () =>
+          this.env.CHECKPOINTS.get(previousCheckpoint.native),
+        );
+        if (!object)
+          return yield* Effect.fail(
+            new ApiError(409, "checkpoint_missing", "Native checkpoint is missing"),
+          );
+        checkpoint = yield* io("startAttempt", () => object.json());
+      }
+      yield* io("startAttempt", () => this.startAndWaitForPorts());
+      // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job.
+      yield* io("startAttempt", () =>
+        this.ctx.storage.put("assignment", { ...assignment, dispatched: true }),
       );
-    const assignment: Assignment = {
-      sessionId: execution.sessionId,
-      generation: execution.generation,
-      turnId: execution.turnId,
-      model: execution.model,
-      harness,
-      dispatched: false,
-      sandbox: execution.sandbox,
-    };
-    await this.ctx.storage.put("assignment", assignment);
-    const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
-    if (execution.sandbox) {
-      // Every new attempt starts from the last committed filesystem checkpoint.
-      await sandbox.destroy();
-      if (execution.checkpoint?.workspace)
-        await sandbox.restoreBackup(execution.checkpoint.workspace);
-      else {
-        await sandbox.mkdir("/workspace", { recursive: true });
-        await this.prepareSandbox(sandbox, execution);
-      }
-      if (harness === "codex") {
-        const executor = await sandbox.exec([
-          "codex",
-          "exec-server",
-          "--listen",
-          "ws://0.0.0.0:4500",
-        ]);
-        await executor.waitForPort(4500);
-      }
-    }
-    let checkpoint: unknown;
-    if (execution.checkpoint) {
-      const object = await this.env.CHECKPOINTS.get(execution.checkpoint.native);
-      if (!object) throw new ApiError(409, "checkpoint_missing", "Native checkpoint is missing");
-      checkpoint = await object.json();
-    }
-    await this.startAndWaitForPorts();
-    // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job.
-    await this.ctx.storage.put("assignment", { ...assignment, dispatched: true });
-    const result = await this.containerFetch("http://harness/jobs", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ execution, operationId, checkpoint }),
+      const result = yield* io("startAttempt", () =>
+        this.containerFetch("http://harness/jobs", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ execution, operationId, checkpoint }),
+        }),
+      );
+      if (!result.ok)
+        return yield* Effect.fail(new Error(`Harness rejected start (${result.status})`));
     });
-    if (!result.ok) throw new Error(`Harness rejected start (${result.status})`);
   }
-  async pollExecution(execution: Execution, after: number): Promise<Response> {
-    const assignment = await this.assignment();
-    if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
-      return Response.json({ status: "missing", events: [], cursor: 0 });
-    return this.containerFetch(`http://harness/jobs/${execution.turnId}?after=${after}`);
+  pollExecution(execution: Execution, after: number): Promise<Response> {
+    return runPromise(
+      Effect.gen(this, function* () {
+        const assignment = yield* this.assignment();
+        if (
+          assignment.turnId !== execution.turnId ||
+          assignment.generation !== execution.generation
+        )
+          return Response.json({ status: "missing", events: [], cursor: 0 });
+        return yield* io("pollExecution", () =>
+          this.containerFetch(`http://harness/jobs/${execution.turnId}?after=${after}`),
+        );
+      }),
+    );
   }
-  async controlExecution(
+  controlExecution(
     execution: Execution,
     operationId: string,
     command: RuntimeCommand,
   ): Promise<void> {
-    const assignment = await this.assignment();
-    if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
-      throw new ApiError(409, "stale_generation", "Execution was superseded");
-    const result = await this.containerFetch(`http://harness/jobs/${execution.turnId}/control`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ operationId, command }),
-    });
-    if (!result.ok) throw new Error(`Harness rejected control (${result.status})`);
-  }
-  async checkpointExecution(execution: Execution): Promise<Checkpoint> {
-    const assignment = await this.assignment();
-    if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
-      throw new ApiError(409, "stale_generation", "Execution was superseded");
-    const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
-    const committed = await this.ctx.storage.get<Checkpoint>(`checkpoint:${execution.generation}`);
-    if (committed) return committed;
-    const response = await this.containerFetch(
-      `http://harness/jobs/${execution.turnId}/checkpoint`,
+    return runPromise(
+      Effect.gen(this, function* () {
+        const assignment = yield* this.assignment();
+        if (
+          assignment.turnId !== execution.turnId ||
+          assignment.generation !== execution.generation
+        )
+          return yield* Effect.fail(
+            new ApiError(409, "stale_generation", "Execution was superseded"),
+          );
+        const result = yield* io("controlExecution", () =>
+          this.containerFetch(`http://harness/jobs/${execution.turnId}/control`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operationId, command }),
+          }),
+        );
+        if (!result.ok)
+          return yield* Effect.fail(new Error(`Harness rejected control (${result.status})`));
+      }),
     );
-    if (!response.ok || !response.body) throw new Error("Native checkpoint failed");
-    // containerFetch may return a chunked stream; R2 requires a known length.
-    await this.env.CHECKPOINTS.put(key, await response.arrayBuffer());
-    const workspace = execution.sandbox
-      ? await getSandbox(this.env.SANDBOX, execution.sessionId).createBackup({
-          dir: "/workspace",
-          localBucket: this.env.LOCAL_BACKUPS === "true",
-          ttl: 30 * 24 * 60 * 60,
-        })
-      : undefined;
-    const checkpoint: Checkpoint = {
-      version: 1,
-      driver: assignment.harness,
-      revision: HARNESSES[assignment.harness].revision,
-      native: key,
-      ...(workspace ? { workspace } : {}),
-    };
-    await this.ctx.storage.put(`checkpoint:${execution.generation}`, checkpoint);
-    return checkpoint;
   }
-  async stopExecution(execution: Execution): Promise<void> {
-    const assignment = await this.assignment();
-    if (assignment.turnId !== execution.turnId) return;
-    await this.destroy();
-    if (assignment.sandbox) await getSandbox(this.env.SANDBOX, execution.sessionId).destroy();
+  checkpointExecution(execution: Execution): Promise<Checkpoint> {
+    return runPromise(
+      this.lifecycle.withPermits(1)(this.workspace.withPermits(1)(this.snapshot(execution))),
+    );
+  }
+  private snapshot(execution: Execution) {
+    return Effect.gen(this, function* () {
+      const assignment = yield* this.assignment();
+      if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
+        return yield* Effect.fail(
+          new ApiError(409, "stale_generation", "Execution was superseded"),
+        );
+      const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
+      const committed = yield* io("snapshot", () =>
+        this.ctx.storage.get<Checkpoint>(`checkpoint:${execution.generation}`),
+      );
+      if (committed) return committed;
+      const response = yield* io("snapshot", () =>
+        this.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`),
+      );
+      if (!response.ok || !response.body)
+        return yield* Effect.fail(new Error("Native checkpoint failed"));
+      // containerFetch may return a chunked stream; R2 requires a known length.
+      const bytes = yield* io("snapshot", () => response.arrayBuffer());
+      yield* io("snapshot", () => this.env.CHECKPOINTS.put(key, bytes));
+      const workspace = execution.sandbox
+        ? yield* io("snapshot", () =>
+            getSandbox(this.env.SANDBOX, execution.sessionId).createBackup({
+              dir: "/workspace",
+              localBucket: this.env.LOCAL_BACKUPS === "true",
+              ttl: 30 * 24 * 60 * 60,
+            }),
+          )
+        : undefined;
+      const checkpoint: Checkpoint = {
+        version: 1,
+        driver: assignment.harness,
+        revision: HARNESSES[assignment.harness].revision,
+        native: key,
+        ...(workspace ? { workspace } : {}),
+      };
+      yield* io("snapshot", () =>
+        this.ctx.storage.put(`checkpoint:${execution.generation}`, checkpoint),
+      );
+      return checkpoint;
+    });
+  }
+  stopExecution(execution: Execution): Promise<void> {
+    return runPromise(
+      this.lifecycle.withPermits(1)(this.workspace.withPermits(1)(this.stopAttempt(execution))),
+    );
+  }
+  private stopAttempt(execution: Execution) {
+    return Effect.gen(this, function* () {
+      const assignment = yield* this.assignment();
+      if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
+        return;
+      yield* io("stopAttempt", () => this.destroy());
+      if (assignment.sandbox)
+        yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
+    });
   }
 }
 
@@ -250,7 +339,7 @@ export function createHarness<Env extends ContainerBindings>(
 
 export function containerDriver(env: ContainerBindings, harness: HarnessName): RuntimeDriver {
   const stub = (execution: Execution) => env.HARNESS.getByName(execution.sessionId);
-  return {
+  return fromPromiseDriver({
     name: harness,
     revision: HARNESSES[harness].revision,
     capabilities: { steer: HARNESSES[harness].steer, functions: true, sandbox: true },
@@ -258,7 +347,7 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
       await stub(execution).startExecution(execution, operationId);
     },
     poll: async (execution, after) =>
-      batchSchema.parse(await (await stub(execution).pollExecution(execution, after)).json()),
+      decode(batchSchema, await (await stub(execution).pollExecution(execution, after)).json()),
     control: async (execution, operationId, command) => {
       await stub(execution).controlExecution(execution, operationId, command);
     },
@@ -266,7 +355,7 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
     stop: async (execution) => {
       await stub(execution).stopExecution(execution);
     },
-  };
+  });
 }
 
 export const codexDriver = (env: ContainerBindings): RuntimeDriver => containerDriver(env, "codex");

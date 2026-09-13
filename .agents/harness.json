@@ -1,0 +1,12 @@
+{
+  "documents": [
+    "README.md",
+    "CONTRIBUTING.md",
+    "docs/development-harness.md",
+    ".agents/PLANS.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "packages/agent-api/README.md"
+  ],
+  "localSkills": ["native-harness-change"]
+}

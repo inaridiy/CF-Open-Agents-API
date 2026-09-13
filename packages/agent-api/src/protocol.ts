@@ -1,3 +1,4 @@
+import { Data } from "effect";
 import type {
   Agent as UpstreamAgent,
   AgentSessionEvent as UpstreamEvent,
@@ -40,13 +41,17 @@ export const COMPATIBILITY = {
   codex: "0.154.0",
 } as const;
 
-export class ApiError extends Error {
+export class ApiError extends Data.TaggedError("ApiError")<{
+  readonly status: 400 | 401 | 404 | 409 | 413 | 422 | 429 | 500 | 503;
+  readonly code: string;
+  readonly message: string;
+}> {
   constructor(
-    readonly status: 400 | 401 | 404 | 409 | 413 | 422 | 429 | 500 | 503,
-    readonly code: string,
+    status: 400 | 401 | 404 | 409 | 413 | 422 | 429 | 500 | 503,
+    code: string,
     message: string,
   ) {
-    super(message);
+    super({ status, code, message });
     // Error name/message survive Workers RPC; custom properties/prototypes do not.
     this.name = `AgentApiError:${status}:${code}`;
   }

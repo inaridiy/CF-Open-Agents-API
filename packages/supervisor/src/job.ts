@@ -4,18 +4,28 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   type Execution,
+  io,
+  OperationError,
   type RuntimeBatch,
   type RuntimeCommand,
   type RuntimeEvent,
+  runPromise,
+  runSync,
+  type ServiceError,
   type WorkspaceToolName,
   workspaceResultSchema,
   workspaceTools,
 } from "cf-open-agents-api";
+import { Deferred, Effect, Exit, Fiber, Ref, Scope } from "effect";
 import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
+import { JobLifecycle, Operations, once } from "./lifecycle.js";
+
+type ToolResult = { content: { type: "text"; text: string }[]; isError: boolean };
 
 export interface NativeJob {
   readonly execution: Execution;
+  readonly status: RuntimeBatch["status"];
   start(bundle?: unknown): Promise<void>;
   poll(after: number): RuntimeBatch;
   control(operationId: string, command: RuntimeCommand): Promise<void>;
@@ -40,29 +50,59 @@ export interface NativeOptions {
 
 /** Shared transport/lifecycle bookkeeping; inference remains in the native harness. */
 export abstract class ToolJob implements NativeJob {
-  protected status: RuntimeBatch["status"] = "running";
-  protected error?: string;
+  protected readonly lifecycle = new JobLifecycle();
+  get status() {
+    return this.lifecycle.status;
+  }
+  protected get closing() {
+    return this.lifecycle.closing;
+  }
   protected sessionId = "";
-  protected closing = false;
   protected readonly abort = new AbortController();
-  protected task?: Promise<void>;
-  private readonly events: RuntimeBatch["events"] = [];
-  private eventBytes = 0;
-  private readonly pending = new Map<
-    string,
-    {
-      resolve(value: { content: { type: "text"; text: string }[]; isError: boolean }): void;
-      reject(error: Error): void;
-    }
-  >();
-  private readonly operations = new Map<string, Promise<void>>();
-  private saved?: NativeBundle;
+  private readonly scope = runSync(Scope.make());
+  private task?: Fiber.RuntimeFiber<void, never>;
+  private readonly pending = Ref.unsafeMake(
+    new Map<string, Deferred.Deferred<ToolResult, Error>>(),
+  );
+  private readonly operations = new Operations();
+  private readonly saved = once("native.checkpoint", async () => {
+    if (this.status !== "completed" || !this.sessionId)
+      throw new Error("Native turn must complete before checkpointing");
+    await this.stop();
+    return capture(this.home, this.sessionId);
+  });
+  private readonly stopped = once("native.stop", async () => {
+    this.lifecycle.close();
+    this.abort.abort();
+    const pending = runSync(Ref.getAndSet(this.pending, new Map()));
+    for (const result of pending.values())
+      runSync(Deferred.fail(result, new Error("Execution stopped")));
+    await this.closeRuntime();
+    await runPromise(Scope.close(this.scope, Exit.void));
+    if (this.task) await runPromise(Fiber.await(this.task));
+  });
   abstract readonly home: string;
   constructor(
     readonly execution: Execution,
     protected readonly options: NativeOptions,
   ) {}
-  abstract start(bundle?: unknown): Promise<void>;
+  start(bundle?: unknown): Promise<void> {
+    return runPromise(
+      this.lifecycle.transition.withPermits(1)(
+        io("native.start", async () => {
+          if (this.closing) throw new Error("Execution has stopped");
+          await this.open(bundle);
+        }).pipe(
+          Effect.onError((cause) =>
+            Effect.sync(() => this.failStart(cause)).pipe(
+              Effect.zipRight(this.stopped.pipe(Effect.orDie)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  protected abstract open(bundle?: unknown): Promise<void>;
   protected abstract closeRuntime(): Promise<void>;
   protected async prepare(bundle?: unknown): Promise<string | undefined> {
     await rm(this.home, { recursive: true, force: true });
@@ -70,30 +110,24 @@ export abstract class ToolJob implements NativeJob {
     return bundle ? restore(this.home, bundle) : undefined;
   }
   protected emit(event: RuntimeEvent): void {
-    this.eventBytes += JSON.stringify(event).length;
-    if (this.eventBytes > 8_000_000) throw new Error("Native event buffer exceeds its limit");
-    this.events.push({ seq: this.events.length + 1, event });
+    this.lifecycle.emit(event);
   }
   protected run(task: () => Promise<void>): void {
-    this.task = task()
-      .then(() => {
-        if (this.status === "running") this.status = "completed";
-      })
-      .catch((error) => {
-        if (!this.closing && this.status !== "cancelled") this.failStart(error);
-      });
+    this.task = runSync(
+      io("native.run", task).pipe(
+        Effect.tap(() => Effect.sync(() => this.lifecycle.setStatus("completed"))),
+        Effect.catchAllCause(() =>
+          Effect.sync(() => this.failStart(new Error("native_harness_failed"))),
+        ),
+        Effect.forkIn(this.scope),
+      ),
+    );
   }
   failStart(_error: unknown): void {
-    this.status = "failed";
-    this.error = "native_harness_failed";
+    this.lifecycle.fail("native_harness_failed");
   }
   poll(after: number): RuntimeBatch {
-    return {
-      events: this.events.filter((event) => event.seq > after),
-      cursor: this.events.length,
-      status: this.status,
-      ...(this.error ? { error: this.error } : {}),
-    };
+    return this.lifecycle.poll(after);
   }
   async workspace(
     name: WorkspaceToolName,
@@ -123,15 +157,24 @@ export abstract class ToolJob implements NativeJob {
       });
     return result;
   }
-  protected async externalTool(name: string, args: unknown) {
-    if (this.closing || this.abort.signal.aborted) throw new Error("Execution has stopped");
-    const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
-    this.emit({ type: "function_call", id: callId, callId, name, arguments: z.json().parse(args) });
-    this.status = "waiting";
-    return new Promise<{ content: { type: "text"; text: string }[]; isError: boolean }>(
-      (resolve, reject) => {
-        this.pending.set(callId, { resolve, reject });
-      },
+  protected externalTool(name: string, args: unknown): Promise<ToolResult> {
+    return runPromise(
+      Effect.gen(this, function* () {
+        if (this.closing || this.abort.signal.aborted)
+          return yield* Effect.fail(new Error("Execution has stopped"));
+        const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
+        const result = yield* Deferred.make<ToolResult, Error>();
+        yield* Ref.update(this.pending, (pending) => new Map(pending).set(callId, result));
+        this.emit({
+          type: "function_call",
+          id: callId,
+          callId,
+          name,
+          arguments: z.json().parse(args),
+        });
+        this.lifecycle.setStatus("waiting");
+        return yield* Deferred.await(result);
+      }),
     );
   }
   async mcp(request: Request): Promise<Response> {
@@ -176,49 +219,58 @@ export abstract class ToolJob implements NativeJob {
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    await server.connect(transport);
-    try {
-      return await transport.handleRequest(request);
-    } finally {
-      await server.close();
-    }
+    return runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(Effect.succeed(server), (server) =>
+            io("mcp.close", () => server.close()).pipe(Effect.orDie),
+          );
+          yield* io("mcp.connect", () => server.connect(transport));
+          return yield* io("mcp.request", () => transport.handleRequest(request));
+        }),
+      ),
+    );
   }
-  async control(operationId: string, command: RuntimeCommand): Promise<void> {
-    const previous = this.operations.get(operationId);
-    if (previous) return previous;
-    const operation = (async () => {
-      if (command.type === "steer") throw new Error("This harness cannot steer an active turn");
-      if (command.type === "cancel") {
-        this.status = "cancelled";
-        await this.stop();
-        return;
-      }
-      const pending = this.pending.get(command.callId);
-      if (!pending) throw new Error("No matching pending function call");
-      this.pending.delete(command.callId);
-      pending.resolve({
-        content: [{ type: "text", text: command.output }],
-        isError: !command.success,
-      });
-      if (!this.pending.size) this.status = "running";
-    })();
-    this.operations.set(operationId, operation);
-    return operation;
+  control(operationId: string, command: RuntimeCommand): Promise<void> {
+    return runPromise(
+      this.operations.perform(
+        operationId,
+        command,
+        this.lifecycle.transition.withPermits(1)(
+          Effect.gen(this, function* () {
+            if (command.type === "steer")
+              return yield* Effect.fail(new Error("This harness cannot steer an active turn"));
+            if (command.type === "cancel") {
+              this.lifecycle.setStatus("cancelled");
+              yield* this.stopped;
+              return;
+            }
+            if (this.closing || this.status !== "waiting")
+              return yield* Effect.fail(new Error("Execution is not waiting for tools"));
+            const pending = yield* Ref.get(this.pending);
+            const result = pending.get(command.callId);
+            if (!result) return yield* Effect.fail(new Error("No matching pending function call"));
+            const next = new Map(pending);
+            next.delete(command.callId);
+            yield* Ref.set(this.pending, next);
+            this.lifecycle.setStatus(next.size ? "waiting" : "running");
+            yield* Deferred.succeed(result, {
+              content: [{ type: "text" as const, text: command.output }],
+              isError: !command.success,
+            });
+          }).pipe(
+            Effect.mapError(
+              (cause): ServiceError => new OperationError({ operation: "native.control", cause }),
+            ),
+          ),
+        ),
+      ),
+    );
   }
-  async checkpoint(): Promise<NativeBundle> {
-    if (this.saved) return this.saved;
-    if (this.status !== "completed" || !this.sessionId)
-      throw new Error("Native turn must complete before checkpointing");
-    await this.stop();
-    this.saved = await capture(this.home, this.sessionId);
-    return this.saved;
+  checkpoint(): Promise<NativeBundle> {
+    return runPromise(this.saved);
   }
-  async stop(): Promise<void> {
-    this.closing = true;
-    this.abort.abort();
-    for (const pending of this.pending.values()) pending.reject(new Error("Execution stopped"));
-    this.pending.clear();
-    await this.closeRuntime();
-    await this.task;
+  stop(): Promise<void> {
+    return runPromise(this.lifecycle.transition.withPermits(1)(this.stopped));
   }
 }
