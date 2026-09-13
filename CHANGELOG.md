@@ -16,6 +16,6 @@
 - Effect is a shared peer dependency. Stable library dependencies use compatible
   ranges; the Sandbox preview SDK and image remain exactly paired.
 
-This version implements the [alpha compatibility profile](docs/compatibility.md).
+This version implements the [alpha compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/v0.1.0/docs/compatibility.md).
 The npm dist-tag is `alpha`. It does not implement upstream subagents, artifact
 APIs or cross-harness forks.

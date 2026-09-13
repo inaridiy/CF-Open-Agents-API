@@ -1,6 +1,7 @@
 # Project work notes
 
 Use `.agents/execplans/` for work that needs a handoff or several experiments.
+The directory is ignored by Git; public release documentation belongs in `docs/`.
 A note records the requested outcome, constraints, verified state, open decisions,
 validation results and next step. Update it when evidence changes the approach.
 For persistent-format or deployment changes, also explain migration and recovery.

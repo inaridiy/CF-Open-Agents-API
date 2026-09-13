@@ -13,3 +13,6 @@ examples/worker/env.d.ts
 packages/agent-api/LICENSE
 packages/agent-api/NOTICE
 packages/agent-api/CHANGELOG.md
+
+# Local work notes are not release documentation.
+.agents/execplans/
