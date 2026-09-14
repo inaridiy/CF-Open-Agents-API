@@ -430,7 +430,10 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
             )
           : object?.body;
       if (!bytes) return yield* new ApiError(404, "not_found", "Input file not found");
-      yield* io("environment.upload.store", () => this.env.CHECKPOINTS.put(upload.key, bytes));
+      // The upload row below names this object: observe the put's outcome before committing.
+      yield* Effect.uninterruptible(
+        io("environment.upload.store", () => this.env.CHECKPOINTS.put(upload.key, bytes)),
+      );
       // Commit the desired write before touching the live filesystem. A crash or a
       // lost response can then be reconciled from immutable R2 bytes after restore.
       yield* attempt("environment.upload.commit", () =>

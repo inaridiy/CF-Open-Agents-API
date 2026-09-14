@@ -386,8 +386,12 @@ export class HarnessContainer<
             return new Response(null, { status: 404 });
           const url = new URL(request.url);
           url.hostname = "environment-mcp.internal";
-          return yield* io("mcp.environment", () =>
-            this.env.SANDBOX.getByName(assignment.sessionId).fetch(new Request(url, request)),
+          return yield* io("mcp.environment", (signal) =>
+            this.env.SANDBOX.getByName(assignment.sessionId).fetch(
+              new Request(new Request(url, request), {
+                signal: AbortSignal.any([request.signal, signal]),
+              }),
+            ),
           );
         }
         const serverURL = tool.transport.server_url;
@@ -613,13 +617,14 @@ export class HarnessContainer<
         const current = yield* this.assignment();
         if (current.turnId !== assignment.turnId || current.generation !== assignment.generation)
           return new Response("Execution was superseded", { status: 409 });
-        return yield* io("modelRequest", () =>
+        return yield* io("modelRequest", (signal) =>
           this.env.MODEL_GATEWAY.fetch(
             new Request(request, {
               body:
                 assignment.harness === "codex" && assignment.webSearchMode !== undefined
                   ? JSON.stringify(constrainCodexSearch(body, assignment.webSearchMode))
                   : bytes,
+              signal: AbortSignal.any([request.signal, signal]),
             }),
           ),
         );
@@ -821,49 +826,59 @@ export class HarnessContainer<
           );
         checkpoint = yield* io("startAttempt", () => object.json());
       }
-      yield* io("startAttempt", () => this.startAndWaitForPorts());
-      // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job.
-      yield* attempt("startAttempt", () =>
-        this.db.put("assignment", "current", { ...assignment, dispatched: true }),
+      yield* io("startAttempt", (signal) =>
+        this.startAndWaitForPorts(undefined, { abort: signal }),
       );
-      const result = yield* io("startAttempt", () =>
-        this.containerFetch("http://harness/jobs", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            execution: {
-              ...execution,
-              capabilityRoots,
-              agent: {
-                ...execution.agent,
-                instructions: [execution.agent.instructions, portableInstructions]
-                  .filter(Boolean)
-                  .join("\n\n"),
-                tools: [
-                  ...(execution.agent.tools ?? []).filter((tool) => tool.type !== "mcp"),
-                  ...(assignment.mcp ?? []),
-                ].map((tool) =>
-                  tool.type === "mcp" &&
-                  (harness !== "codex" ||
-                    (tool.transport.type === "http" && tool.connection_origin !== "environment"))
-                    ? {
-                        ...tool,
-                        transport: {
-                          type: "http",
-                          server_url: `http://mcp.internal/${tool.server_label}`,
-                        },
-                        connection_origin: "service",
-                        credential_id: null,
-                        request_metadata: {},
-                      }
-                    : tool,
-                ),
-              },
-            },
-            operationId,
-            checkpoint,
-          }),
-        }),
+      // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job. The
+      // marker and the dispatch it describes are one uninterruptible step: an interrupt
+      // between them, or mid-request, would leave a marker for a job that never started.
+      const result = yield* Effect.uninterruptible(
+        attempt("startAttempt", () =>
+          this.db.put("assignment", "current", { ...assignment, dispatched: true }),
+        ).pipe(
+          Effect.zipRight(
+            io("startAttempt", () =>
+              this.containerFetch("http://harness/jobs", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  execution: {
+                    ...execution,
+                    capabilityRoots,
+                    agent: {
+                      ...execution.agent,
+                      instructions: [execution.agent.instructions, portableInstructions]
+                        .filter(Boolean)
+                        .join("\n\n"),
+                      tools: [
+                        ...(execution.agent.tools ?? []).filter((tool) => tool.type !== "mcp"),
+                        ...(assignment.mcp ?? []),
+                      ].map((tool) =>
+                        tool.type === "mcp" &&
+                        (harness !== "codex" ||
+                          (tool.transport.type === "http" &&
+                            tool.connection_origin !== "environment"))
+                          ? {
+                              ...tool,
+                              transport: {
+                                type: "http",
+                                server_url: `http://mcp.internal/${tool.server_label}`,
+                              },
+                              connection_origin: "service",
+                              credential_id: null,
+                              request_metadata: {},
+                            }
+                          : tool,
+                      ),
+                    },
+                  },
+                  operationId,
+                  checkpoint,
+                }),
+              }),
+            ),
+          ),
+        ),
       );
       if (!result.ok)
         return yield* Effect.fail(new Error(`Harness rejected start (${result.status})`));
@@ -878,8 +893,10 @@ export class HarnessContainer<
           assignment.generation !== execution.generation
         )
           return Response.json({ status: "missing", events: [], cursor: 0 });
-        return yield* io("pollExecution", () =>
-          this.containerFetch(`http://harness/jobs/${execution.turnId}?after=${after}`),
+        return yield* io("pollExecution", (signal) =>
+          this.containerFetch(`http://harness/jobs/${execution.turnId}?after=${after}`, {
+            signal,
+          }),
         );
       }),
     );
@@ -915,11 +932,14 @@ export class HarnessContainer<
             this.db.put("assignment", "current", { ...assignment, imageDigests }),
           );
         }
-        const result = yield* io("controlExecution", () =>
+        // Interruptible: the supervisor deduplicates control by operationId, so an aborted
+        // delivery is retried by the next alarm without applying the command twice.
+        const result = yield* io("controlExecution", (signal) =>
           this.containerFetch(`http://harness/jobs/${execution.turnId}/control`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ operationId, command }),
+            signal,
           }),
         );
         if (command.type === "cancel")
@@ -967,14 +987,15 @@ export class HarnessContainer<
         this.db.get<Checkpoint>("checkpoint", String(execution.generation)),
       );
       if (committed) return committed;
-      const response = yield* io("snapshot", () =>
-        this.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`),
+      const response = yield* io("snapshot", (signal) =>
+        this.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`, { signal }),
       );
       if (!response.ok || !response.body)
         return yield* Effect.fail(new Error("Native checkpoint failed"));
       // containerFetch may return a chunked stream; R2 requires a known length.
       const bytes = yield* io("snapshot", () => response.arrayBuffer());
-      yield* io("snapshot", () => this.env.CHECKPOINTS.put(key, bytes));
+      // The checkpoint record below names this object: its outcome must be observed.
+      yield* Effect.uninterruptible(io("snapshot", () => this.env.CHECKPOINTS.put(key, bytes)));
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const workspace = execution.sandbox
         ? yield* io("snapshot", () =>
@@ -1092,9 +1113,9 @@ export class HarnessContainer<
       );
       // Native stderr is lost with the Container; keep a bounded tail in Worker logs.
       if (assignment.dispatched)
-        yield* io("stopAttempt.diagnostics", async () => {
+        yield* io("stopAttempt.diagnostics", async (signal) => {
           const response = await this.containerFetch("http://harness/diagnostics", {
-            signal: AbortSignal.timeout(5_000),
+            signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
           });
           if (!response.ok) return;
           const { lines } = (await response.json()) as { lines?: string[] };

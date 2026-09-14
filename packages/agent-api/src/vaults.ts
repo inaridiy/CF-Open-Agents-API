@@ -284,81 +284,92 @@ export class VaultRepository {
         }),
       );
       const outcome = yield* exchange.pipe(Effect.either);
-      if (outcome._tag === "Left") {
-        const failure = outcome.left;
-        // The endpoint answered (or refused a redirect before any credential was sent):
-        // nothing was consumed, so the reservation is released. A 4xx grant rejection is
-        // final until rotation; a 5xx may be retried. No answer at all stays unknown.
-        const definite =
-          failure instanceof RefreshRejected ||
-          (failure instanceof ApiError && failure.code === "upstream_redirect");
-        if (definite) {
-          const rejected = failure instanceof RefreshRejected && failure.rejected;
-          yield* attempt("vault.refresh.release", () =>
+      // The endpoint has answered. Releasing the reservation, recording a rejection or
+      // committing the rotated token must not be separated from that answer by an
+      // interrupt, or a consumed refresh token would be reported as unknown.
+      return yield* Effect.uninterruptible(
+        Effect.gen(this, function* () {
+          if (outcome._tag === "Left") {
+            const failure = outcome.left;
+            // The endpoint answered (or refused a redirect before any credential was sent):
+            // nothing was consumed, so the reservation is released. A 4xx grant rejection is
+            // final until rotation; a 5xx may be retried. No answer at all stays unknown.
+            const definite =
+              failure instanceof RefreshRejected ||
+              (failure instanceof ApiError && failure.code === "upstream_redirect");
+            if (definite) {
+              const rejected = failure instanceof RefreshRejected && failure.rejected;
+              yield* attempt("vault.refresh.release", () =>
+                this.db.transaction(() => {
+                  if (
+                    this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId ===
+                    operationId
+                  )
+                    this.db.remove("credential_refresh", id);
+                  if (rejected)
+                    this.db.put("credential_refresh_rejected", id, {
+                      version: 1,
+                      status: failure.status,
+                      at: Math.floor(Date.now() / 1000),
+                    });
+                }),
+              );
+              return yield* new ApiError(
+                422,
+                rejected ? "credential_refresh_rejected" : "credential_refresh_failed",
+                rejected
+                  ? "The token endpoint rejected the OAuth refresh; rotate the credential"
+                  : "The token endpoint failed; retry later",
+              );
+            }
+            return yield* new ApiError(
+              422,
+              "credential_refresh_failed",
+              "OAuth refresh outcome is unknown; rotate the credential before retrying",
+            );
+          }
+          const result = outcome.right;
+          return yield* attempt("vault.refresh.commit", () =>
             this.db.transaction(() => {
+              const current = this.db.require<CredentialRecord>(
+                `credential:${record.resource.vault_id}`,
+                id,
+              );
               if (
-                this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId ===
-                operationId
+                canonicalJSON(current.auth) !== fingerprint ||
+                this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId !==
+                  operationId
               )
-                this.db.remove("credential_refresh", id);
-              if (rejected)
-                this.db.put("credential_refresh_rejected", id, {
-                  version: 1,
-                  status: failure.status,
-                  at: Math.floor(Date.now() / 1000),
-                });
+                throw new ApiError(
+                  409,
+                  "credential_changed",
+                  "Credential was rotated during refresh",
+                );
+              const updated: Auth = {
+                ...auth,
+                access_token: result.access_token,
+                expires_at: result.expires_in
+                  ? new Date(Date.now() + result.expires_in * 1000).toISOString()
+                  : null,
+                refresh: {
+                  ...refresh,
+                  refresh_token: result.refresh_token ?? refresh.refresh_token,
+                  scope: result.scope ?? refresh.scope,
+                },
+              };
+              this.db.put(`credential:${record.resource.vault_id}`, id, {
+                ...record,
+                auth: updated,
+                resource: {
+                  ...record.resource,
+                  auth: publicCredentialAuth(updated),
+                  updated_at: Math.floor(Date.now() / 1000),
+                },
+              });
+              this.db.remove("credential_refresh", id);
+              return updated.access_token;
             }),
           );
-          return yield* new ApiError(
-            422,
-            rejected ? "credential_refresh_rejected" : "credential_refresh_failed",
-            rejected
-              ? "The token endpoint rejected the OAuth refresh; rotate the credential"
-              : "The token endpoint failed; retry later",
-          );
-        }
-        return yield* new ApiError(
-          422,
-          "credential_refresh_failed",
-          "OAuth refresh outcome is unknown; rotate the credential before retrying",
-        );
-      }
-      const result = outcome.right;
-      return yield* attempt("vault.refresh.commit", () =>
-        this.db.transaction(() => {
-          const current = this.db.require<CredentialRecord>(
-            `credential:${record.resource.vault_id}`,
-            id,
-          );
-          if (
-            canonicalJSON(current.auth) !== fingerprint ||
-            this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId !==
-              operationId
-          )
-            throw new ApiError(409, "credential_changed", "Credential was rotated during refresh");
-          const updated: Auth = {
-            ...auth,
-            access_token: result.access_token,
-            expires_at: result.expires_in
-              ? new Date(Date.now() + result.expires_in * 1000).toISOString()
-              : null,
-            refresh: {
-              ...refresh,
-              refresh_token: result.refresh_token ?? refresh.refresh_token,
-              scope: result.scope ?? refresh.scope,
-            },
-          };
-          this.db.put(`credential:${record.resource.vault_id}`, id, {
-            ...record,
-            auth: updated,
-            resource: {
-              ...record.resource,
-              auth: publicCredentialAuth(updated),
-              updated_at: Math.floor(Date.now() / 1000),
-            },
-          });
-          this.db.remove("credential_refresh", id);
-          return updated.access_token;
         }),
       );
     });

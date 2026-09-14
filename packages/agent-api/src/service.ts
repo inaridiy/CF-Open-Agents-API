@@ -262,6 +262,11 @@ export function createAgentService<Env extends AgentBindings>(
       return Effect.gen(this, function* () {
         const catalog = this.catalog(tenant);
         const stub = this.env.SESSIONS.getByName(JSON.stringify([tenant, reservation.id]));
+        // The commit makes the session discoverable after its object already exists; an
+        // interrupt must not leave that step unknown for the retry to sort out.
+        const commit = Effect.uninterruptible(
+          io("api.createSession", () => catalog.commit(idempotencyKey)),
+        );
         if (reservation.ready) return yield* io("api.createSession", () => stub.retrieve());
         yield* io("api.createSession", () => stub.initialize(reservation.record));
         const environmentSpec = reservation.record.environmentSpec;
@@ -278,7 +283,7 @@ export function createAgentService<Env extends AgentBindings>(
           const prepared = yield* environments.prepare(environmentSpec).pipe(Effect.either);
           if (prepared._tag === "Left") {
             yield* io("api.environment.failed", () => stub.environmentStatus("failed"));
-            yield* io("api.createSession", () => catalog.commit(idempotencyKey));
+            yield* commit;
             return yield* io("api.createSession", () => stub.retrieve());
           }
           yield* io("api.environment.connected", () => stub.environmentStatus("connected"));
@@ -292,7 +297,7 @@ export function createAgentService<Env extends AgentBindings>(
               ),
             ),
           );
-        yield* io("api.createSession", () => catalog.commit(idempotencyKey));
+        yield* commit;
         return yield* io("api.createSession", () => stub.retrieve());
       });
     }

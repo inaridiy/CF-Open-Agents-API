@@ -315,24 +315,29 @@ export interface RuntimeDriver {
   stop(execution: Execution): Effect.Effect<void, ServiceError>;
 }
 
-/** Migration adapter for external Promise drivers. All calls are lazy and typed. */
+/**
+ * Migration adapter for external Promise drivers. All calls are lazy and typed. Each
+ * method also receives the fiber's interruption signal; a driver that can cancel the
+ * underlying call should honor it, and one that cannot may ignore it.
+ */
 export type PromiseRuntimeDriver = {
   [K in keyof RuntimeDriver]: RuntimeDriver[K] extends (
     ...args: infer P
   ) => Effect.Effect<infer A, ServiceError>
-    ? (...args: P) => Promise<A>
+    ? (...args: [...P, signal: AbortSignal]) => Promise<A>
     : RuntimeDriver[K];
 };
 export const fromPromiseDriver = (driver: PromiseRuntimeDriver): RuntimeDriver => ({
   name: driver.name,
   revision: driver.revision,
   capabilities: driver.capabilities,
-  start: (execution, id) => io("runtime.start", () => driver.start(execution, id)),
-  poll: (execution, after) => io("runtime.poll", () => driver.poll(execution, after)),
+  start: (execution, id) => io("runtime.start", (signal) => driver.start(execution, id, signal)),
+  poll: (execution, after) => io("runtime.poll", (signal) => driver.poll(execution, after, signal)),
   control: (execution, id, command) =>
-    io("runtime.control", () => driver.control(execution, id, command)),
-  checkpoint: (execution) => io("runtime.checkpoint", () => driver.checkpoint(execution)),
-  stop: (execution) => io("runtime.stop", () => driver.stop(execution)),
+    io("runtime.control", (signal) => driver.control(execution, id, command, signal)),
+  checkpoint: (execution) =>
+    io("runtime.checkpoint", (signal) => driver.checkpoint(execution, signal)),
+  stop: (execution) => io("runtime.stop", (signal) => driver.stop(execution, signal)),
 });
 
 export interface AgentRegistration {

@@ -64,16 +64,23 @@ export function uploadInputFile(bucket: R2Bucket, form: FormData) {
         ...(lifetime ? { expires_at: created_at + lifetime } : {}),
       },
     };
-    yield* io("file.store", () =>
-      bucket.put(record.key, file.stream(), {
-        httpMetadata: { contentType: file.type || "application/octet-stream" },
-      }),
+    // The catalog record names this object once it is stored: observe the put's outcome.
+    yield* Effect.uninterruptible(
+      io("file.store", () =>
+        bucket.put(record.key, file.stream(), {
+          httpMetadata: { contentType: file.type || "application/octet-stream" },
+        }),
+      ),
     );
     return record;
   });
 }
 
-/** A failed or interrupted R2 write interrupts the producer as well. R2 requires a known length. */
+/**
+ * A failed or interrupted R2 write interrupts the producer as well. R2 requires a known
+ * length. Interrupting the transfer aborts the copy; the store then observes the broken
+ * stream and settles on its own, so an interrupted put is never left with an unknown outcome.
+ */
 export function copyKnownLength(
   source: ReadableStream<Uint8Array>,
   length: number,
@@ -85,7 +92,7 @@ export function copyKnownLength(
       Effect.all(
         [
           io("file.transfer.copy", (signal) => source.pipeTo(stream.writable, { signal })),
-          io("file.transfer.store", () => store(stream.readable)),
+          Effect.uninterruptible(io("file.transfer.store", () => store(stream.readable))),
         ],
         { concurrency: 2, discard: true },
       ),
