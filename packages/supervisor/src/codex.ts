@@ -14,7 +14,7 @@ import { Deferred, Effect, Ref } from "effect";
 import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
-import { AppServer, type RpcMessage } from "./json-rpc.js";
+import { AppServer, RpcError, type RpcMessage } from "./json-rpc.js";
 import {
   describeFailure,
   JobLifecycle,
@@ -1038,11 +1038,18 @@ export class CodexJob {
     if (this.closing || !["running", "waiting"].includes(this.status))
       throw rejected("Turn is no longer active");
     if (command.type === "steer") {
-      await this.server.request("turn/steer", {
-        threadId: this.threadId,
-        expectedTurnId: this.nativeTurnId,
-        input: this.input(command.input),
-      });
+      try {
+        await this.server.request("turn/steer", {
+          threadId: this.threadId,
+          expectedTurnId: this.nativeTurnId,
+          input: this.input(command.input),
+        });
+      } catch (error) {
+        // Codex answered: the steer can never apply to this turn (it ended or
+        // moved on). Transport failures stay transient and are retried.
+        if (error instanceof RpcError) throw rejected(`Codex rejected the steer: ${error.message}`);
+        throw error;
+      }
     } else {
       const delegated = this.delegations.owns(command.callId);
       if (delegated) {

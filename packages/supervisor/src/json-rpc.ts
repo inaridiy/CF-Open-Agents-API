@@ -10,9 +10,20 @@ const envelope = z.object({
   method: z.string().optional(),
   params: z.unknown().optional(),
   result: z.unknown().optional(),
-  error: z.object({ message: z.string() }).optional(),
+  error: z.object({ code: z.number().optional(), message: z.string() }).optional(),
 });
 export type RpcMessage = z.infer<typeof envelope>;
+
+/** The app-server answered a request with a JSON-RPC error: a definite rejection, not a transport failure. */
+export class RpcError extends Error {
+  constructor(
+    readonly code: number | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RpcError";
+  }
+}
 
 /** Codex app-server's documented newline-delimited stdio transport. */
 export class AppServer {
@@ -71,7 +82,8 @@ export class AppServer {
       if (typeof message.id === "number" && !message.method) {
         const request = runSync(Ref.get(this.pending)).get(message.id);
         if (!request) return;
-        if (message.error) runSync(Deferred.fail(request, new Error(message.error.message)));
+        if (message.error)
+          runSync(Deferred.fail(request, new RpcError(message.error.code, message.error.message)));
         else runSync(Deferred.succeed(request, message.result));
       } else options.onMessage(message);
     });
