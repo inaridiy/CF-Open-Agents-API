@@ -136,7 +136,12 @@ it.each(["complete", "cancel", "immediate"])(
         await delay(25);
       if (outcome !== "immediate")
         expect(job.poll(0).status, diagnostics.join("\n")).toBe("running");
-      expect(job.poll(0).events.some(({ event }) => event.type === "subagent_turn")).toBe(true);
+      // The child's turn notification and the root's final text are independent
+      // app-server events; the child turn is asserted once it has been projected.
+      const childTurnSeen = () =>
+        job.poll(0).events.some(({ event }) => event.type === "subagent_turn");
+      for (let i = 0; i < 200 && !childTurnSeen(); i++) await delay(25);
+      expect(childTurnSeen(), diagnostics.join("\n")).toBe(true);
       if (outcome === "cancel") {
         await job.control("cancel-after-root", { type: "cancel" });
         for (let i = 0; i < 200 && job.poll(0).status === "running"; i++) await delay(25);

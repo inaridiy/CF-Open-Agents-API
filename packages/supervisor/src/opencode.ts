@@ -152,9 +152,12 @@ export class OpenCodeJob extends ToolJob {
       const parts = new Map<string, Part["type"]>();
       const usage = new Map<string, AssistantMessage>();
       const started = Date.now();
-      const collectUsage = (info: AssistantMessage) => {
-        if (info.sessionID !== this.sessionId || info.time.created < started) return;
+      const record = (info: AssistantMessage) => {
+        if (info.sessionID !== this.sessionId || info.time.created < started) return false;
         usage.set(info.id, info);
+        return true;
+      };
+      const publishUsage = () => {
         const messages = [...usage.values()];
         const input = messages.reduce(
           (sum, message) =>
@@ -202,8 +205,12 @@ export class OpenCodeJob extends ToolJob {
       let streamError: unknown;
       const consume = (async () => {
         for await (const event of events.stream) {
-          if (event.type === "message.updated" && event.properties.info.role === "assistant")
-            collectUsage(event.properties.info);
+          if (
+            event.type === "message.updated" &&
+            event.properties.info.role === "assistant" &&
+            record(event.properties.info)
+          )
+            publishUsage();
           if (event.type === "message.part.updated") collectPart(event.properties.part);
           if (
             event.type === "message.part.delta" &&
@@ -256,7 +263,13 @@ export class OpenCodeJob extends ToolJob {
           { signal: this.abort.signal },
         );
         if (streamError) throw streamError;
-        if (result.data) collectUsage(result.data.info);
+        // The event feed can lag under load; the stored messages are authoritative
+        // for usage, so the final report covers every inference of this turn.
+        const listed = await client.session.messages({ sessionID: this.sessionId });
+        for (const message of listed.data ?? [])
+          if (message.info.role === "assistant") record(message.info);
+        if (result.data) record(result.data.info);
+        publishUsage();
         if (
           !result.data ||
           result.data.info.error ||

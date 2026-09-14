@@ -13,6 +13,7 @@ import {
 import { Context, Effect, Layer, Ref, Schema } from "effect";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { ClaudeCodeJob } from "./claude-code.js";
 import { CodexJob, type CodexOptions } from "./codex.js";
@@ -64,7 +65,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
     Effect.gen(function* () {
       const current = yield* Ref.get(active);
       if (!current || current.job.execution.turnId !== turn)
-        return yield* new ApiError(404, "missing", "Execution is missing");
+        return yield* new ApiError(404, "execution_missing", "Execution is missing");
       return current.job;
     });
   const stop = lifecycle.withPermits(1)(
@@ -75,14 +76,26 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   );
   const app = new Hono();
   app.use("*", bodyLimit({ maxSize: 48 * 1024 * 1024 }));
-  app.onError((error) =>
-    Response.json(
-      { error: error instanceof ApiError ? error.code : error.message },
-      {
-        status: error instanceof z.ZodError ? 400 : error instanceof ApiError ? error.status : 409,
-      },
-    ),
-  );
+  /**
+   * Error contract for the HarnessDO: `{ code, message }` with the status of a
+   * known failure. `409 command_rejected` means the command can never apply to
+   * this execution; `404 execution_missing` means no such job; anything else is
+   * a transient failure worth retrying. `error` mirrors `code` for older readers.
+   */
+  app.onError((error) => {
+    if (error instanceof HTTPException) return error.getResponse();
+    const known =
+      error instanceof z.ZodError
+        ? new ApiError(400, "invalid_request", z.prettifyError(error))
+        : error instanceof ApiError
+          ? error
+          : undefined;
+    const code = known?.code ?? "internal_error";
+    return Response.json(
+      { error: code, code, message: known?.message ?? error.message },
+      { status: known?.status ?? 500 },
+    );
+  });
   app.get("/health", () => Response.json({ harnesses: HARNESSES, ready: true }));
   app.get("/diagnostics", () => Response.json({ lines: recent }));
   app.post("/jobs", async (c) => {

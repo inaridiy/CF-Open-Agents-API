@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 const dataImage = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\r\n]+)$/;
+/** Inline image data forwarded to a native runtime; base64 text, so ~15 MiB decoded. */
+const INLINE_IMAGE_LIMIT = 20 * 1024 * 1024;
 /** Remote images pass through an assignment-scoped Worker proxy; native homes have no credentials. */
 export async function imageContent(
   url: string,
@@ -8,8 +10,11 @@ export async function imageContent(
   endpoint = "http://media.internal",
 ) {
   const inline = dataImage.exec(url);
-  if (inline)
-    return { type: "image" as const, mimeType: inline[1] ?? "image/png", data: inline[2] ?? "" };
+  if (inline) {
+    const [, mimeType = "", data = ""] = inline;
+    if (data.length > INLINE_IMAGE_LIMIT) throw new Error("Inline image exceeds 20 MiB");
+    return { type: "image" as const, mimeType, data: data.replace(/[\r\n]/g, "") };
+  }
   const response = await fetch(
     `${endpoint.replace(/\/$/, "")}/image?url=${encodeURIComponent(url)}`,
     { signal },

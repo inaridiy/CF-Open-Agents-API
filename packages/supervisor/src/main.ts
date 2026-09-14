@@ -19,6 +19,17 @@ const config = Config.all({
   ),
   sandboxUrl: Config.url("SANDBOX_URL").pipe(Config.withDefault(new URL("ws://sandbox.internal"))),
 });
+// A stray rejection or exception in a native callback must not take every job's
+// transport down with it; the affected job reports its own failure.
+process.on("unhandledRejection", (reason) => {
+  console.error(`supervisor: unhandled rejection: ${describe(reason)}`);
+});
+process.on("uncaughtException", (error) => {
+  console.error(`supervisor: uncaught exception: ${describe(error)}`);
+});
+function describe(value: unknown): string {
+  return value instanceof Error ? (value.stack ?? value.message) : String(value);
+}
 const shutdown = Effect.async<void>((resume) => {
   const stop = () => resume(Effect.void);
   process.once("SIGTERM", stop);

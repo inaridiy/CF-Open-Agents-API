@@ -149,13 +149,17 @@ export class ClaudeCodeJob extends ToolJob {
         )
           throw new Error("Workspace MCP server failed to connect");
         if (message.type === "assistant") {
+          // Text that precedes tool use is commentary; the closing message is the answer.
+          const phase = message.message.content.some((part) => part.type === "tool_use")
+            ? "commentary"
+            : "final_answer";
           for (const [index, part] of message.message.content.entries()) {
             if (part.type === "text")
               this.emit({
                 type: "text",
                 id: `${message.message.id}:${index}`,
                 text: part.text,
-                phase: "final_answer",
+                phase,
               });
             else if (part.type === "thinking")
               this.emit({

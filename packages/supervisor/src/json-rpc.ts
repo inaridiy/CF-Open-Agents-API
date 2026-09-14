@@ -21,6 +21,7 @@ export class AppServer {
   private readonly pending = Ref.unsafeMake(new Map<number, Deferred.Deferred<unknown, Error>>());
   private readonly exited = runSync(Deferred.make<void>());
   private closed = false;
+  private readonly onDiagnostic: (line: string) => void;
   private readonly stopped = once("app-server.stop", () =>
     runPromise(
       Effect.gen(this, function* () {
@@ -42,6 +43,7 @@ export class AppServer {
     onExit: () => void;
     onDiagnostic: (line: string) => void;
   }) {
+    this.onDiagnostic = options.onDiagnostic;
     this.child = spawn(options.binary, ["app-server", "--listen", "stdio://"], {
       cwd: options.directory,
       // An explicit child environment keeps host credentials out of Codex.
@@ -53,12 +55,17 @@ export class AppServer {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // A broken pipe while writing to a dying process is diagnosed, never thrown at top level.
+    this.child.stdin.on("error", (error) => {
+      options.onDiagnostic(`app-server stdin: ${error.message}`);
+    });
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       let message: RpcMessage;
       try {
         message = envelope.parse(JSON.parse(line));
       } catch {
-        this.fail(new Error("Malformed app-server message"));
+        // One unparseable line does not invalidate the transport or other requests.
+        options.onDiagnostic(`app-server: dropped malformed message: ${line.slice(0, 512)}`);
         return;
       }
       if (typeof message.id === "number" && !message.method) {
@@ -119,8 +126,14 @@ export class AppServer {
   reject(id: number | string): void {
     this.write({ id, error: { code: -32601, message: "Unsupported server request" } });
   }
+  /** Writes to a closed process are dropped: nothing can consume them. */
   private write(value: unknown): void {
-    this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    if (this.closed || this.child.stdin.destroyed || !this.child.stdin.writable) return;
+    try {
+      this.child.stdin.write(`${JSON.stringify(value)}\n`);
+    } catch (error) {
+      this.onDiagnostic(`app-server write failed: ${String(error)}`);
+    }
   }
   private fail(error: Error): void {
     const pending = runSync(Ref.getAndSet(this.pending, new Map()));

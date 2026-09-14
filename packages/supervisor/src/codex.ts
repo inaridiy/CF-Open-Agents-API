@@ -2,6 +2,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Execution, RuntimeBatch, RuntimeCommand, RuntimeEvent } from "cf-open-agents-api";
 import {
+  ApiError,
   io,
   type JsonValue,
   programmaticTool,
@@ -12,9 +13,9 @@ import {
 import { Deferred, Effect, Ref } from "effect";
 import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
-import { DELEGATION_TOOLS, Delegations } from "./delegation.js";
+import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
 import { AppServer, type RpcMessage } from "./json-rpc.js";
-import { JobLifecycle, Operations, once } from "./lifecycle.js";
+import { describeFailure, JobLifecycle, Operations, once } from "./lifecycle.js";
 import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
 import { executeWorkspace } from "./workspace.js";
 
@@ -79,6 +80,8 @@ export interface CodexOptions {
   diagnostics: (line: string) => void;
   programmaticUrl?: string;
   delegateUrl?: string;
+  /** Bounds for delegate round trips; tests shorten them. */
+  delegationTimeouts?: DelegationOptions["timeouts"];
 }
 
 /** One instance per attempt. Workspace I/O goes through the remote environment. */
@@ -123,8 +126,11 @@ export class CodexJob {
     return capture(this.home, this.threadId);
   });
   private readonly stopped = once("codex.stop", async () => {
-    this.lifecycle.close();
+    // Children are told first, while their terminal events are still recorded; a
+    // root that settles meanwhile reads as cancelled, never completed.
+    this.lifecycle.requestCancel();
     await this.delegations.cancelAll();
+    this.lifecycle.close();
     this.codeAbort.abort();
     for (const pending of this.pendingCode.values())
       runSync(Deferred.fail(pending, new Error("Execution stopped")));
@@ -148,6 +154,7 @@ export class CodexJob {
       },
       settled: () => this.finishIfReady(),
       diagnostics: options.diagnostics,
+      ...(options.delegationTimeouts ? { timeouts: options.delegationTimeouts } : {}),
     });
   }
   start(bundle?: unknown): Promise<void> {
@@ -232,7 +239,7 @@ export class CodexJob {
       onMessage: (message) => this.receive(message),
       onExit: () => {
         if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status)) {
-          this.lifecycle.fail("app_server_exited");
+          this.lifecycle.fail("native_harness_exited");
         }
       },
       onDiagnostic: this.options.diagnostics,
@@ -357,13 +364,12 @@ export class CodexJob {
       ),
     );
   }
+  /** Exceeding the retained event budget fails the job; the app-server is then stopped. */
   private push(event: RuntimeEvent): void {
-    try {
-      this.lifecycle.emit(event);
-    } catch {
-      this.lifecycle.fail("event_buffer_limit");
-      void this.stop().catch(this.options.diagnostics);
-    }
+    if (!this.lifecycle.emit(event) && this.status === "failed" && !this.closing)
+      void this.stop().catch((error) =>
+        this.options.diagnostics(`Failed to stop after output limit: ${String(error)}`),
+      );
   }
   private receive(message: RpcMessage): void {
     if (this.closing || !["running", "waiting"].includes(this.status)) return;
@@ -821,7 +827,13 @@ export class CodexJob {
       if (result.data.turn.status === "completed")
         this.rootOutcome = this.cancelRequested ? "cancelled" : "completed";
       else if (result.data.turn.status === "interrupted") this.rootOutcome = "cancelled";
-      else this.lifecycle.fail(result.data.turn.error?.message ?? "native_turn_failed");
+      else {
+        // The public error is a stable code; the native message goes to diagnostics.
+        this.options.diagnostics(
+          `native_turn_failed: ${result.data.turn.error?.message ?? result.data.turn.status}`,
+        );
+        this.lifecycle.fail("native_turn_failed");
+      }
       this.finishIfReady();
     }
   }
@@ -848,30 +860,31 @@ export class CodexJob {
     );
   }
   private async apply(id: string, command: RuntimeCommand): Promise<void> {
-    if (!this.server) throw new Error("App-server not started");
-    if (
-      command.type !== "cancel" &&
-      (this.closing || !["running", "waiting"].includes(this.status))
-    )
-      throw new Error("Turn is no longer active");
+    const rejected = (message: string) => new ApiError(409, "command_rejected", message);
     if (command.type === "cancel") {
-      if (["completed", "cancelled", "failed"].includes(this.status)) return;
+      // Idempotent: a terminal or unstarted job has nothing left to interrupt.
+      if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
       this.cancelRequested = true;
+      // A finished root must read as cancelled before a settling child can seal the outcome.
+      this.lifecycle.requestCancel();
+      if (this.rootOutcome) this.rootOutcome = "cancelled";
       // Children are told before the shared abort signal closes their route.
       await this.delegations.cancelAll();
       this.codeAbort.abort();
       for (const pending of this.pendingCode.values())
         runSync(Deferred.fail(pending, new Error("Execution cancelled")));
       this.pendingCode.clear();
-      if (this.rootOutcome) this.rootOutcome = "cancelled";
-      else await this.interrupt(this.threadId, this.nativeTurnId);
+      if (!this.rootOutcome) await this.interrupt(this.threadId, this.nativeTurnId);
       for (const [threadId, child] of this.children) {
         if (child.active && child.turnId) await this.interrupt(threadId, child.turnId);
       }
       this.finishIfReady();
-    } else if (command.type === "steer") {
-      if (this.closing || !["running", "waiting"].includes(this.status))
-        throw new Error("Turn is no longer steerable");
+      return;
+    }
+    if (!this.server) throw rejected("App-server not started");
+    if (this.closing || !["running", "waiting"].includes(this.status))
+      throw rejected("Turn is no longer active");
+    if (command.type === "steer") {
       await this.server.request("turn/steer", {
         threadId: this.threadId,
         expectedTurnId: this.nativeTurnId,
@@ -904,7 +917,7 @@ export class CodexJob {
         return;
       }
       const requestId = runSync(Ref.get(this.pendingTools)).get(command.callId);
-      if (requestId === undefined) throw new Error("Unknown tool call");
+      if (requestId === undefined) throw rejected("Unknown tool call");
       this.server.respond(requestId, {
         success: command.success,
         contentItems:
@@ -1088,8 +1101,10 @@ export class CodexJob {
       if (!(error instanceof Error && error.message === "no active turn to interrupt")) throw error;
     }
   }
+  /** The public error is a stable code; the native reason goes to diagnostics. */
   failStart(error: unknown): void {
-    this.lifecycle.fail(error instanceof Error ? error.message : "app_server_start_failed");
+    this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
+    this.lifecycle.fail("native_harness_failed");
   }
   checkpoint(): Promise<NativeBundle> {
     return runPromise(this.saved);
