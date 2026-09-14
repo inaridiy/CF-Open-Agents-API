@@ -37,7 +37,10 @@ export class RemoteTools {
               signal: this.signal,
             },
           }),
-          { signal: this.signal, timeout: Math.min(30_000, execution.deadline - Date.now()) },
+          {
+            signal: this.signal,
+            timeout: Math.max(1_000, Math.min(30_000, execution.deadline - Date.now())),
+          },
         );
         let cursor: string | undefined;
         const seen = new Set<string>();

@@ -8,6 +8,7 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
+  ApiError,
   type Execution,
   io,
   type JsonValue,
@@ -22,11 +23,11 @@ import {
   type WorkspaceToolName,
   workspaceTools,
 } from "cf-open-agents-api";
-import { Cause, Deferred, Effect, Exit, Fiber, Ref, Scope } from "effect";
+import { Deferred, Effect, Exit, Fiber, Ref, Scope } from "effect";
 import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
-import { DELEGATION_TOOLS, Delegations } from "./delegation.js";
-import { JobLifecycle, Operations, once } from "./lifecycle.js";
+import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
+import { describeFailure, JobLifecycle, Operations, once } from "./lifecycle.js";
 import { imageContent } from "./media.js";
 import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
 import { RemoteTools } from "./remote-tools.js";
@@ -65,6 +66,8 @@ export interface NativeOptions {
   programmaticUrl?: string;
   mediaUrl?: string;
   delegateUrl?: string;
+  /** Bounds for delegate round trips; tests shorten them. */
+  delegationTimeouts?: DelegationOptions["timeouts"];
 }
 
 /** Shared transport/lifecycle bookkeeping; inference remains in the native harness. */
@@ -87,7 +90,8 @@ export abstract class ToolJob implements NativeJob {
   protected readonly remoteTools = new RemoteTools(this.abort.signal, (event) => this.emit(event));
   protected readonly delegations: Delegations;
   private readonly discovered = new Set<string>();
-  private readonly codeInvocations = new Set<string>();
+  /** Client function calls raised by each live code invocation; settled calls leave the set. */
+  private readonly codeCalls = new Map<string, Set<string>>();
   private readonly saved = once("native.checkpoint", async () => {
     if (this.status !== "completed" || !this.sessionId)
       throw new Error("Native turn must complete before checkpointing");
@@ -95,9 +99,12 @@ export abstract class ToolJob implements NativeJob {
     return capture(this.home, this.sessionId);
   });
   private readonly stopped = once("native.stop", async () => {
-    this.lifecycle.close();
-    // Children are told first, while this job can still reach its HarnessDO route.
+    // Children are told first, while their terminal events are still recorded and
+    // this job can still reach its HarnessDO route; closing then seals the log.
+    // A task that finishes meanwhile reads as cancelled, never completed.
+    this.lifecycle.requestCancel();
     await this.delegations.cancelAll();
+    this.lifecycle.close();
     this.abort.abort();
     const pending = runSync(Ref.getAndSet(this.pending, new Map()));
     for (const result of pending.values())
@@ -121,6 +128,7 @@ export abstract class ToolJob implements NativeJob {
         void this.stop().catch(() => options.diagnostics("Failed to stop after child failure"));
       },
       diagnostics: (line) => options.diagnostics(line),
+      ...(options.delegationTimeouts ? { timeouts: options.delegationTimeouts } : {}),
     });
   }
   start(bundle?: unknown): Promise<void> {
@@ -148,8 +156,10 @@ export abstract class ToolJob implements NativeJob {
     await this.remoteTools.open(this.execution);
     return previous;
   }
+  /** Exceeding the retained event budget fails the job; the runtime is then stopped. */
   protected emit(event: RuntimeEvent): void {
-    this.lifecycle.emit(event);
+    if (!this.lifecycle.emit(event) && this.status === "failed" && !this.closing)
+      void this.stop().catch(() => this.options.diagnostics("Failed to stop after output limit"));
   }
   protected run(task: () => Promise<void>): void {
     this.task = runSync(
@@ -161,22 +171,17 @@ export abstract class ToolJob implements NativeJob {
         Effect.tap(() => Effect.sync(() => this.lifecycle.setStatus("completed"))),
         Effect.catchAllCause((cause) =>
           Effect.sync(() => {
-            // The public error stays generic; the reason is kept in native diagnostics.
-            if (!this.closing) {
-              const squashed = Cause.squash(cause);
-              const reason = squashed instanceof OperationError ? squashed.cause : squashed;
-              this.options.diagnostics(
-                `native_harness_failed: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
-              );
-            }
-            this.failStart(new Error("native_harness_failed"));
+            // A stop interrupts the task deliberately; that is not a harness failure.
+            if (!this.closing) this.failStart(cause);
           }),
         ),
         Effect.forkIn(this.scope),
       ),
     );
   }
-  failStart(_error: unknown): void {
+  /** The public error is a stable code; the native reason goes to diagnostics. */
+  failStart(error: unknown): void {
+    this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
     this.lifecycle.fail("native_harness_failed");
   }
   poll(after: number): RuntimeBatch {
@@ -193,7 +198,7 @@ export abstract class ToolJob implements NativeJob {
     );
   }
 
-  protected externalTool(name: string, args: unknown): Promise<ToolResult> {
+  protected externalTool(name: string, args: unknown, invocation?: string): Promise<ToolResult> {
     return runPromise(
       Effect.gen(this, function* () {
         if (this.closing || this.abort.signal.aborted)
@@ -201,6 +206,7 @@ export abstract class ToolJob implements NativeJob {
         const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
         const result = yield* Deferred.make<ToolResult, Error>();
         yield* Ref.update(this.pending, (pending) => new Map(pending).set(callId, result));
+        if (invocation) this.codeCalls.get(invocation)?.add(callId);
         this.emit({
           type: "function_call",
           id: callId,
@@ -215,7 +221,10 @@ export abstract class ToolJob implements NativeJob {
   }
   protected async executeCode(input: unknown) {
     const invocation = crypto.randomUUID();
-    this.codeInvocations.add(invocation);
+    // Only calls this invocation raised count as unfinished; a native call the
+    // runtime issued in parallel belongs to the runtime, not to the code.
+    const raised = new Set<string>();
+    this.codeCalls.set(invocation, raised);
     try {
       const result = await executeCode(
         this.execution,
@@ -224,7 +233,7 @@ export abstract class ToolJob implements NativeJob {
         this.options.programmaticUrl,
         invocation,
       );
-      if (result.terminal || (result.isError && runSync(Ref.get(this.pending)).size))
+      if (result.terminal || (result.isError && raised.size))
         throw new Error("Code execution left unfinished tool calls");
       return result;
     } catch (error) {
@@ -233,11 +242,11 @@ export abstract class ToolJob implements NativeJob {
       void this.stop().catch(() => this.options.diagnostics("Failed to stop code execution"));
       throw error;
     } finally {
-      this.codeInvocations.delete(invocation);
+      this.codeCalls.delete(invocation);
     }
   }
   async codeTools(invocation: string): Promise<string[]> {
-    if (!this.codeInvocations.has(invocation)) throw new Error("No active code invocation");
+    if (!this.codeCalls.has(invocation)) throw new Error("No active code invocation");
     return [
       ...(this.execution.agent.tools ?? []).flatMap((tool) =>
         tool.type === "function" ? [tool.name] : [],
@@ -259,7 +268,7 @@ export abstract class ToolJob implements NativeJob {
     }
     if (this.remoteTools.tools.some((tool) => tool.codeName === name))
       return this.remoteTools.call(name, args);
-    return this.externalTool(name, functionArguments(this.execution, name, args));
+    return this.externalTool(name, functionArguments(this.execution, name, args), invocation);
   }
   protected toolDefinitions(): Tool[] {
     const functions = (this.execution.agent.tools ?? []).flatMap((tool, index) =>
@@ -396,63 +405,76 @@ export abstract class ToolJob implements NativeJob {
   }
   control(operationId: string, command: RuntimeCommand): Promise<void> {
     return runPromise(
-      this.operations.perform(
-        operationId,
-        command,
-        this.lifecycle.transition.withPermits(1)(
-          Effect.gen(this, function* () {
-            if (command.type === "steer")
-              return yield* Effect.fail(new Error("This harness cannot steer an active turn"));
-            if (command.type === "cancel") {
-              this.lifecycle.setStatus("cancelled");
-              yield* this.stopped;
-              return;
-            }
-            const child = this.delegations.owns(command.callId);
-            if (child) {
-              // The result belongs to a delegated child's function call.
-              if (this.closing) return yield* Effect.fail(new Error("Execution has stopped"));
-              yield* io("native.delegate", () =>
-                this.delegations.routeToolResult(child, operationId, command),
-              );
-              return;
-            }
-            if (this.closing || this.status !== "waiting")
-              return yield* Effect.fail(new Error("Execution is not waiting for tools"));
-            const pending = yield* Ref.get(this.pending);
-            const result = pending.get(command.callId);
-            if (!result) return yield* Effect.fail(new Error("No matching pending function call"));
-            const content =
-              typeof command.output === "string"
-                ? [{ type: "text" as const, text: command.output }]
-                : yield* io("native.toolImages", () =>
-                    Promise.all(
-                      (command.output as Exclude<typeof command.output, string>).map(
-                        async (part) =>
-                          part.type === "input_text"
-                            ? { type: "text" as const, text: part.text }
-                            : imageContent(
-                                part.image_url,
-                                this.abort.signal,
-                                this.options.mediaUrl,
-                              ),
-                      ),
-                    ),
-                  );
-            const next = new Map(pending);
-            next.delete(command.callId);
-            yield* Ref.set(this.pending, next);
-            this.lifecycle.setStatus(next.size ? "waiting" : "running");
-            yield* Deferred.succeed(result, {
-              content,
-              isError: !command.success,
-            });
-          }).pipe(
-            Effect.mapError(
-              (cause): ServiceError => new OperationError({ operation: "native.control", cause }),
-            ),
-          ),
+      Effect.gen(this, function* () {
+        // Remote image parts are fetched before the memoized operation, so a transient
+        // media failure stays retryable under the same operation ID.
+        const content = command.type === "tool_result" ? yield* this.toolContent(command) : [];
+        yield* this.operations.perform(
+          operationId,
+          command,
+          this.lifecycle.transition.withPermits(1)(this.apply(operationId, command, content)),
+        );
+      }),
+    );
+  }
+  private toolContent(command: Extract<RuntimeCommand, { type: "tool_result" }>) {
+    const output = command.output;
+    if (typeof output === "string")
+      return Effect.succeed<ToolResult["content"]>([{ type: "text", text: output }]);
+    return io("native.toolImages", () =>
+      Promise.all(
+        output.map(
+          async (part): Promise<ToolResult["content"][number]> =>
+            part.type === "input_text"
+              ? { type: "text", text: part.text }
+              : imageContent(part.image_url, this.abort.signal, this.options.mediaUrl),
         ),
+      ),
+    );
+  }
+  /**
+   * `command_rejected` means the command can never apply to this execution; the
+   * HarnessDO forwards it as such. Other failures are transient I/O errors.
+   */
+  private apply(operationId: string, command: RuntimeCommand, content: ToolResult["content"]) {
+    return Effect.gen(this, function* () {
+      const rejected = (message: string) => new ApiError(409, "command_rejected", message);
+      if (command.type === "steer")
+        return yield* rejected("This harness cannot steer an active turn");
+      if (command.type === "cancel") {
+        // Idempotent: closing marks the outcome cancelled unless it is already terminal.
+        yield* this.stopped;
+        return;
+      }
+      const child = this.delegations.owns(command.callId);
+      if (child) {
+        // The result belongs to a delegated child's function call.
+        if (this.closing) return yield* rejected("Execution has stopped");
+        yield* io("native.delegate", () =>
+          this.delegations.routeToolResult(child, operationId, command),
+        );
+        return;
+      }
+      if (this.closing || this.status !== "waiting")
+        return yield* rejected("Execution is not waiting for tools");
+      // Remove the call atomically: registrations that raced the image fetch survive.
+      const entry = yield* Ref.modify(this.pending, (pending) => {
+        const result = pending.get(command.callId);
+        if (!result) return [undefined, pending] as const;
+        const next = new Map(pending);
+        next.delete(command.callId);
+        return [{ result, remaining: next.size }, next] as const;
+      });
+      if (!entry) return yield* rejected("No matching pending function call");
+      for (const raised of this.codeCalls.values()) raised.delete(command.callId);
+      this.lifecycle.setStatus(entry.remaining ? "waiting" : "running");
+      yield* Deferred.succeed(entry.result, { content, isError: !command.success });
+    }).pipe(
+      Effect.mapError(
+        (cause): ServiceError =>
+          cause instanceof ApiError
+            ? cause
+            : new OperationError({ operation: "native.control", cause }),
       ),
     );
   }

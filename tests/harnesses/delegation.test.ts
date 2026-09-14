@@ -79,63 +79,108 @@ function scriptedChildren() {
   return { server, controls, spawns };
 }
 
-it.each(["codex", "claude-code", "opencode"])(
+/**
+ * Scripted parent model: delegates once, then either waits for the child (`wait`)
+ * or answers immediately and leaves the child running (`leave`).
+ */
+function scriptedGateway(plan: "wait" | "leave") {
+  return createModelGateway(() => ({
+    primary: aiSDKModel(
+      new MockLanguageModelV4({
+        doStream: async ({ prompt, tools }) => {
+          const history = JSON.stringify(prompt);
+          const definitions = tools?.filter((tool) => tool.type === "function") ?? [];
+          const find = (suffix: string) =>
+            definitions.find((tool) => tool.name === suffix || tool.name.endsWith(`_${suffix}`));
+          const spawned = history.includes("subagent_1");
+          const waited = plan === "leave" || history.includes("CHILD_ANSWER");
+          const tool = !spawned ? find("cf_delegate") : !waited ? find("cf_wait") : undefined;
+          if (!waited && !tool)
+            throw new Error(`Missing delegation tool: ${definitions.map((t) => t.name)}`);
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "stream-start", warnings: [] },
+                ...(tool
+                  ? [
+                      {
+                        type: "tool-call" as const,
+                        toolCallId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
+                        toolName: tool.name,
+                        input: JSON.stringify(
+                          !spawned
+                            ? { model: "helper", prompt: "CHILD_TASK", name: "checker" }
+                            : { subagent_ids: ["subagent_1"] },
+                        ),
+                      },
+                    ]
+                  : [
+                      { type: "text-start" as const, id: "answer" },
+                      { type: "text-delta" as const, id: "answer", delta: "Delegation done." },
+                      { type: "text-end" as const, id: "answer" },
+                    ]),
+                {
+                  type: "finish",
+                  finishReason: { unified: tool ? "tool-calls" : "stop", raw: "scripted" },
+                  usage: {
+                    inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 5, text: 5, reasoning: 0 },
+                  },
+                },
+              ],
+            }),
+          };
+        },
+      }),
+    ),
+  }));
+}
+const harnesses = ["codex", "claude-code", "opencode"] as const;
+const parentExecution = (harness: (typeof harnesses)[number]): Execution => ({
+  sessionId: "sess_delegation",
+  turnId: "turn_parent",
+  generation: 1,
+  harness,
+  model: "primary",
+  agent: {
+    model: "primary",
+    multi_agent: { enabled: true, max_concurrent_subagents: 2 },
+    tools: [
+      {
+        type: "function",
+        name: "lookup",
+        description: "Look up a value",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+          additionalProperties: false,
+        },
+      },
+    ],
+  },
+  input: [{ role: "user", content: [{ type: "input_text", text: "Delegate the check." }] }],
+  checkpoint: null,
+  deadline: Date.now() + 50_000,
+  sandbox: false,
+  delegates: [{ alias: "helper", harness: "claude-code", model: "primary" }],
+  maxConcurrentSubagents: 2,
+});
+const post = (url: string, path: string, body: unknown) =>
+  fetch(url + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+it.each(harnesses)(
   "%s delegates to another runtime, routes the child's client tool result and waits for it",
   async (harness) => {
     const directory = await mkdtemp(join(tmpdir(), "cf-delegation-"));
     const diagnostics: string[] = [];
     const scripted = scriptedChildren();
     const delegate = await scripted.server;
-    const gateway = createModelGateway(() => ({
-      primary: aiSDKModel(
-        new MockLanguageModelV4({
-          doStream: async ({ prompt, tools }) => {
-            const history = JSON.stringify(prompt);
-            const definitions = tools?.filter((tool) => tool.type === "function") ?? [];
-            const find = (suffix: string) =>
-              definitions.find((tool) => tool.name === suffix || tool.name.endsWith(`_${suffix}`));
-            const spawned = history.includes("subagent_1");
-            const waited = history.includes("CHILD_ANSWER");
-            const tool = !spawned ? find("cf_delegate") : !waited ? find("cf_wait") : undefined;
-            if (!waited && !tool)
-              throw new Error(`Missing delegation tool: ${definitions.map((t) => t.name)}`);
-            return {
-              stream: simulateReadableStream({
-                chunks: [
-                  { type: "stream-start", warnings: [] },
-                  ...(tool
-                    ? [
-                        {
-                          type: "tool-call" as const,
-                          toolCallId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
-                          toolName: tool.name,
-                          input: JSON.stringify(
-                            !spawned
-                              ? { model: "helper", prompt: "CHILD_TASK", name: "checker" }
-                              : { subagent_ids: ["subagent_1"] },
-                          ),
-                        },
-                      ]
-                    : [
-                        { type: "text-start" as const, id: "answer" },
-                        { type: "text-delta" as const, id: "answer", delta: "Delegation done." },
-                        { type: "text-end" as const, id: "answer" },
-                      ]),
-                  {
-                    type: "finish",
-                    finishReason: { unified: tool ? "tool-calls" : "stop", raw: "scripted" },
-                    usage: {
-                      inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
-                      outputTokens: { total: 5, text: 5, reasoning: 0 },
-                    },
-                  },
-                ],
-              }),
-            };
-          },
-        }),
-      ),
-    }));
+    const gateway = scriptedGateway("wait");
     const model = await serveFetch((request) => gateway.fetch(request, {}));
     let supervisor: ReturnType<typeof createSupervisor>;
     const server = await serveFetch(async (request) => supervisor.app.fetch(request));
@@ -149,36 +194,7 @@ it.each(["codex", "claude-code", "opencode"])(
       delegateUrl: delegate.url,
       diagnostics: (line) => diagnostics.push(line),
     });
-    const execution: Execution = {
-      sessionId: "sess_delegation",
-      turnId: "turn_parent",
-      generation: 1,
-      harness,
-      model: "primary",
-      agent: {
-        model: "primary",
-        multi_agent: { enabled: true, max_concurrent_subagents: 2 },
-        tools: [
-          {
-            type: "function",
-            name: "lookup",
-            description: "Look up a value",
-            parameters: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-      input: [{ role: "user", content: [{ type: "input_text", text: "Delegate the check." }] }],
-      checkpoint: null,
-      deadline: Date.now() + 50_000,
-      sandbox: false,
-      delegates: [{ alias: "helper", harness: "claude-code", model: "primary" }],
-      maxConcurrentSubagents: 2,
-    };
+    const execution = parentExecution(harness);
     const events: RuntimeEvent[] = [];
     try {
       const response = await fetch(`${server.url}/jobs`, {
@@ -263,6 +279,78 @@ it.each(["codex", "claude-code", "opencode"])(
       expect(parentText).toMatchObject({ text: "Delegation done." });
       expect(events.indexOf(childText as RuntimeEvent)).toBeLessThan(
         events.indexOf(parentText as RuntimeEvent),
+      );
+    } finally {
+      await supervisor.stop();
+      await server.close();
+      await model.close();
+      await delegate.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+it.each(harnesses)(
+  "%s cancels a parent whose root finished while a delegated child is still running",
+  async (harness) => {
+    const directory = await mkdtemp(join(tmpdir(), "cf-delegation-cancel-"));
+    const diagnostics: string[] = [];
+    const scripted = scriptedChildren();
+    const delegate = await scripted.server;
+    const gateway = scriptedGateway("leave");
+    const model = await serveFetch((request) => gateway.fetch(request, {}));
+    let supervisor: ReturnType<typeof createSupervisor>;
+    const server = await serveFetch(async (request) => supervisor.app.fetch(request));
+    supervisor = createSupervisor({
+      binary: "codex",
+      opencodeBinary: resolve("node_modules/.bin/opencode"),
+      directory,
+      modelBaseUrl: `${model.url}/v1`,
+      sandboxUrl: "http://unused.invalid",
+      supervisorUrl: server.url,
+      delegateUrl: delegate.url,
+      diagnostics: (line) => diagnostics.push(line),
+    });
+    const execution = parentExecution(harness);
+    const events: RuntimeEvent[] = [];
+    const read = async () => {
+      const batch = (await (
+        await fetch(`${server.url}/jobs/${execution.turnId}?after=${events.length}`)
+      ).json()) as RuntimeBatch;
+      events.push(...batch.events.map(({ event }) => event));
+      return batch;
+    };
+    try {
+      const response = await post(server.url, "/jobs", { execution, operationId: "start" });
+      expect(response.ok, await response.text()).toBe(true);
+      // The root answers without waiting; the child keeps the turn open.
+      let status: RuntimeBatch["status"] = "running";
+      for (let attempt = 0; attempt < 600; attempt++) {
+        status = (await read()).status;
+        if (status === "failed") throw new Error(diagnostics.join("\n"));
+        if (events.some((event) => event.type === "text" && !event.subagentId)) break;
+        await delay(50);
+      }
+      expect(events.some((event) => event.type === "text" && !event.subagentId)).toBe(true);
+      await delay(200);
+      expect((await read()).status, diagnostics.join("\n")).toBe("running");
+      const cancel = await post(server.url, `/jobs/${execution.turnId}/control`, {
+        operationId: "cancel",
+        command: { type: "cancel" },
+      });
+      expect(cancel.status, await cancel.text()).toBe(204);
+      for (let attempt = 0; attempt < 200 && status === "running"; attempt++) {
+        status = (await read()).status;
+        await delay(25);
+      }
+      // A cancelled turn is never sealed as completed, and the child's end is recorded.
+      expect(status, diagnostics.join("\n")).toBe("cancelled");
+      expect(scripted.controls.map(({ command }) => command.type)).toEqual(["cancel"]);
+      expect(
+        events.some((event) => event.type === "subagent_turn" && event.status === "cancelled"),
+      ).toBe(true);
+      expect(events.some((event) => event.type === "subagent" && event.status === "closed")).toBe(
+        true,
       );
     } finally {
       await supervisor.stop();

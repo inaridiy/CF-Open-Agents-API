@@ -39,6 +39,20 @@ export interface DelegationOptions {
   settled?: () => void;
   diagnostics: (line: string) => void;
   pollIntervalMs?: number;
+  /** Bounds for HarnessDO round trips; a stalled route must not hold the parent's lifecycle. */
+  timeouts?: { requestMs?: number; cancelMs?: number; settleMs?: number };
+}
+const DEFAULT_TIMEOUTS = { requestMs: 30_000, cancelMs: 10_000, settleMs: 5_000 };
+/** Resolve when `promise` settles or after `ms`; the timer never outlives the race. */
+async function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  const timer = new AbortController();
+  return Promise.race([
+    promise.then(
+      () => true,
+      () => true,
+    ),
+    delay(ms, false, { signal: timer.signal }).catch(() => false),
+  ]).finally(() => timer.abort());
 }
 const spawnSchema = z.strictObject({
   model: z.string().min(1),
@@ -127,12 +141,19 @@ export class Delegations {
     if (name === "cf_close") return this.close(args);
     throw new Error("Unknown delegation tool");
   }
-  private async request(path: string, body?: unknown): Promise<Response> {
+  private get timeouts() {
+    return { ...DEFAULT_TIMEOUTS, ...this.options.timeouts };
+  }
+  private async request(
+    path: string,
+    body?: unknown,
+    timeoutMs = this.timeouts.requestMs,
+  ): Promise<Response> {
     const response = await fetch(`${this.options.endpoint.replace(/\/$/, "")}/${path}`, {
       method: body === undefined ? "GET" : "POST",
       headers: body === undefined ? {} : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: this.options.signal,
+      signal: AbortSignal.any([this.options.signal, AbortSignal.timeout(timeoutMs)]),
     });
     if (!response.ok)
       throw new Error(`Delegation request failed (${response.status}): ${await response.text()}`);
@@ -226,7 +247,10 @@ export class Delegations {
       completedAt: null,
     });
     this.collaboration("spawnAgent", [child.subagentId], input.prompt, input.model, true);
-    void this.follow(child);
+    // The relay owns its own failures; nothing here may become an unhandled rejection.
+    this.follow(child).catch((error) => {
+      this.options.diagnostics(`delegate relay crashed: ${String(error)}`);
+    });
     return text({ subagent_id: child.subagentId, turn_id: child.turnId, status: "in_progress" });
   }
   /** Relay the child's runtime events until it stops; the relay owns the child's terminal state. */
@@ -293,7 +317,9 @@ export class Delegations {
       startedAt: child.openedAt,
       completedAt: Math.floor(Date.now() / 1000),
     });
-    if (status === "completed" || child.closed) this.closeRecord(child);
+    // Delegated children are single-turn: any terminal outcome closes the subagent,
+    // and the record is published before anyone can seal the parent's outcome.
+    this.closeRecord(child);
     child.finish();
     // Late workspace effects from abandoned code cannot be contained inside a shared sandbox.
     if (error === "programmatic_execution_uncertain") this.options.fail(error);
@@ -333,12 +359,7 @@ export class Delegations {
     const children = selected.filter((child): child is Child => !!child);
     const budget = Math.max(1, this.execution.deadline - Date.now() - 1_000);
     const timeout = Math.min(parsed.data.timeout_ms ?? budget, budget);
-    const timer = new AbortController();
-    const finished = await Promise.race([
-      Promise.all(children.map((child) => child.settled)).then(() => true),
-      delay(timeout, false, { signal: timer.signal }).catch(() => false),
-    ]);
-    timer.abort();
+    const finished = await within(Promise.all(children.map((child) => child.settled)), timeout);
     this.collaboration(
       "wait",
       children.map((child) => child.subagentId),
@@ -363,14 +384,15 @@ export class Delegations {
   private async cancel(child: Child): Promise<void> {
     if (child.status !== "in_progress") return;
     try {
-      await this.request(`${this.execution.turnId}/${child.subagentId}/control`, {
-        operationId: `${child.turnId}:cancel`,
-        command: { type: "cancel" } satisfies RuntimeCommand,
-      });
+      await this.request(
+        `${this.execution.turnId}/${child.subagentId}/control`,
+        { operationId: `${child.turnId}:cancel`, command: { type: "cancel" } },
+        this.timeouts.cancelMs,
+      );
     } catch (error) {
       this.options.diagnostics(`delegate cancel failed: ${String(error)}`);
     }
-    await Promise.race([child.settled, delay(30_000)]);
+    await within(child.settled, this.timeouts.requestMs);
   }
   /** Route a client function result to the child that raised the call. */
   async routeToolResult(
@@ -394,21 +416,22 @@ export class Delegations {
    * relay to observe it, then record the children as cancelled. The owning
    * HarnessDO stops child Containers regardless of what this relay observed.
    */
-  async cancelAll(waitMs = 5_000): Promise<void> {
+  async cancelAll(waitMs = this.timeouts.settleMs): Promise<void> {
     const active = [...this.children.values()].filter((child) => child.status === "in_progress");
     await Promise.all(
       active.map(async (child) => {
         try {
-          await this.request(`${this.execution.turnId}/${child.subagentId}/control`, {
-            operationId: `${child.turnId}:cancel`,
-            command: { type: "cancel" } satisfies RuntimeCommand,
-          });
+          await this.request(
+            `${this.execution.turnId}/${child.subagentId}/control`,
+            { operationId: `${child.turnId}:cancel`, command: { type: "cancel" } },
+            this.timeouts.cancelMs,
+          );
         } catch (error) {
           this.options.diagnostics(`delegate cancel failed: ${String(error)}`);
         }
       }),
     );
-    await Promise.race([Promise.all(active.map((child) => child.settled)), delay(waitMs)]);
+    await within(Promise.all(active.map((child) => child.settled)), waitMs);
     for (const child of active) this.terminate(child, "cancelled", null);
     for (const child of this.children.values()) this.closeRecord(child);
   }

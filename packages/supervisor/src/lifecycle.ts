@@ -2,12 +2,20 @@ import {
   ApiError,
   canonicalJSON,
   io,
+  OperationError,
   type RuntimeBatch,
   type RuntimeEvent,
   runSync,
   type ServiceError,
 } from "cf-open-agents-api";
-import { Chunk, Effect, Ref, SynchronizedRef } from "effect";
+import { Cause, Chunk, Effect, Ref, SynchronizedRef } from "effect";
+
+/** Native failure detail for diagnostics; the public batch error stays a stable code. */
+export function describeFailure(value: unknown): string {
+  const squashed = Cause.isCause(value) ? Cause.squash(value) : value;
+  const reason = squashed instanceof OperationError ? squashed.cause : squashed;
+  return reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+}
 
 type Outcome =
   | { readonly status: "running" | "waiting" }
@@ -15,16 +23,22 @@ type Outcome =
   | { readonly status: "failed"; readonly error: string };
 interface JobState {
   readonly outcome: Outcome;
+  /** Cancellation was requested: completion can no longer seal the job, events still flow. */
+  readonly cancelling: boolean;
+  /** The log is sealed: no further events or transitions. */
   readonly closing: boolean;
   readonly events: Chunk.Chunk<RuntimeBatch["events"][number]>;
   readonly bytes: number;
 }
 const terminal = (outcome: Outcome) => outcome.status !== "running" && outcome.status !== "waiting";
+/** Retained native events per execution, including streamed deltas and completed items. */
+export const EVENT_LOG_LIMIT = 8_000_000;
 
 /** All native callbacks share one atomic, immutable state. Terminal outcomes are absorbing. */
 export class JobLifecycle {
   private readonly state = Ref.unsafeMake<JobState>({
     outcome: { status: "running" },
+    cancelling: false,
     closing: false,
     events: Chunk.empty(),
     bytes: 0,
@@ -38,8 +52,23 @@ export class JobLifecycle {
   }
   setStatus(status: "running" | "waiting" | "completed" | "cancelled"): void {
     runSync(
+      Ref.update(this.state, (state) => {
+        if (terminal(state.outcome) || state.closing) return state;
+        // Once cancellation is requested, a task that finishes because its children
+        // were cancelled reads as cancelled, and progress transitions are ignored.
+        if (state.cancelling)
+          return status === "completed" || status === "cancelled"
+            ? { ...state, outcome: { status: "cancelled" as const } }
+            : state;
+        return { ...state, outcome: { status } };
+      }),
+    );
+  }
+  /** Completion can no longer seal the job; events are recorded until `close()`. */
+  requestCancel(): void {
+    runSync(
       Ref.update(this.state, (state) =>
-        terminal(state.outcome) || state.closing ? state : { ...state, outcome: { status } },
+        terminal(state.outcome) || state.closing ? state : { ...state, cancelling: true },
       ),
     );
   }
@@ -61,17 +90,29 @@ export class JobLifecycle {
       })),
     );
   }
-  emit(event: RuntimeEvent): void {
-    runSync(
-      Ref.update(this.state, (state) => {
-        if (terminal(state.outcome) || state.closing) return state;
+  /**
+   * Append an event. Returns false when the event was not retained: the job is
+   * terminal or closing, or the retained log would exceed its limit. Exceeding the
+   * limit fails the job with `native_output_limit`; callers stop the runtime.
+   */
+  emit(event: RuntimeEvent): boolean {
+    return runSync(
+      Ref.modify(this.state, (state) => {
+        if (terminal(state.outcome) || state.closing) return [false, state] as const;
         const bytes = state.bytes + new TextEncoder().encode(JSON.stringify(event)).byteLength;
-        if (bytes > 8_000_000) throw new Error("Native event buffer exceeds its limit");
-        return {
-          ...state,
-          bytes,
-          events: Chunk.append(state.events, { seq: state.events.length + 1, event }),
-        };
+        if (bytes > EVENT_LOG_LIMIT)
+          return [
+            false,
+            { ...state, outcome: { status: "failed" as const, error: "native_output_limit" } },
+          ] as const;
+        return [
+          true,
+          {
+            ...state,
+            bytes,
+            events: Chunk.append(state.events, { seq: state.events.length + 1, event }),
+          },
+        ] as const;
       }),
     );
   }
