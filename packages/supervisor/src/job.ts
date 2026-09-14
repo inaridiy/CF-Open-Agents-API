@@ -39,6 +39,12 @@ type ToolResult = {
   isError: boolean;
 };
 
+/** Attribution of events raised on behalf of a native subagent. */
+export interface ToolScope {
+  subagentId: string;
+  turnId: string;
+}
+
 export interface NativeJob {
   readonly execution: Execution;
   readonly status: RuntimeBatch["status"];
@@ -80,6 +86,9 @@ export abstract class ToolJob implements NativeJob {
   protected get closing() {
     return this.lifecycle.closing;
   }
+  protected get cancelling() {
+    return this.lifecycle.cancelling;
+  }
   protected sessionId = "";
   protected readonly abort = new AbortController();
   private readonly scope = runSync(Scope.make());
@@ -105,6 +114,10 @@ export abstract class ToolJob implements NativeJob {
     // A task that finishes meanwhile reads as cancelled, never completed.
     this.lifecycle.requestCancel();
     await this.delegations.cancelAll();
+    // A runtime that can stop gracefully reports its final usage before the log seals.
+    await this.interruptRuntime().catch((error) =>
+      this.options.diagnostics(`interrupt failed: ${describeFailure(error)}`),
+    );
     this.lifecycle.close();
     this.abort.abort();
     const pending = runSync(Ref.getAndSet(this.pending, new Map()));
@@ -150,6 +163,14 @@ export abstract class ToolJob implements NativeJob {
   }
   protected abstract open(bundle?: unknown): Promise<void>;
   protected abstract closeRuntime(): Promise<void>;
+  /**
+   * Ask the native runtime to end the current turn gracefully before the job is
+   * closed; runtimes that can report usage for an interrupted turn override this.
+   * Bounded by the implementation; the default returns immediately.
+   */
+  protected interruptRuntime(): Promise<void> {
+    return Promise.resolve();
+  }
   /**
    * Deliver input to the running native turn. Runtimes that can queue or inject
    * messages override this; the default rejects, which the HarnessDO reports as
@@ -201,15 +222,21 @@ export abstract class ToolJob implements NativeJob {
   async workspace(
     name: WorkspaceToolName,
     args: unknown,
+    scope?: ToolScope,
   ): Promise<{ text: string; exitCode: number | null }> {
     if (!this.execution.sandbox || this.closing || this.abort.signal.aborted)
       throw new Error("No active sandbox assignment");
     return executeWorkspace(this.options.sandboxUrl, name, args, this.abort.signal, (event) =>
-      this.emit(event),
+      this.emit(scope ? { ...event, ...scope } : event),
     );
   }
 
-  protected externalTool(name: string, args: unknown, invocation?: string): Promise<ToolResult> {
+  protected externalTool(
+    name: string,
+    args: unknown,
+    invocation?: string,
+    scope?: ToolScope,
+  ): Promise<ToolResult> {
     return runPromise(
       Effect.gen(this, function* () {
         if (this.closing || this.abort.signal.aborted)
@@ -224,6 +251,7 @@ export abstract class ToolJob implements NativeJob {
           callId,
           name,
           arguments: z.json().parse(args),
+          ...scope,
         });
         this.lifecycle.setStatus("waiting");
         return yield* Deferred.await(result);
@@ -345,7 +373,14 @@ export abstract class ToolJob implements NativeJob {
         : []),
     ];
   }
-  protected async callTool(name: string, args: unknown) {
+  /**
+   * Route a native tool call. `scope` attributes the resulting events to a native
+   * subagent; subagents cannot delegate or run code, which would nest execution
+   * authority the Worker does not track.
+   */
+  protected async callTool(name: string, args: unknown, scope?: ToolScope) {
+    if (scope && (name === programmaticTool.name || DELEGATION_TOOLS.has(name)))
+      throw new Error("This tool is not available to subagents");
     if (name === programmaticTool.name && codeEnabled(this.execution))
       return this.executeCode(args);
     if (DELEGATION_TOOLS.has(name) && this.delegations.enabled)
@@ -371,21 +406,31 @@ export abstract class ToolJob implements NativeJob {
       );
       if (tool?.type !== "function" || !this.discovered.has(tool.name))
         throw new Error("Discover the deferred tool before calling it");
-      return this.externalTool(tool.name, z.fromJSONSchema(tool.parameters).parse(input.arguments));
+      return this.externalTool(
+        tool.name,
+        z.fromJSONSchema(tool.parameters).parse(input.arguments),
+        undefined,
+        scope,
+      );
     }
     if (Object.hasOwn(workspaceTools, name)) {
-      const result = await this.workspace(name as WorkspaceToolName, args);
+      const result = await this.workspace(name as WorkspaceToolName, args, scope);
       return {
         content: [{ type: "text" as const, text: result.text }],
         isError: result.exitCode !== null && result.exitCode !== 0,
       };
     }
     if (this.remoteTools.tools.some((tool) => tool.definition.name === name))
-      return CallToolResultSchema.parse(await this.remoteTools.call(name, args));
+      return CallToolResultSchema.parse(await this.remoteTools.call(name, args, scope));
     const index = /^function_(\d+)$/.exec(name)?.[1];
     const tool = index === undefined ? undefined : this.execution.agent.tools?.[Number(index)];
     if (tool?.type !== "function" || tool.defer_loading) throw new Error("Unknown function tool");
-    return this.externalTool(tool.name, z.fromJSONSchema(tool.parameters).parse(args));
+    return this.externalTool(
+      tool.name,
+      z.fromJSONSchema(tool.parameters).parse(args),
+      undefined,
+      scope,
+    );
   }
   async mcp(request: Request): Promise<Response> {
     const server = new Server(
@@ -470,8 +515,15 @@ export abstract class ToolJob implements NativeJob {
       if (child) {
         // The result belongs to a delegated child's function call.
         if (this.closing) return yield* rejected("Execution has stopped");
+        // A child the HarnessDO already closed can never take the result.
         yield* io("native.delegate", () =>
           this.delegations.routeToolResult(child, operationId, command),
+        ).pipe(
+          Effect.mapError((error) =>
+            error instanceof OperationError && error.cause instanceof ApiError
+              ? error.cause
+              : error,
+          ),
         );
         return;
       }
