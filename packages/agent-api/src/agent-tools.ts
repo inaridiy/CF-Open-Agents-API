@@ -1,6 +1,7 @@
 import { z } from "zod";
 
-const toolName = z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/);
+/** The Responses/Agents API charset: letters, digits, underscores and hyphens, up to 64. */
+const toolName = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 export const functionToolSchema = z.strictObject({
   type: z.literal("function"),
   name: toolName,

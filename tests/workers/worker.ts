@@ -1,6 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
+import { Effect } from "effect";
+import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/environments";
 import ExampleCallerWorker from "../../examples/caller/src/index.js";
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
+import type { EnvironmentDriver } from "../../packages/agent-api/src/environments.js";
+import { ApiError } from "../../packages/agent-api/src/protocol.js";
 import type {
   Execution,
   RuntimeBatch,
@@ -206,12 +210,34 @@ function fixture(env: TestEnv, name = "fixture"): RuntimeDriver {
     },
   });
 }
+/** Scripted environment driver: setup is a no-op and the status is read from R2 so tests can flip it. */
+function scriptedEnvironments(env: TestEnv): EnvironmentDriver {
+  const unavailable = () =>
+    Effect.fail(
+      new ApiError(503, "environment_unavailable", "Scripted environments hold no files"),
+    );
+  return {
+    prepare: () => Effect.void,
+    status: (spec) =>
+      Effect.promise(async () => {
+        const stored = await env.ASSETS.get(`environment-status/${spec.sessionId}`);
+        return ((await stored?.text()) ?? "connected") as EnvironmentInfo["status"];
+      }),
+    upload: unavailable,
+    files: unavailable,
+  };
+}
 const service = createAgentService<TestEnv>({
   objects: (env) => env.ASSETS,
+  environments: scriptedEnvironments,
   agents: {
     test: { harness: "fixture", model: "fixture-model" },
     "test-images": { harness: "fixture-images", model: "fixture-model" },
     "test-tools": { harness: "fixture-tools", model: "fixture-model" },
+    // Hosted web search needs the harness flag and the alias's model connection.
+    "test-search": { harness: "fixture-search", model: "fixture-model", webSearch: true },
+    "test-search-unflagged": { harness: "fixture-search", model: "fixture-model" },
+    "test-hosted": { harness: "fixture-hosted", model: "fixture-model" },
     // Cross-runtime delegation is deployment configuration, not a runtime capability.
     "test-lead": { harness: "fixture", model: "fixture-model", delegates: ["test-tools"] },
     "test-misconfigured": { harness: "fixture", model: "fixture-model", delegates: ["absent"] },
@@ -230,6 +256,14 @@ const service = createAgentService<TestEnv>({
         toolSearch: true,
         toolsFixedAtStart: true,
       },
+    },
+    "fixture-search": {
+      ...fixture(env, "fixture-search"),
+      capabilities: { ...fixture(env).capabilities, webSearch: true },
+    },
+    "fixture-hosted": {
+      ...fixture(env, "fixture-hosted"),
+      capabilities: { ...fixture(env).capabilities, sandbox: true },
     },
   }),
   authenticate: async (request) =>

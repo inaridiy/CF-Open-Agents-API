@@ -74,8 +74,9 @@ export class CatalogObject extends DurableObject {
   deleteFile(id: string): void {
     this.db.remove("input_file", id);
   }
-  files(query: PageQuery) {
+  files(query: PageQuery, purpose?: string) {
     const page = this.db.list<StoredInputFile>("input_file", query, {
+      ...(purpose ? { field: "resource.purpose" as const, value: purpose } : {}),
       expiresAfter: Date.now() / 1000,
     });
     return { ...page, data: page.data.map(({ resource }) => resource) };

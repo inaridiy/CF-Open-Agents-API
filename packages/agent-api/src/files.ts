@@ -5,6 +5,15 @@ import { attempt, io } from "./effect.js";
 import { ApiError, identifier, parse } from "./protocol.js";
 
 export const INPUT_FILE_LIMIT = 50 * 1024 * 1024;
+/** `FilePurpose` of openai@7.15.0; every value is accepted and stored as opaque metadata. */
+export const FILE_PURPOSES = [
+  "assistants",
+  "batch",
+  "fine-tune",
+  "vision",
+  "user_data",
+  "evals",
+] as const;
 export interface StoredInputFile {
   version: 1;
   key: string;
@@ -22,7 +31,7 @@ export function uploadInputFile(bucket: R2Bucket, form: FormData) {
     if (!(file instanceof File))
       return yield* new ApiError(400, "invalid_file", "Expected a multipart file");
     const purpose = yield* attempt("file.purpose", () =>
-      parse(z.literal("user_data"), form.get("purpose")),
+      parse(z.enum(FILE_PURPOSES), form.get("purpose")),
     );
     if (file.size > INPUT_FILE_LIMIT)
       return yield* new ApiError(413, "file_too_large", "Environment input files exceed 50 MiB");
@@ -48,7 +57,8 @@ export function uploadInputFile(bucket: R2Bucket, form: FormData) {
         bytes: file.size,
         created_at,
         filename: file.name,
-        purpose,
+        // `evals` is a valid upload purpose the SDK's FileObject type does not list yet.
+        purpose: purpose as FileObject["purpose"],
         status: "processed",
         ...(lifetime ? { expires_at: created_at + lifetime } : {}),
       },

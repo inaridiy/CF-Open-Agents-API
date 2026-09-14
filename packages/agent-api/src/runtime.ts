@@ -342,6 +342,12 @@ export interface AgentRegistration {
    * Children run on their own harness and share the parent's execution environment.
    */
   delegates?: string[];
+  /**
+   * The alias's model connection performs hosted web search (a native Responses or
+   * Anthropic passthrough). `web_search` tools are accepted only when both the
+   * harness and the alias support it; the portable AI SDK path cannot.
+   */
+  webSearch?: boolean;
 }
 
 export interface ServiceOptions<Env> {
