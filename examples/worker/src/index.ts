@@ -24,7 +24,13 @@ const service = createAgentService<Bindings>({
   agents: {
     // `delegates` lists the presets a session may start subagents on when
     // multi_agent is enabled; children share the parent's sandbox.
-    coding: { harness: "codex", model: "codex", delegates: ["claude", "opencode"] },
+    // `webSearch` declares that the alias's model connection provides hosted web search.
+    coding: {
+      harness: "codex",
+      model: "codex",
+      delegates: ["claude", "opencode"],
+      webSearch: true,
+    },
     claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
     opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
     workers: { harness: "codex", model: "workers" },

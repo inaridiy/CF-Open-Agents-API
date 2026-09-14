@@ -19,7 +19,7 @@ interface Bindings extends AgentBindings, ContainerBindings {}
 const service = createAgentService<Bindings>({
   agents: {
     codex: { harness: "codex", model: "fixture", delegates: ["claude-code"] },
-    "codex-search": { harness: "codex", model: "search-fixture" },
+    "codex-search": { harness: "codex", model: "search-fixture", webSearch: true },
     "claude-code": { harness: "claude-code", model: "fixture", delegates: ["opencode"] },
     opencode: { harness: "opencode", model: "fixture", delegates: ["codex"] },
   },
