@@ -1,6 +1,6 @@
 {
   "name": "cf-open-agents-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Unofficial, independent implementation of the OpenAI Agents API on Cloudflare Workers, Durable Objects and Containers, running Codex, Claude Code or OpenCode against models you configure",
   "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
   "bugs": {

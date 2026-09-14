@@ -1,11 +1,10 @@
 # Library API
 
-`cf-open-agents-api` implements the OpenAI Agents API using configurable native runtimes and model connections.
-Use the official SDK over a [Service Binding](service-binding.md) or [HTTP](http-api.md), or call the [typed RPC surface](rpc.md).
+`cf-open-agents-api` implements the OpenAI Agents API with configurable native runtimes and model connections. Use the official SDK over a [Service Binding](service-binding.md) or [HTTP](http-api.md), or call the [typed RPC surface](rpc.md). Running any harness needs the Docker images in the repository's `docker/` directory; the library alone gives you the API and the drivers, not the runtimes.
 
 ## Install from source
 
-While distribution remains private, use the workspace examples or build a local package:
+The package is not on npm yet. Use the workspace examples, or build a local tarball:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -13,41 +12,38 @@ pnpm build
 pnpm --filter cf-open-agents-api pack --pack-destination /tmp/cf-open-agents-package
 ```
 
-Install the resulting tarball in your consuming project with `pnpm add /absolute/path/to/the.tgz`.
-Install the declared peers: `effect@3.22.2`, `openai@7.15.0`, and `ai@7.0.97` when using the model entry point.
-The repository example uses `workspace:*`; it does not require an npm publication.
+Install the tarball in your project with `pnpm add /absolute/path/to/the.tgz`, together with the peers `effect@3.22.2`, `openai@7.15.0` and, for the model entrypoint, `ai@7.0.97`. The repository example uses `workspace:*`.
 
 ## Entry points
 
-| Import                          | Exports                                                                                                    |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `cf-open-agents-api`            | Wire schemas/types, `ApiError`, `remoteApiError`, runtime contracts, Effect boundary helpers               |
-| `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, DO/Container classes and drivers |
-| `cf-open-agents-api/models`     | `aiSDKModel`, `nativeModel`, `openAICompatibleModel`, `createModelGateway`                                 |
-| `cf-open-agents-api/tools`      | Function tool contracts, search presets, immutable asset/skill helpers                                     |
+| Import                          | Exports                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cf-open-agents-api`            | Wire schemas and types, `ApiError`, `remoteApiError`, `parse`, `HARNESSES`, runtime schemas and `RuntimeDriver`, `fromPromiseDriver`, workspace tool contracts, `io`, `attempt`, `decode`, `decodeEffect`, `runPromise`, `runSync`                                                                                                                                   |
+| `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, `bearerTenant`, `CatalogObject`, `SessionObject`, `HarnessContainer`, `SandboxContainer`, `ContainerProxy`, `createHarness`, `containerHarnesses`, `codexDriver`, `claudeCodeDriver`, `openCodeDriver`, `containerDriver`, `containerEnvironments`, `EnvironmentDriver`, `EnvironmentSpec` |
+| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `modelAdapter`, `createModelGateway`, `sanitizeProviderError`, `fetchWithoutRedirect`                                                                                                                                                                                                                          |
+| `cf-open-agents-api/tools`      | `defineTool`, `webSearch`, `knowledgeSearch`, `publishSkill`, `loadSkill`, `skillReader`, `installSkill`                                                                                                                                                                                                                                                             |
 
-See [the composition root](../examples/worker/src/index.ts) for a complete deployment.
-`createAgentService(options)` returns `AgentWorker` and `SessionDO` classes configured together.
-Subclass/export both, and bind the tenant catalog, harness, Sandbox, and R2 resources in Wrangler.
+The root import has no Cloudflare runtime dependency, so its types and schemas can be used from Node.
 
-| Factory option               | Purpose                                                         |
-| ---------------------------- | --------------------------------------------------------------- |
-| `agents`                     | Public model aliases mapped to `{ harness, model, delegates? }` |
-| `harnesses(env)`             | Execution drivers, usually `containerHarnesses`                 |
-| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null`                |
-| `objects(env)`               | R2 bucket used for configuration and artifact content           |
-| `environments(env)`          | Hosted environment driver, usually `containerEnvironments`      |
-| `maxTurnMs`                  | Turn deadline; default 15 minutes                               |
-| `pollIntervalMs`             | Durable reconciliation interval; default one second             |
+## Composition
 
-`openai_hosted` is the upstream wire name for this deployment's Cloudflare Sandbox.
-Provider keys belong in `createModelGateway`'s Worker, not in client configuration or native runtime snapshots.
-[Extending the service](extending.md) describes model capabilities, custom drivers and tools.
+See [the example composition](../examples/worker/src/index.ts). `createAgentService(options)` returns `AgentWorker` and `SessionDO` classes configured together. Subclass and export both, export `CatalogObject`, `HarnessContainer`, `SandboxContainer` and `ContainerProxy` under the class names your Wrangler configuration binds, and export a `WorkerEntrypoint` that delegates to `createModelGateway(...).fetch`.
+
+| Factory option               | Purpose                                                                                                          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `agents`                     | Presets: public model names mapped to `{ harness, model, delegates?, webSearch? }`                               |
+| `harnesses(env)`             | Runtime drivers by name, usually `containerHarnesses`                                                            |
+| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null`; `bearerTenant` is the single-tenant example                    |
+| `objects(env)`               | R2 bucket for environment configuration, input files, skills and artifacts (the example's `CHECKPOINTS`)         |
+| `environments(env)`          | Hosted environment driver, usually `containerEnvironments`; without it `openai_hosted` configuration is rejected |
+| `maxTurnMs`                  | Turn deadline; default 15 minutes                                                                                |
+| `pollIntervalMs`             | Reconciler alarm interval; default one second                                                                    |
+
+`openai_hosted` is the SDK's wire name for this deployment's Cloudflare sandbox. Provider keys belong in the gateway Worker, not in client configuration or native runtime snapshots. [Extending the service](extending.md) describes presets, model adapters, custom drivers and tools.
 
 ## Session RPC methods
 
-Every method takes a trusted `tenant` first.
-Types come from the package's exported schemas; `PageQuery` accepts `after`, `limit`, and `order`.
+Every method takes a trusted `tenant` first. Types come from the exported schemas; `PageQuery` accepts `after`, `limit` and `order`.
 
 | Method                                       | Result                                                                                    |
 | -------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -61,23 +57,10 @@ Types come from the package's exported schemas; `PageQuery` accepts `after`, `li
 | `retrieveTurn(tenant, id, turnId)`           | `Turn`                                                                                    |
 | `deleteSession(tenant, id)`                  | `{ id, object: "agent.session.deleted", deleted: true }`                                  |
 
-All results are promises. Defaults and validation match the corresponding HTTP operations.
-For streaming and other official resources, use `AGENTS.fetch` through the OpenAI client.
-The package's root import has no Cloudflare runtime import, so types/schemas can also be consumed from Node.
+All results are promises. Defaults and validation match the HTTP operations. Streaming and the other official resources go through `AGENTS.fetch` with the OpenAI client.
 
 ## Effect extension contracts
 
-`RuntimeDriver` and `EnvironmentDriver` methods return `Effect<A, ServiceError>`.
-`containerEnvironments(env)` adapts the Container RPC boundary to that contract.
-A custom environment driver implements `prepare`, `status`, `upload` and `files`;
-`EnvironmentSpec` identifies the session and its private configuration object.
-The environment listing uses the official SDK's `page`/`next` token contract.
+`RuntimeDriver` and `EnvironmentDriver` methods return `Effect<A, ServiceError>`, where `ServiceError` is `ApiError | OperationError`. `containerEnvironments(env)` adapts the Container RPC boundary to that contract. A custom environment driver implements `prepare`, `status`, `upload` and `files`; `EnvironmentSpec` identifies the session and its private configuration object, and `prepare` receives `inherited` when a fork adopts another session's committed workspace. The environment listing uses the SDK's `page`/`next` token contract.
 
-`prepare` receives `inherited` when a fork adopts another session's committed
-workspace; the Container driver copies the source's base backup and capability
-roots after applying the network policy to the new sandbox.
-Compose typed failures, interruption and resource release inside the driver.
-Use `io` for SDK/HTTP/RPC promises and `attempt` for synchronous validation or storage.
-Run the resulting Effect at a platform boundary with `runPromise`.
-SQLite transaction callbacks remain synchronous and cannot return Effects.
-The [Effect architecture](effect.md) describes lifecycle gates, finalizers and recovery.
+Use `io(name, (signal) => promise)` for SDK, HTTP and RPC calls and `attempt(name, () => value)` for synchronous validation or storage. Run an Effect only at a platform boundary with `runPromise`. SQLite transaction callbacks stay synchronous and cannot return Effects. The [house rules](effect.md) apply.
