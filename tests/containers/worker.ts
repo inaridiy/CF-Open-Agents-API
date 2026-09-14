@@ -80,7 +80,12 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
     const definitions = tools?.filter((tool) => tool.type === "function") ?? [];
     if (request.includes("programmatic-proof")) {
       const abandoned = request.includes("programmatic-proof-abandoned");
-      const received = JSON.stringify(toolResults).includes("CODE_TOOL_PROOF");
+      // The code also proves the sandbox of the previous completed turn was reused: the
+      // marker it wrote outside /workspace is still there.
+      const received =
+        JSON.stringify(toolResults).includes("CODE_TOOL_PROOF") &&
+        (request.includes("programmatic-proof-cancel") ||
+          JSON.stringify(toolResults).includes("T2_KEPT"));
       const codeTool = definitions.find(
         (tool) =>
           tool.name === "cf_execute" ||
@@ -112,7 +117,7 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
                     input: JSON.stringify({
                       code: abandoned
                         ? "void tools.bash({command: 'sleep 3; touch /workspace/abandoned-proof', timeout: 10000}); void tools.write({file_path: '/workspace/abandoned-queued-proof', content: 'must never write'}); await new Promise(resolve => setTimeout(resolve, 100)); return 'unawaited';"
-                        : "return await Promise.all([tools.lookup({query:'first'}), tools.lookup({query:'second'})]);",
+                        : "const kept = await tools.bash({command: 'test -f /tmp/cf-smoke-t2.txt && printf T2_KEPT', timeout: 10000}); return [...await Promise.all([tools.lookup({query:'first'}), tools.lookup({query:'second'})]), kept.content[0].text];",
                     }),
                   },
                 ]),
@@ -218,6 +223,15 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
         throw new Error("Child file is missing from the shared workspace");
       return once(shell("cat /workspace/child.txt"), "Child file present.");
     }
+    // After a cancelled turn the sandbox is restored from the last checkpoint: /workspace
+    // is back, state outside it (the T2 marker) is gone.
+    if (request.includes("verify-home-reset"))
+      return once(
+        shell(
+          "test ! -e /tmp/cf-smoke-t2.txt && test -f /workspace/proof.txt && printf HOME_RESET",
+        ),
+        "Home reset verified.",
+      );
     // Codex discovers capabilities natively; Claude Code and OpenCode receive
     // discovered skill metadata through their instructions.
     if (!history.includes("INLINE_PLUGIN_CATALOG_PROOF"))
@@ -238,9 +252,11 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
           {
             name: codex.name,
             input: {
+              // Turn 1 sees the setup marker outside /workspace (provisioned sandbox reused);
+              // the restored turn 2 must not, and leaves its own marker for turn 3.
               cmd: restored
-                ? "test -f /workspace/uploaded.txt && cat /workspace/proof.txt"
-                : 'test -f /workspace/.agents/skills/smoke/SKILL.md && test -f /workspace/setup.txt && test "$EXAMPLE_SETTING" = configured && printf sandbox-only > /workspace/proof.txt && mkdir -p /workspace/outputs && cp /workspace/proof.txt /workspace/outputs/proof.txt && cat /workspace/proof.txt',
+                ? "test ! -e /tmp/cf-smoke-home.txt && printf T2 > /tmp/cf-smoke-t2.txt && test -f /workspace/uploaded.txt && cat /workspace/proof.txt"
+                : 'test -f /tmp/cf-smoke-home.txt && test -f /workspace/.agents/skills/smoke/SKILL.md && test -f /workspace/setup.txt && test "$EXAMPLE_SETTING" = configured && printf sandbox-only > /workspace/proof.txt && mkdir -p /workspace/outputs && cp /workspace/proof.txt /workspace/outputs/proof.txt && cat /workspace/proof.txt',
               workdir: "/workspace",
               max_output_tokens: 100,
             },
@@ -251,7 +267,8 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
             {
               name: external("bash")?.name,
               input: {
-                command: "cat /workspace/proof.txt",
+                command:
+                  "test ! -e /tmp/cf-smoke-home.txt && printf T2 > /tmp/cf-smoke-t2.txt && cat /workspace/proof.txt",
                 description: "Read the restored proof",
               },
             },
@@ -264,7 +281,7 @@ async function scripted({ prompt, tools }: StreamOptions): Promise<StreamResult>
               name: external("bash")?.name,
               input: {
                 command:
-                  'test -f /workspace/.agents/skills/smoke/SKILL.md && test -f /workspace/setup.txt && test "$EXAMPLE_SETTING" = configured && mkdir -p /workspace/outputs && cp /workspace/proof.txt /workspace/outputs/proof.txt && cat /workspace/proof.txt',
+                  'test -f /tmp/cf-smoke-home.txt && test -f /workspace/.agents/skills/smoke/SKILL.md && test -f /workspace/setup.txt && test "$EXAMPLE_SETTING" = configured && mkdir -p /workspace/outputs && cp /workspace/proof.txt /workspace/outputs/proof.txt && cat /workspace/proof.txt',
                 description: "Verify the separate workspace",
               },
             },

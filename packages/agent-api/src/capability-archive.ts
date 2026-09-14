@@ -5,8 +5,8 @@ archive, destination, kind, name, description = sys.argv[1:]
 root = pathlib.Path(destination)
 with zipfile.ZipFile(archive) as bundle:
     entries = bundle.infolist()
-    if len(entries) > 10000 or sum(entry.file_size for entry in entries) > 200 * 1024 * 1024:
-        raise ValueError("Capability archive exceeds extraction limits")
+    if len(entries) > 10000 or sum(entry.file_size for entry in entries) > 32 * 1024 * 1024:
+        raise ValueError("Capability archive exceeds 10,000 entries or 32 MiB extracted")
     for entry in entries:
         path = pathlib.PurePosixPath(entry.filename)
         mode = entry.external_attr >> 16

@@ -23,16 +23,21 @@ for configured in roots:
                 skills.append({'path':str(path),'content':content})
             if name == 'plugin.json' and path.parent.name in ['.codex-plugin', '.claude-plugin']:
                 if path.stat().st_size > 128*1024: raise ValueError('Plugin metadata too large')
-                manifest = json.loads(path.read_text()); base = path.parent.parent
-                source = manifest.get('mcpServers', '.mcp.json')
-                if isinstance(source, str):
-                    sourcepath = (base/source).resolve()
-                    if not sourcepath.is_relative_to(base): raise ValueError('Plugin MCP path escapes root')
-                    if sourcepath.exists():
-                        if sourcepath.stat().st_size > 128*1024: raise ValueError('MCP metadata too large')
-                        source = json.loads(sourcepath.read_text())
-                    else: source = {}
-                plugins.append({'name':manifest['name'], 'root':str(base), 'mcp':source.get('mcpServers', source)})
+                base = path.parent.parent
+                try:
+                    manifest = json.loads(path.read_text())
+                    source = manifest.get('mcpServers', '.mcp.json') if isinstance(manifest, dict) else {}
+                    if isinstance(source, str):
+                        sourcepath = (base/source).resolve()
+                        if not sourcepath.is_relative_to(base): raise ValueError('Plugin MCP path escapes root')
+                        if sourcepath.exists():
+                            if sourcepath.stat().st_size > 128*1024: raise ValueError('MCP metadata too large')
+                            source = json.loads(sourcepath.read_text())
+                        else: source = {}
+                    servers = source.get('mcpServers', source) if isinstance(source, dict) else {}
+                    plugins.append({'name': manifest.get('name') if isinstance(manifest, dict) else None, 'root': str(base), 'mcp': servers if isinstance(servers, dict) else {}, 'error': None})
+                except Exception as error:
+                    plugins.append({'name': None, 'root': str(base), 'mcp': {}, 'error': str(error)[:512]})
 print(json.dumps({'skills':skills, 'plugins':plugins}))
 `;
 const discoveredSchema = z.object({
@@ -40,15 +45,60 @@ const discoveredSchema = z.object({
   plugins: z
     .array(
       z.object({
-        name: z.string(),
+        name: z.unknown(),
         root: z.string(),
-        mcp: z.record(z.string(), z.record(z.string(), z.json())),
+        mcp: z.record(z.string(), z.unknown()),
+        error: z.string().nullable(),
       }),
     )
     .max(100),
 });
-export async function discoverCapabilities(sandbox: ISandbox, roots: readonly string[]) {
+const skillMetadataSchema = z.object({
+  name: z.string().min(1).max(256),
+  description: z.string().max(4096),
+});
+const LABEL_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+const LABEL_LIMIT = 64;
+
+/**
+ * Derive an MCP `server_label` from plugin-controlled text. Invalid characters become
+ * underscores, the result is truncated to the wire limit and made distinct from every
+ * label already taken, so workspace content can add servers but never replace one.
+ */
+export function sanitizeServerLabel(candidate: string, taken: ReadonlySet<string> = new Set()) {
+  let label = candidate.replace(/[^a-zA-Z0-9_]/g, "_");
+  if (!/^[a-zA-Z_]/.test(label)) label = `_${label}`;
+  label = label.slice(0, LABEL_LIMIT);
+  if (!taken.has(label)) return label;
+  for (let suffix = 2; ; suffix++) {
+    const tail = `_${suffix}`;
+    const distinct = `${label.slice(0, LABEL_LIMIT - tail.length)}${tail}`;
+    if (!taken.has(distinct)) return distinct;
+  }
+}
+export function isServerLabel(value: string): boolean {
+  return LABEL_PATTERN.test(value);
+}
+
+export interface DiscoveryOptions {
+  /** Labels of configured servers; discovered servers never collide with them. */
+  reservedLabels?: readonly string[];
+  /** Receives one line per skipped skill or plugin; discovery never fails on content. */
+  diagnostics?: (line: string) => void;
+}
+
+/**
+ * Read skill metadata and plugin MCP definitions from the assigned Sandbox. Malformed
+ * entries are skipped with a diagnostic: capability roots are writable by the model, so
+ * their contents must not be able to prevent a turn from starting.
+ */
+export async function discoverCapabilities(
+  sandbox: ISandbox,
+  roots: readonly string[],
+  options: DiscoveryOptions = {},
+) {
   if (!roots.length) return { instructions: "", mcp: [] as McpToolConfig[] };
+  const diagnostics = options.diagnostics ?? (() => {});
   const process = await sandbox.exec(["python3", "-c", discover, JSON.stringify(roots)]);
   const result = await process.output({
     timeout: 30_000,
@@ -57,18 +107,30 @@ export async function discoverCapabilities(sandbox: ISandbox, roots: readonly st
   });
   if (result.exitCode !== 0 || result.truncated) throw new Error("Capability discovery failed");
   const found = discoveredSchema.parse(JSON.parse(result.stdout));
-  const skills = found.skills.map(({ path, content }) => {
+  const skills = found.skills.flatMap(({ path, content }) => {
     const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
-    if (!match) throw new Error("Skill frontmatter is missing");
-    const yaml = parseDocument(match[1] ?? "", { uniqueKeys: true });
-    if (yaml.errors.length) throw new Error("Invalid skill frontmatter");
-    const metadata = z
-      .object({ name: z.string().min(1).max(256), description: z.string().max(4096) })
-      .parse(yaml.toJS({ maxAliasCount: 0 }));
-    return { ...metadata, path };
+    if (!match) {
+      diagnostics(`skill skipped (missing frontmatter): ${path}`);
+      return [];
+    }
+    try {
+      const yaml = parseDocument(match[1] ?? "", { uniqueKeys: true });
+      if (yaml.errors.length) throw new Error(yaml.errors[0]?.message ?? "invalid YAML");
+      const metadata = skillMetadataSchema.parse(yaml.toJS({ maxAliasCount: 0 }));
+      return [{ ...metadata, path }];
+    } catch (error) {
+      diagnostics(`skill skipped (invalid frontmatter): ${path}: ${String(error)}`);
+      return [];
+    }
   });
-  const mcp = found.plugins.flatMap((plugin) =>
-    Object.entries(plugin.mcp).map(([label, value]) => {
+  const taken = new Set(options.reservedLabels ?? []);
+  const mcp = found.plugins.flatMap((plugin) => {
+    if (plugin.error !== null || typeof plugin.name !== "string" || !plugin.name) {
+      diagnostics(`plugin skipped (${plugin.error ?? "missing name"}): ${plugin.root}`);
+      return [];
+    }
+    const name = plugin.name;
+    return Object.entries(plugin.mcp).flatMap(([label, value]) => {
       const substitute = (input: unknown): unknown => {
         if (typeof input === "string")
           return input
@@ -81,23 +143,31 @@ export async function discoverCapabilities(sandbox: ISandbox, roots: readonly st
           );
         return input;
       };
-      const config = z.record(z.string(), z.json()).parse(substitute(value));
-      return mcpToolSchema.parse({
-        type: "mcp",
-        server_label: `${plugin.name}_${label}`,
-        connection_origin: "environment",
-        transport: config.url
-          ? { type: "http", server_url: config.url, headers: config.headers }
-          : {
-              type: "stdio",
-              command: config.command,
-              args: config.args,
-              cwd: config.cwd ?? plugin.root,
-              env: config.env,
-            },
-      });
-    }),
-  );
+      try {
+        const config = z.record(z.string(), z.json()).parse(substitute(value));
+        const server_label = sanitizeServerLabel(`${name}_${label}`, taken);
+        const tool = mcpToolSchema.parse({
+          type: "mcp",
+          server_label,
+          connection_origin: "environment",
+          transport: config.url
+            ? { type: "http", server_url: config.url, headers: config.headers }
+            : {
+                type: "stdio",
+                command: config.command,
+                args: config.args,
+                cwd: config.cwd ?? plugin.root,
+                env: config.env,
+              },
+        });
+        taken.add(server_label);
+        return [tool];
+      } catch (error) {
+        diagnostics(`plugin MCP server skipped (${name}/${label}): ${String(error)}`);
+        return [];
+      }
+    });
+  });
   return {
     instructions: skills.length
       ? `Available skills in the assigned Sandbox (metadata only):\n${JSON.stringify(skills)}\nWhen a skill applies, read its SKILL.md with the read tool, then follow its instructions. Resolve relative references from that file's directory. Execute scripts with the Sandbox bash tool.`

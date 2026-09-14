@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Data, Effect, Schema } from "effect";
 import type { Credential } from "openai/resources/beta/agents/vaults/credentials";
 import type { Vault } from "openai/resources/beta/agents/vaults/vaults";
 import { z } from "zod";
@@ -81,6 +81,12 @@ export const vaultPageSchema = pageSchema.extend({
 });
 type Auth = z.infer<typeof credentialAuthSchema>;
 type CredentialRecord = { version: 1; resource: Credential; auth: Auth };
+/** The token endpoint answered: the refresh token was not consumed by a lost request. */
+class RefreshRejected extends Data.TaggedError("RefreshRejected")<{
+  readonly status: number;
+  /** A 4xx answer: the grant itself is invalid and only rotation can help. */
+  readonly rejected: boolean;
+}> {}
 
 export function publicCredentialAuth(auth: Auth): Credential["auth"] {
   if (auth.type === "static_bearer")
@@ -143,6 +149,12 @@ export class VaultRepository {
   private usableToken(record: CredentialRecord): string | undefined {
     const auth = record.auth;
     if (auth.type === "static_bearer") return auth.token;
+    if (this.db.get("credential_refresh_rejected", record.resource.id))
+      throw new ApiError(
+        422,
+        "credential_refresh_rejected",
+        "The token endpoint rejected the OAuth refresh; rotate the credential",
+      );
     if (!auth.expires_at || Date.parse(auth.expires_at) > Date.now() + 30_000)
       return auth.access_token;
     if (!auth.refresh) {
@@ -250,11 +262,11 @@ export class VaultRepository {
             ),
           );
           if (!response.ok)
-            return yield* new ApiError(
-              422,
-              "credential_refresh_failed",
-              "OAuth refresh was rejected",
-            );
+            return yield* new RefreshRejected({
+              status: response.status,
+              rejected: response.status >= 400 && response.status < 500,
+            });
+          // A 2xx body that cannot be decoded may still have rotated the token: unknown.
           return yield* io("vault.refresh.body", () => response.json()).pipe(
             Effect.flatMap((value) => Schema.decodeUnknown(tokenSchema)(value)),
             Effect.mapError(
@@ -270,16 +282,47 @@ export class VaultRepository {
             new ApiError(422, "credential_refresh_failed", "OAuth refresh timed out"),
         }),
       );
-      const result = yield* exchange.pipe(
-        Effect.mapError(
-          () =>
-            new ApiError(
-              422,
-              "credential_refresh_failed",
-              "OAuth refresh failed; rotate the credential before retrying",
-            ),
-        ),
-      );
+      const outcome = yield* exchange.pipe(Effect.either);
+      if (outcome._tag === "Left") {
+        const failure = outcome.left;
+        // The endpoint answered (or refused a redirect before any credential was sent):
+        // nothing was consumed, so the reservation is released. A 4xx grant rejection is
+        // final until rotation; a 5xx may be retried. No answer at all stays unknown.
+        const definite =
+          failure instanceof RefreshRejected ||
+          (failure instanceof ApiError && failure.code === "upstream_redirect");
+        if (definite) {
+          const rejected = failure instanceof RefreshRejected && failure.rejected;
+          yield* attempt("vault.refresh.release", () =>
+            this.db.transaction(() => {
+              if (
+                this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId ===
+                operationId
+              )
+                this.db.remove("credential_refresh", id);
+              if (rejected)
+                this.db.put("credential_refresh_rejected", id, {
+                  version: 1,
+                  status: failure.status,
+                  at: Math.floor(Date.now() / 1000),
+                });
+            }),
+          );
+          return yield* new ApiError(
+            422,
+            rejected ? "credential_refresh_rejected" : "credential_refresh_failed",
+            rejected
+              ? "The token endpoint rejected the OAuth refresh; rotate the credential"
+              : "The token endpoint failed; retry later",
+          );
+        }
+        return yield* new ApiError(
+          422,
+          "credential_refresh_failed",
+          "OAuth refresh outcome is unknown; rotate the credential before retrying",
+        );
+      }
+      const result = outcome.right;
       return yield* attempt("vault.refresh.commit", () =>
         this.db.transaction(() => {
           const current = this.db.require<CredentialRecord>(
@@ -436,6 +479,7 @@ export class VaultRepository {
       record.resource.updated_at = Math.floor(Date.now() / 1000);
       this.db.put(`credential:${vaultId}`, id, record);
       this.db.remove("credential_refresh", id);
+      this.db.remove("credential_refresh_rejected", id);
       return record.resource;
     });
   }
@@ -443,6 +487,7 @@ export class VaultRepository {
     this.credential(vaultId, id);
     this.db.remove(`credential:${vaultId}`, id);
     this.db.remove("credential_refresh", id);
+    this.db.remove("credential_refresh_rejected", id);
     return { id, object: "vault.credential.deleted" as const, deleted: true };
   }
 }
