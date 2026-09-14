@@ -17,7 +17,7 @@
     "format": "ultracite fix --type-aware",
     "test": "vitest run",
     "test:codex": "vitest run --config vitest.codex.config.ts",
-    "check": "pnpm check:docs && pnpm check:harness && pnpm test:scripts && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+    "check": "pnpm check:docs && pnpm check:harness && pnpm typecheck && pnpm lint && pnpm build && pnpm test:scripts && pnpm test",
     "dev": "wrangler dev --config examples/worker/wrangler.jsonc",
     "dev:caller": "wrangler dev --config examples/caller/wrangler.jsonc --config examples/worker/wrangler.jsonc --port 8788",
     "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts && wrangler types --config examples/caller/wrangler.jsonc --env-interface CallerEnv examples/caller/env.d.ts",
