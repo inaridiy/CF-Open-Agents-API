@@ -22,7 +22,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "check:harness": "node scripts/check-harness.mjs",
     "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts",
-    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:scripts": "node --test scripts/*.test.mjs tests/containers/*.test.mjs",
     "test:package": "pnpm build && node scripts/test-package.mjs"
   },
   "devDependencies": {
