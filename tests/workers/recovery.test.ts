@@ -418,7 +418,7 @@ it("oversized UTF-8 state rolls back the complete input transaction", async () =
     },
   );
   expect(result).toMatchObject({
-    accepted: { ok: false, error: { status: 413, code: "storage_record_too_large" } },
+    accepted: { _tag: "Left", left: { _tag: "RecordTooLarge" } },
     status: "idle",
     turns: [],
     items: [],

@@ -7,7 +7,7 @@ import { z } from "zod";
 
 import { sessionTools } from "./agent-tools.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
-import { agentResource } from "./catalog.js";
+import { agentResource, ReservationResult, ReserveResult } from "./catalog.js";
 import { attempt, io, runPromise } from "./effect.js";
 import {
   environmentFileSchema,
@@ -18,6 +18,7 @@ import {
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
 import { environmentFilePageSchema, mergeEnvironment } from "./environments.js";
+import { decodeRpc, projectApiError, toApiError } from "./errors.js";
 import { INPUT_FILE_LIMIT, type ResolvedInputFile, uploadInputFile } from "./files.js";
 import type {
   Agent,
@@ -45,17 +46,14 @@ import {
   metadataSchema,
   pageSchema,
   parse,
-  type RpcResult,
-  remoteApiError,
   remoteImageURLs,
   reservedDelegationName,
   savedAgentSchema,
   sessionPageSchema,
-  unwrap,
 } from "./protocol.js";
 import type { AgentRegistration, RuntimeDriver, ServiceOptions } from "./runtime.js";
-import type { ForkSource, SessionRecord } from "./session.js";
-import { SessionObject } from "./session.js";
+import type { SessionRecord } from "./session.js";
+import { ForkSourceResult, SessionObject, SubmitResult } from "./session.js";
 import { type ResolvedSkill, readSkillUpload, SKILL_UPLOAD_LIMIT } from "./skills.js";
 import {
   credentialSchema,
@@ -289,8 +287,8 @@ export function createAgentService<Env extends AgentBindings>(
           yield* io("api.environment.connected", () => stub.environmentStatus("connected"));
         }
         if (initialInput)
-          unwrap(
-            yield* io<RpcResult<null>>("api.createSession", () =>
+          yield* decodeRpc(SubmitResult)(
+            yield* io<typeof SubmitResult.Encoded>("api.createSession", () =>
               stub.submit(
                 [{ type: "agent.session.input.message", input: inputMessages(initialInput) }],
                 `${idempotencyKey}:initial`,
@@ -314,10 +312,8 @@ export function createAgentService<Env extends AgentBindings>(
           yield* attempt("api.images", () => assertInputImages(input.input));
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint(input);
-          const previous = unwrap(
-            JSON.parse(
-              yield* io("api.reservation", () => catalog.reservation(idempotencyKey, fingerprint)),
-            ) as RpcResult<Reservation | null>,
+          const previous = yield* decodeRpc(ReservationResult)(
+            yield* io("api.reservation", () => catalog.reservation(idempotencyKey, fingerprint)),
           );
           const reservation =
             previous ??
@@ -537,12 +533,10 @@ export function createAgentService<Env extends AgentBindings>(
                 deleted: false,
                 ...(environmentSpec ? { environmentSpec } : {}),
               };
-              return unwrap(
-                JSON.parse(
-                  yield* io("api.createSession", () =>
-                    catalog.reserve(idempotencyKey, fingerprint, record),
-                  ),
-                ) as RpcResult<Reservation>,
+              return yield* decodeRpc(ReserveResult)(
+                yield* io("api.createSession", () =>
+                  catalog.reserve(idempotencyKey, fingerprint, record),
+                ),
               );
             }));
           return yield* this.establish(tenant, idempotencyKey, reservation, input.input);
@@ -561,19 +555,15 @@ export function createAgentService<Env extends AgentBindings>(
           yield* attempt("api.images", () => assertInputImages(input.input));
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint({ fork: id, ...input });
-          const previous = unwrap(
-            JSON.parse(
-              yield* io("api.reservation", () => catalog.reservation(idempotencyKey, fingerprint)),
-            ) as RpcResult<Reservation | null>,
+          const previous = yield* decodeRpc(ReservationResult)(
+            yield* io("api.reservation", () => catalog.reservation(idempotencyKey, fingerprint)),
           );
           const reservation =
             previous ??
             (yield* Effect.gen(this, function* () {
               const sourceStub = yield* io("api.fork.session", () => this.session(tenant, id));
-              const source = unwrap(
-                JSON.parse(
-                  yield* io("api.fork.source", () => sourceStub.forkSource()),
-                ) as RpcResult<ForkSource>,
+              const source = yield* decodeRpc(ForkSourceResult)(
+                yield* io("api.fork.source", () => sourceStub.forkSource()),
               );
               const hosted = source.session.environment.type !== "none";
               const agent = yield* attempt("api.agent.validate", () =>
@@ -698,12 +688,10 @@ export function createAgentService<Env extends AgentBindings>(
                   : {}),
                 forkedFrom: { sessionId: source.session.id, turnId: source.lastTurnId },
               };
-              return unwrap(
-                JSON.parse(
-                  yield* io("api.forkSession", () =>
-                    catalog.reserve(idempotencyKey, fingerprint, record),
-                  ),
-                ) as RpcResult<Reservation>,
+              return yield* decodeRpc(ReserveResult)(
+                yield* io("api.forkSession", () =>
+                  catalog.reserve(idempotencyKey, fingerprint, record),
+                ),
               );
             }));
           return yield* this.establish(tenant, idempotencyKey, reservation, input.input);
@@ -725,8 +713,10 @@ export function createAgentService<Env extends AgentBindings>(
             parse(eventsSchema, { events }),
           );
           const stub = yield* io("api.submitEvents", () => this.session(tenant, id));
-          unwrap(
-            yield* io<RpcResult<null>>("api.submitEvents", () => stub.submit(parsed.events, key)),
+          yield* decodeRpc(SubmitResult)(
+            yield* io<typeof SubmitResult.Encoded>("api.submitEvents", () =>
+              stub.submit(parsed.events, key),
+            ),
           );
         }),
       );
@@ -746,7 +736,7 @@ export function createAgentService<Env extends AgentBindings>(
             ({ id }) =>
               io("api.retrieveSession", () => this.retrieveSession(tenant, id)).pipe(
                 Effect.catchIf(
-                  (error) => error._tag === "ApiError" && error.status === 404,
+                  (error) => error._tag !== "OperationError" && toApiError(error).status === 404,
                   () => Effect.succeed(undefined),
                 ),
               ),
@@ -868,8 +858,9 @@ export function createAgentService<Env extends AgentBindings>(
       const known =
         error instanceof SyntaxError
           ? new ApiError(400, "invalid_json", "Request body must be valid JSON")
-          : remoteApiError(error);
-      if (!known) console.error("Agent API request failed", { message: error.message });
+          : projectApiError(error);
+      if (!known || known.status === 500)
+        console.error("Agent API request failed", { message: error.message });
       const status = known ? known.status : 500;
       const response = Response.json(
         {

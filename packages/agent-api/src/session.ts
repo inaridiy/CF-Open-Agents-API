@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { Context, Effect, Either, Layer, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import type {
   AgentSessionEnvironmentState,
   SessionTurnError,
@@ -7,8 +7,25 @@ import type {
 } from "openai/resources/beta/agents/agents";
 import type { SessionArtifact } from "openai/resources/beta/agents/sessions/artifacts";
 
-import { attempt, io, runPromise } from "./effect.js";
+import { attempt, io, runPromise, runSync } from "./effect.js";
 import type { EnvironmentSpec } from "./environments.js";
+import {
+  CheckpointIncompatible,
+  encodeRpc,
+  IdempotencyConflict,
+  InvalidRuntimeEvent,
+  InvalidSessionState,
+  isDomainError,
+  rpcEnvelope,
+  SessionFailed,
+  SessionNotFound,
+  StorageFailure,
+  Superseded,
+  toApiError,
+  type TransportFailure,
+  TurnCheckpointing,
+  UnknownToolCall,
+} from "./errors.js";
 import type {
   AgentConfig,
   AgentSession,
@@ -24,9 +41,7 @@ import {
   assertImageLimit,
   canonicalJSON,
   identifier,
-  type RpcResult,
   remoteImageURLs,
-  rpcFailure,
 } from "./protocol.js";
 import {
   type AgentRegistration,
@@ -82,6 +97,13 @@ export interface ForkSource {
   lastTurnId: string | null;
   transcript: string;
 }
+const forkSourceSchema = Schema.declare<ForkSource>(
+  (input): input is ForkSource =>
+    typeof input === "object" && input !== null && "session" in input && "transcript" in input,
+);
+/** String carrier: the RPC type of the public session shape is too deep for the stub. */
+export const ForkSourceResult = Schema.parseJson(rpcEnvelope(forkSourceSchema));
+export const SubmitResult = rpcEnvelope(Schema.Null);
 /** Leading input of a fork's first turn; the harness reads it as ordinary context. */
 export const TRANSCRIPT_LIMIT = 96_000;
 const TRANSCRIPT_ENTRY_LIMIT = 4_000;
@@ -244,17 +266,18 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     return migrated.session;
   }
   private record(): SessionRecord {
-    const original = this.db.require<SessionRecord>("state", "session");
+    const original = this.db.get<SessionRecord>("state", "session");
+    if (!original) throw new SessionNotFound();
     const record = this.migrate(original);
     this.validate(record);
     if (record !== original) this.save(record);
-    if (record.deleted) throw new ApiError(404, "not_found", "Session not found");
+    if (record.deleted) throw new SessionNotFound();
     return record;
   }
   private migrate(record: SessionRecord): SessionRecord {
     if (record.schemaVersion === 2) return record;
     if (record.schemaVersion !== undefined)
-      throw new ApiError(409, "invalid_session_state", "Unsupported session record version");
+      throw new InvalidSessionState({ reason: "Unsupported session record version" });
     // Alpha records stored the response-only null limit in request configuration.
     const agent = (config: AgentConfig): AgentConfig => ({
       ...config,
@@ -285,7 +308,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         (record.execution.generation !== record.generation ||
           record.execution.sessionId !== record.session.id))
     )
-      throw new ApiError(409, "invalid_session_state", "Persisted execution state is inconsistent");
+      throw new InvalidSessionState({ reason: "Persisted execution state is inconsistent" });
   }
   private save(record: SessionRecord): void {
     this.validate(record);
@@ -412,16 +435,15 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.record();
     return this.db.events<AgentSessionEvent>(after);
   }
-  /**
-   * Committed state only: an active turn has no consistent checkpoint yet.
-   * Serialized because the RPC type of the public session shape is too deep.
-   */
+  /** Committed state only: an active turn has no consistent checkpoint yet. */
   forkSource(): string {
-    try {
-      return JSON.stringify({ ok: true, value: this.source() } satisfies RpcResult<ForkSource>);
-    } catch (error) {
-      return JSON.stringify(rpcFailure(error));
-    }
+    return runSync(
+      encodeRpc(
+        ForkSourceResult,
+        attempt("session.forkSource", () => this.source()),
+      ),
+      "session.forkSource",
+    );
   }
   private source(): ForkSource {
     const record = this.record();
@@ -449,154 +471,134 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     };
   }
 
-  submit(events: InputEvent[], key: string): Promise<RpcResult<null>> {
+  submit(events: InputEvent[], key: string): Promise<typeof SubmitResult.Encoded> {
     return runPromise(
-      Effect.gen(this, function* () {
-        // Persist the wakeup first; the synchronous input transaction then cannot be orphaned.
-        yield* io("session.arm", () => this.ctx.storage.setAlarm(Date.now() + 1));
-        yield* attempt("session.submit", () =>
-          this.db.transaction(() => {
-            let record = this.record();
-            const fingerprint = canonicalJSON(events);
-            const previous = this.db.get<string>("idempotency", key);
-            if (previous) {
-              if (previous !== fingerprint)
-                throw new ApiError(
-                  409,
-                  "idempotency_conflict",
-                  "Key was used with different input",
-                );
-              return;
-            }
-            if (record.phase === "failed")
-              throw new ApiError(
-                409,
-                "session_failed",
-                "Fork or create a new session after an indeterminate execution",
-              );
-            if (record.phase === "checkpointing")
-              throw new ApiError(
-                409,
-                "turn_checkpointing",
-                "Wait for the current turn to become idle",
-              );
-            const driver = this.driver(record);
-            const images = new Set<string>();
-            for (const event of events) {
-              if (event.type === "agent.session.input.message")
-                remoteImageURLs(
-                  event.input.flatMap((message) => message.content),
-                  images,
-                );
-              else if (
-                event.type === "agent.session.input.tool_result" &&
-                Array.isArray(event.output)
-              )
-                remoteImageURLs(event.output, images);
-            }
-            assertImageLimit(images);
-            for (const event of events) {
-              switch (event.type) {
-                case "agent.session.input.message": {
-                  if (
-                    !driver.capabilities.images &&
-                    event.input.some((message) =>
-                      message.content.some((part) => part.type === "input_image"),
+      encodeRpc(
+        SubmitResult,
+        Effect.gen(this, function* () {
+          // Persist the wakeup first; the synchronous input transaction then cannot be orphaned.
+          yield* io("session.arm", () => this.ctx.storage.setAlarm(Date.now() + 1));
+          yield* attempt("session.submit", () =>
+            this.db.transaction(() => {
+              let record = this.record();
+              const fingerprint = canonicalJSON(events);
+              const previous = this.db.get<string>("idempotency", key);
+              if (previous) {
+                if (previous !== fingerprint) throw new IdempotencyConflict({ subject: "input" });
+                return;
+              }
+              if (record.phase === "failed") throw new SessionFailed();
+              if (record.phase === "checkpointing") throw new TurnCheckpointing();
+              const driver = this.driver(record);
+              const images = new Set<string>();
+              for (const event of events) {
+                if (event.type === "agent.session.input.message")
+                  remoteImageURLs(
+                    event.input.flatMap((message) => message.content),
+                    images,
+                  );
+                else if (
+                  event.type === "agent.session.input.tool_result" &&
+                  Array.isArray(event.output)
+                )
+                  remoteImageURLs(event.output, images);
+              }
+              assertImageLimit(images);
+              for (const event of events) {
+                switch (event.type) {
+                  case "agent.session.input.message": {
+                    if (
+                      !driver.capabilities.images &&
+                      event.input.some((message) =>
+                        message.content.some((part) => part.type === "input_image"),
+                      )
                     )
-                  )
-                    throw new ApiError(
-                      422,
-                      "unsupported_capability",
-                      "The selected harness does not support image input",
-                    );
-                  if (record.execution) {
-                    if (!driver.capabilities.steer)
                       throw new ApiError(
-                        409,
-                        "active_turn_not_steerable",
-                        "This harness cannot steer an active turn",
+                        422,
+                        "unsupported_capability",
+                        "The selected harness does not support image input",
                       );
-                    const itemIds = this.addInput(record, event.input);
-                    this.enqueue(record, { type: "steer", input: event.input }, itemIds);
-                  } else {
-                    record = this.begin(record, event.input);
-                    this.addInput(record, event.input);
+                    if (record.execution) {
+                      if (!driver.capabilities.steer)
+                        throw new ApiError(
+                          409,
+                          "active_turn_not_steerable",
+                          "This harness cannot steer an active turn",
+                        );
+                      const itemIds = this.addInput(record, event.input);
+                      this.enqueue(record, { type: "steer", input: event.input }, itemIds);
+                    } else {
+                      record = this.begin(record, event.input);
+                      this.addInput(record, event.input);
+                    }
+                    break;
                   }
-                  break;
-                }
-                case "agent.session.input.cancel":
-                  if (record.execution) this.enqueue(record, { type: "cancel" });
-                  break;
-                case "agent.session.input.tool_result": {
-                  if (
-                    !driver.capabilities.images &&
-                    Array.isArray(event.output) &&
-                    event.output.some((part) => part.type === "input_image")
-                  )
-                    throw new ApiError(
-                      422,
-                      "unsupported_capability",
-                      "The selected harness does not support image function results",
+                  case "agent.session.input.cancel":
+                    if (record.execution) this.enqueue(record, { type: "cancel" });
+                    break;
+                  case "agent.session.input.tool_result": {
+                    if (
+                      !driver.capabilities.images &&
+                      Array.isArray(event.output) &&
+                      event.output.some((part) => part.type === "input_image")
+                    )
+                      throw new ApiError(
+                        422,
+                        "unsupported_capability",
+                        "The selected harness does not support image function results",
+                      );
+                    const action = record.session.required_actions.find(
+                      (action) =>
+                        action.type === "function_call" &&
+                        action.call_id === event.call_id &&
+                        action.turn_id === event.turn_id,
                     );
-                  const action = record.session.required_actions.find(
-                    (action) =>
-                      action.type === "function_call" &&
-                      action.call_id === event.call_id &&
-                      action.turn_id === event.turn_id,
-                  );
-                  // The official SDK retries a tool result submitted before the call was
-                  // registered only when the response is a 400 whose `code` is
-                  // `invalid_request_error` and whose message is exactly this text
-                  // (openai/lib/agents/agent-session-stream.js, `#submit`). Keep both.
-                  if (!action || !record.execution)
-                    throw new ApiError(
-                      400,
-                      "invalid_request_error",
-                      `Unknown pending tool call: ${event.call_id}`,
-                    );
-                  recordToolResult(this.db, record, event);
-                  this.enqueue(record, {
-                    type: "tool_result",
-                    callId: event.call_id,
-                    success: event.success,
-                    output: event.success ? (event.output ?? "") : (event.error ?? "Tool failed"),
-                  });
-                  const required_actions = record.session.required_actions.filter(
-                    (value) => value !== action,
-                  );
-                  record = {
-                    ...record,
-                    session: {
-                      ...record.session,
-                      required_actions,
-                      status: required_actions.length ? "requires_action" : "in_progress",
-                    },
-                  };
-                  if (!required_actions.length) {
-                    const turn = this.turn(event.turn_id);
-                    this.db.put("turn", turn.id, { ...turn, status: "in_progress" });
-                    this.emit({
-                      type: "agent.session.in_progress",
-                      event_id: identifier("evt"),
-                      session: record.session,
+                    if (!action || !record.execution)
+                      throw new UnknownToolCall({ callId: event.call_id });
+                    recordToolResult(this.db, record, event);
+                    this.enqueue(record, {
+                      type: "tool_result",
+                      callId: event.call_id,
+                      success: event.success,
+                      output: event.success ? (event.output ?? "") : (event.error ?? "Tool failed"),
                     });
+                    const required_actions = record.session.required_actions.filter(
+                      (value) => value !== action,
+                    );
+                    record = {
+                      ...record,
+                      session: {
+                        ...record.session,
+                        required_actions,
+                        status: required_actions.length ? "requires_action" : "in_progress",
+                      },
+                    };
+                    if (!required_actions.length) {
+                      const turn = this.turn(event.turn_id);
+                      this.db.put("turn", turn.id, { ...turn, status: "in_progress" });
+                      this.emit({
+                        type: "agent.session.in_progress",
+                        event_id: identifier("evt"),
+                        session: record.session,
+                      });
+                    }
+                    break;
                   }
-                  break;
                 }
               }
-            }
-            this.db.put("idempotency", key, fingerprint);
-            // Accepted input counts as activity even when it only queues a command.
-            record = {
-              ...record,
-              session: { ...record.session, last_active_at: Math.floor(Date.now() / 1_000) },
-            };
-            this.save(record);
-          }),
-        );
-        this.flush();
-        return { ok: true, value: null } as const;
-      }).pipe(Effect.catchTag("ApiError", (error) => Effect.succeed(rpcFailure(error)))),
+              this.db.put("idempotency", key, fingerprint);
+              // Accepted input counts as activity even when it only queues a command.
+              record = {
+                ...record,
+                session: { ...record.session, last_active_at: Math.floor(Date.now() / 1_000) },
+              };
+              this.save(record);
+            }),
+          );
+          this.flush();
+          return null;
+        }),
+      ),
     );
   }
   private driver(record: SessionRecord): RuntimeDriver {
@@ -769,13 +771,37 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       ? (record as ActiveSession)
       : undefined;
   }
-  private transition<A>(execution: Execution, f: (record: ActiveSession) => A) {
-    return attempt("session.transition", () =>
-      this.db.transaction(() => {
-        const record = this.current(execution);
-        return record ? f(record) : undefined;
-      }),
-    );
+  /**
+   * The fenced unit of work: `f` runs inside one synchronous transaction, only while
+   * `execution` is still the durable identity; otherwise it fails with `Superseded`. A
+   * throw rolls the transaction back and keeps its tag; anything untyped is a storage
+   * failure. `f` may not return a Promise or an Effect (type-enforced, as in SqlStore).
+   */
+  private transition<A>(
+    execution: Execution,
+    f: (
+      record: ActiveSession,
+    ) => A &
+      (A extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown),
+  ) {
+    return Effect.suspend(() => {
+      try {
+        return Effect.succeed(
+          this.db.storage.transactionSync(() => {
+            const record = this.current(execution);
+            if (!record)
+              throw new Superseded({ turnId: execution.turnId, generation: execution.generation });
+            return f(record);
+          }),
+        );
+      } catch (thrown) {
+        return Effect.fail(
+          isDomainError(thrown) || thrown instanceof ApiError
+            ? thrown
+            : new StorageFailure({ operation: "session.transition", cause: thrown }),
+        );
+      }
+    });
   }
   private advance() {
     return Effect.gen(this, function* () {
@@ -794,10 +820,22 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         yield* this.finish(execution, "failed", "executor_unavailable");
         return;
       }
-      const stopAndFail = (code: string) =>
-        driver
-          .stop(execution)
-          .pipe(Effect.zipRight(this.finish(execution, "failed", code)), Effect.asVoid);
+      yield* this.reconcile(driver, execution, initial);
+      // A fence that no longer holds ends the tick silently; the winner owns the record.
+    }).pipe(Effect.catchTag("Superseded", () => Effect.void));
+  }
+  /**
+   * One reconciliation tick. The error policy is a type: a definite answer (a runtime
+   * rejection, a protocol violation, an unstorable record) fails the turn with its code
+   * at once; a transport or storage failure propagates, is logged by the alarm and
+   * retried by the next one; a superseded fence stops silently.
+   */
+  private reconcile(driver: RuntimeDriver, execution: Execution, initial: ActiveSession) {
+    const stopAndFail = (code: string) =>
+      driver
+        .stop(execution)
+        .pipe(Effect.zipRight(this.finish(execution, "failed", code)), Effect.asVoid);
+    return Effect.gen(this, function* () {
       if (driver.revision !== initial.revision) {
         yield* stopAndFail("executor_version_incompatible");
         return;
@@ -812,15 +850,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         return;
       }
       if (initial.phase === "starting") {
-        const started = yield* driver
-          .start(execution, `${execution.turnId}:start`)
-          .pipe(Effect.either);
-        if (Either.isLeft(started)) {
-          // A typed rejection is permanent; an I/O failure is retried until the deadline.
-          if (started.left._tag !== "ApiError") return yield* Effect.fail(started.left);
-          yield* stopAndFail(started.left.code);
-          return;
-        }
+        yield* driver.start(execution, `${execution.turnId}:start`);
         yield* this.transition(execution, (record) => {
           this.save({ ...record, phase: "running" });
           const turn = {
@@ -866,41 +896,50 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
               yield* this.transition(execution, () => this.db.remove("command", operation.id));
             continue;
           }
-          const delivered = yield* driver
-            .control(execution, operation.id, operation.command)
-            .pipe(Effect.either);
-          if (Either.isRight(delivered)) {
-            if (!cancel)
-              yield* this.transition(execution, () => this.db.remove("command", operation.id));
-            continue;
-          }
-          if (cancel) {
-            yield* Effect.logWarning(
-              "Cancellation delivery failed; reconciling native outcome",
-              delivered.left,
-            );
-          } else if (delivered.left._tag === "ApiError") {
-            yield* Effect.logWarning("Executor refused a queued command", delivered.left);
-            yield* this.transition(execution, () => this.reject(operation));
-          } else {
-            yield* Effect.logWarning("Command delivery failed; polling first", delivered.left);
+          // A cancellation's delivery outcome never matters: the native outcome is reconciled.
+          const refused = (error: unknown) =>
+            cancel
+              ? Effect.logWarning(
+                  "Cancellation delivery failed; reconciling native outcome",
+                  error,
+                ).pipe(Effect.as("skipped" as const))
+              : Effect.logWarning("Executor refused a queued command", error).pipe(
+                  Effect.zipRight(this.transition(execution, () => this.reject(operation))),
+                  Effect.as("skipped" as const),
+                );
+          const delivery = yield* driver.control(execution, operation.id, operation.command).pipe(
+            Effect.as("delivered" as const),
+            Effect.catchTags({
+              CommandRejected: refused,
+              ExecutionMissing: refused,
+              TransportFailure: (error) =>
+                cancel
+                  ? refused(error)
+                  : Effect.logWarning("Command delivery failed; polling first", error).pipe(
+                      Effect.as("retry" as const),
+                    ),
+            }),
+          );
+          if (delivery === "retry") {
             retryDelivery = true;
             break;
           }
+          if (delivery === "delivered" && !cancel)
+            yield* this.transition(execution, () => this.db.remove("command", operation.id));
         }
         const current = this.current(execution);
         if (!current) return;
         const batch = yield* driver.poll(execution, current.cursor);
-        const accepted = yield* this.transition(execution, (record) => {
+        // A protocol violation rolls the whole batch back and fails the turn with its code.
+        const phase = yield* this.transition(execution, (record) => {
           let next = record;
           for (const entry of batch.events) {
             if (entry.seq <= next.cursor) continue;
             if (entry.seq !== next.cursor + 1)
-              throw new ApiError(
-                409,
-                "invalid_runtime_cursor",
-                "Runtime events must be contiguous",
-              );
+              throw new InvalidRuntimeEvent({
+                code: "invalid_runtime_cursor",
+                message: "Runtime events must be contiguous",
+              });
             next = { ...acceptRuntimeEvent(this.db, next, entry.event), cursor: entry.seq };
           }
           // A command accepted during poll must be delivered before sealing completion.
@@ -909,15 +948,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
           if (batch.status === "completed" && !pending) next = { ...next, phase: "checkpointing" };
           this.save(next);
           return pending ? "commands" : next.phase;
-        }).pipe(Effect.either);
-        if (Either.isLeft(accepted)) {
-          // A protocol violation cannot be retried into success: stop and fail with its code.
-          if (accepted.left._tag !== "ApiError") return yield* Effect.fail(accepted.left);
-          yield* stopAndFail(accepted.left.code);
-          return;
-        }
-        const phase = accepted.right;
-        if (!phase) return;
+        });
         if (phase === "checkpointing") {
           yield* this.checkpoint(driver, execution);
           return;
@@ -935,18 +966,31 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         }
         if (phase !== "commands" || retryDelivery) return;
       }
-    });
+    }).pipe(
+      Effect.catchTags({
+        RuntimeRejected: (error) => stopAndFail(error.code),
+        InvalidRuntimeEvent: (error) => stopAndFail(error.code),
+        RecordTooLarge: (error) => stopAndFail(toApiError(error).code),
+        InvalidSessionState: (error) => stopAndFail(toApiError(error).code),
+      }),
+    );
   }
   private checkpoint(driver: RuntimeDriver, execution: Execution) {
+    const seal = (code: string) =>
+      driver
+        .stop(execution)
+        .pipe(Effect.zipRight(this.finish(execution, "failed", code)), Effect.asVoid);
+    // A checkpoint is attempted even after the deadline: an already committed result can
+    // still be recovered. Only a failure to answer is bounded by the deadline.
+    const unavailable = (error: TransportFailure | StorageFailure) =>
+      Date.now() >= execution.deadline ? seal("checkpoint_unavailable") : Effect.fail(error);
     return Effect.gen(this, function* () {
       const checkpoint = yield* driver.checkpoint(execution);
       yield* this.transition(execution, (record) => {
         if (checkpoint.driver !== record.driver || checkpoint.revision !== record.revision)
-          throw new ApiError(
-            409,
-            "invalid_checkpoint",
-            "Checkpoint has an incompatible harness revision",
-          );
+          throw new CheckpointIncompatible({
+            message: "Checkpoint has an incompatible harness revision",
+          });
         for (const artifact of checkpoint.artifacts ?? [])
           this.db.put("artifact", artifact.id, {
             ...artifact,
@@ -955,22 +999,14 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         this.complete({ ...record, checkpoint }, "completed");
       });
     }).pipe(
-      Effect.catchAll((error) => {
-        if (error._tag === "ApiError" || Date.now() >= execution.deadline) {
-          return driver
-            .stop(execution)
-            .pipe(
-              Effect.zipRight(
-                this.finish(
-                  execution,
-                  "failed",
-                  error._tag === "ApiError" ? error.code : "checkpoint_unavailable",
-                ),
-              ),
-              Effect.asVoid,
-            );
-        }
-        return Effect.fail(error);
+      Effect.catchTags({
+        RuntimeRejected: (error) => seal(error.code),
+        CheckpointIncompatible: (error) => seal(toApiError(error).code),
+        RecordTooLarge: (error) => seal(toApiError(error).code),
+        InvalidSessionState: (error) => seal(toApiError(error).code),
+        ApiError: (error) => seal(error.code),
+        TransportFailure: unavailable,
+        StorageFailure: unavailable,
       }),
     );
   }
@@ -1081,7 +1117,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     if (!stored) {
       // A purged object keeps only its tombstone, so a lost-response retry still succeeds.
       const tombstone = this.db.get<{ id: string }>("state", "tombstone");
-      if (!tombstone) throw new ApiError(404, "not_found", "Session not found");
+      if (!tombstone) throw new SessionNotFound();
       return { id: tombstone.id, object: "agent.session.deleted", deleted: true };
     }
     const record = this.migrate(stored);

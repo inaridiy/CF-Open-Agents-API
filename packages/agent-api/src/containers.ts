@@ -10,6 +10,7 @@ import { attempt, decode, io, runPromise } from "./effect.js";
 import type { HostedConfiguration } from "./environment-config.js";
 import { environmentMcpScript } from "./environment-mcp.js";
 import type { EnvironmentDriver } from "./environments.js";
+import { CommandRejected, ExecutionMissing, TransportFailure } from "./errors.js";
 import { copyKnownLength } from "./files.js";
 import { HARNESSES, type HarnessName } from "./harnesses.js";
 import { proxyMcp } from "./mcp.js";
@@ -881,7 +882,10 @@ export class HarnessContainer<
         ),
       );
       if (!result.ok)
-        return yield* Effect.fail(new Error(`Harness rejected start (${result.status})`));
+        return yield* new TransportFailure({
+          operation: "startAttempt",
+          cause: `Harness rejected start (${result.status})`,
+        });
     });
   }
   pollExecution(execution: Execution, after: number): Promise<Response> {
@@ -959,9 +963,10 @@ export class HarnessContainer<
               : typeof body.error === "string"
                 ? body.error
                 : `Harness rejected control (${result.status})`;
-          if (result.status === 409) return yield* new ApiError(409, "command_rejected", message);
-          if (result.status === 404) return yield* new ApiError(404, "execution_missing", message);
-          return yield* Effect.fail(new Error(message));
+          if (result.status === 409)
+            return yield* new CommandRejected({ code: "command_rejected", message });
+          if (result.status === 404) return yield* new ExecutionMissing({ message });
+          return yield* new TransportFailure({ operation: "controlExecution", cause: message });
         }
       }),
     );
@@ -991,7 +996,10 @@ export class HarnessContainer<
         this.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`, { signal }),
       );
       if (!response.ok || !response.body)
-        return yield* Effect.fail(new Error("Native checkpoint failed"));
+        return yield* new TransportFailure({
+          operation: "snapshot",
+          cause: `Native checkpoint failed (${response.status})`,
+        });
       // containerFetch may return a chunked stream; R2 requires a known length.
       const bytes = yield* io("snapshot", () => response.arrayBuffer());
       // The checkpoint record below names this object: its outcome must be observed.

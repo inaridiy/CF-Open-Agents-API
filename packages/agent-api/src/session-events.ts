@@ -4,6 +4,7 @@ import type {
   AgentOutputItem as UpstreamOutputItem,
 } from "openai/resources/beta/agents/agents";
 
+import { InvalidRuntimeEvent } from "./errors.js";
 import type {
   AgentSessionEvent,
   AgentSessionItem,
@@ -11,7 +12,7 @@ import type {
   JsonWire,
   Turn,
 } from "./protocol.js";
-import { ApiError, identifier } from "./protocol.js";
+import { identifier } from "./protocol.js";
 import type { RuntimeEvent } from "./runtime.js";
 import type { ActiveSession, SessionRecord } from "./session.js";
 import type { SqlStore } from "./storage.js";
@@ -21,11 +22,10 @@ type OutputItem = JsonWire<UpstreamOutputItem>;
 function runtimeRecord<T>(db: SqlStore, kind: string, id: string): T {
   const value = db.get<T>(kind, id);
   if (!value)
-    throw new ApiError(
-      409,
-      "invalid_runtime_event",
-      `Runtime event references an unknown ${kind}: ${id}`,
-    );
+    throw new InvalidRuntimeEvent({
+      code: "invalid_runtime_event",
+      message: `Runtime event references an unknown ${kind}: ${id}`,
+    });
   return value;
 }
 type AssistantMessage = Extract<OutputItem, { type: "message" }>;

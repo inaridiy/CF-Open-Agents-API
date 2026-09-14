@@ -80,22 +80,6 @@ export function remoteApiError(error: Error): ApiError | undefined {
   return new ApiError(status, match[2], error.message);
 }
 
-/** Expected validation failures cross DO RPC as data, without platform error logs. */
-export type RpcResult<T> =
-  | { ok: true; value: T }
-  | {
-      ok: false;
-      error: { status: ApiError["status"]; code: string; message: string };
-    };
-export function rpcFailure(error: unknown): RpcResult<never> {
-  if (!(error instanceof ApiError)) throw error;
-  return { ok: false, error: { status: error.status, code: error.code, message: error.message } };
-}
-export function unwrap<T>(result: RpcResult<T>): T {
-  if (result.ok) return result.value;
-  throw new ApiError(result.error.status, result.error.code, result.error.message);
-}
-
 const WORKSPACE_TOOL_NAMES = new Set(["bash", "read", "write", "edit"]);
 const TOOL_SEARCH_NAMES = new Set(["cf_tool_search", "cf_call_tool"]);
 export const metadataSchema = z

@@ -1,5 +1,6 @@
 import { Cause, Data, Effect, Exit, FiberId, Runtime, Schema } from "effect";
 
+import { type DomainError, isDomainError } from "./errors.js";
 import { ApiError, remoteApiError } from "./protocol.js";
 
 /** An I/O failure has an operation and a cause; it is never permission to replay a write. */
@@ -12,9 +13,12 @@ export class OperationError extends Data.TaggedError("OperationError")<{
   }
 }
 
-export type ServiceError = ApiError | OperationError;
+export type ServiceError = ApiError | OperationError | DomainError;
+/** A typed failure keeps its tag; an RPC wire name becomes an ApiError; the rest is opaque. */
 const failure = (operation: string, cause: unknown): ServiceError =>
-  (cause instanceof Error && remoteApiError(cause)) || new OperationError({ operation, cause });
+  isDomainError(cause) || cause instanceof ApiError
+    ? cause
+    : (cause instanceof Error && remoteApiError(cause)) || new OperationError({ operation, cause });
 
 /**
  * SDK / platform Promise boundary. The callback always receives the fiber's interruption

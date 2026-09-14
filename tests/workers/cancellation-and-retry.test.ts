@@ -120,7 +120,7 @@ it.each([false, true])(
       },
     );
     expect(result).toMatchObject({
-      accepted: { ok: true },
+      accepted: { _tag: "Right" },
       afterCancel: { status: "idle", pending: 0 },
       final: "idle",
       turn: "cancelled",

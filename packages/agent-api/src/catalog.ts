@@ -1,25 +1,20 @@
 import { DurableObject } from "cloudflare:workers";
+import { Schema } from "effect";
 import type { EnvironmentTemplate } from "openai/resources/beta/agents/environments/templates";
 import type { z } from "zod";
 
 import { publicTool } from "./agent-tools.js";
-import { runPromise } from "./effect.js";
+import { attempt, runPromise, runSync } from "./effect.js";
 import {
   publicHostedConfiguration,
   type TemplateConfiguration,
   templateSchema,
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
+import { encodeRpc, IdempotencyConflict, rpcEnvelope } from "./errors.js";
 import type { StoredInputFile } from "./files.js";
 import type { Agent, PageQuery } from "./protocol.js";
-import {
-  ApiError,
-  canonicalJSON,
-  identifier,
-  parse,
-  rpcFailure,
-  savedAgentSchema,
-} from "./protocol.js";
+import { ApiError, canonicalJSON, identifier, parse, savedAgentSchema } from "./protocol.js";
 import type { SessionRecord } from "./session.js";
 import { SkillRepository } from "./skills.js";
 import { SqlStore } from "./storage.js";
@@ -31,6 +26,13 @@ export interface Reservation {
   ready: boolean;
   fingerprint: string;
 }
+const reservationSchema = Schema.declare<Reservation>(
+  (input): input is Reservation =>
+    typeof input === "object" && input !== null && "id" in input && "record" in input,
+);
+/** String carriers: the RPC type of the session record inside a reservation is too deep. */
+export const ReservationResult = Schema.parseJson(rpcEnvelope(Schema.NullOr(reservationSchema)));
+export const ReserveResult = Schema.parseJson(rpcEnvelope(reservationSchema));
 
 /** One catalog per authenticated tenant, never one global object. */
 export class CatalogObject extends DurableObject {
@@ -163,42 +165,41 @@ export class CatalogObject extends DurableObject {
     return this.db.require<EnvironmentSpec>("environment", id);
   }
   reservation(key: string, fingerprint: string): string {
-    try {
-      const previous = this.db.get<Reservation>("reservation", key);
-      if (previous && previous.fingerprint !== fingerprint)
-        throw new ApiError(
-          409,
-          "idempotency_conflict",
-          "Key was used with different session parameters",
-        );
-      return JSON.stringify({ ok: true, value: previous ?? null });
-    } catch (error) {
-      return JSON.stringify(rpcFailure(error));
-    }
+    return runSync(
+      encodeRpc(
+        ReservationResult,
+        attempt("catalog.reservation", () => {
+          const previous = this.db.get<Reservation>("reservation", key);
+          if (previous && previous.fingerprint !== fingerprint)
+            throw new IdempotencyConflict({ subject: "session parameters" });
+          return previous ?? null;
+        }),
+      ),
+      "catalog.reservation",
+    );
   }
   reserve(key: string, fingerprint: string, record: SessionRecord): string {
-    try {
-      const value = this.db.transaction(() => {
-        const previous = this.db.get<Reservation>("reservation", key);
-        if (previous) {
-          if (previous.fingerprint !== fingerprint)
-            throw new ApiError(
-              409,
-              "idempotency_conflict",
-              "Key was used with different session parameters",
-            );
-          return previous;
-        }
-        const reservation = { id: record.session.id, record, ready: false, fingerprint };
-        this.db.put("reservation", key, reservation);
-        // Deletion finds the reservation by session, so the key's record can be removed.
-        this.db.put("reservation_session", record.session.id, { key });
-        return reservation;
-      });
-      return JSON.stringify({ ok: true, value });
-    } catch (error) {
-      return JSON.stringify(rpcFailure(error));
-    }
+    return runSync(
+      encodeRpc(
+        ReserveResult,
+        attempt("catalog.reserve", () =>
+          this.db.transaction(() => {
+            const previous = this.db.get<Reservation>("reservation", key);
+            if (previous) {
+              if (previous.fingerprint !== fingerprint)
+                throw new IdempotencyConflict({ subject: "session parameters" });
+              return previous;
+            }
+            const reservation = { id: record.session.id, record, ready: false, fingerprint };
+            this.db.put("reservation", key, reservation);
+            // Deletion finds the reservation by session, so the key's record can be removed.
+            this.db.put("reservation_session", record.session.id, { key });
+            return reservation;
+          }),
+        ),
+      ),
+      "catalog.reserve",
+    );
   }
   commit(key: string): void {
     this.db.transaction(() => {
@@ -247,11 +248,7 @@ export class CatalogObject extends DurableObject {
       const previous = this.db.get<{ fingerprint: string; id: string }>("agent_key", key);
       if (previous) {
         if (previous.fingerprint !== fingerprint)
-          throw new ApiError(
-            409,
-            "idempotency_conflict",
-            "Key was used with different agent parameters",
-          );
+          throw new IdempotencyConflict({ subject: "agent parameters" });
         return this.agent(previous.id);
       }
       this.db.put("agent", agent.id, agent);
