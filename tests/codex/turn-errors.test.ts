@@ -7,7 +7,12 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, expect, it } from "vitest";
 
-import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
+import {
+  type Execution,
+  type RuntimeBatch,
+  type RuntimeEvent,
+  runPromise,
+} from "../../packages/agent-api/src/index.js";
 import { CodexJob, type CodexOptions, turnErrorCode } from "../../packages/supervisor/src/codex.js";
 
 const cleanup: (() => Promise<unknown>)[] = [];
@@ -95,13 +100,13 @@ async function runCodex(
     diagnostics: (line) => diagnostics.push(line),
     ...(overrides.codexConfig ? { codexConfig: overrides.codexConfig } : {}),
   });
-  cleanup.push(() => job.stop());
-  await job.start();
-  let batch: RuntimeBatch = job.poll(0);
+  cleanup.push(() => runPromise(job.stop()));
+  await runPromise(job.start());
+  let batch: RuntimeBatch = await runPromise(job.poll(0));
   const events: RuntimeEvent[] = [];
   let after = 0;
   for (let attempt = 0; attempt < 400; attempt++) {
-    batch = job.poll(after);
+    batch = await runPromise(job.poll(after));
     events.push(...batch.events.map((entry) => entry.event));
     after = batch.cursor;
     if (batch.status !== "running" && batch.status !== "waiting") break;

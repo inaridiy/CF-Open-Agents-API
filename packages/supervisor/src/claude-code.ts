@@ -349,6 +349,8 @@ export class ClaudeCodeJob extends ToolJob {
             child.once("exit", () => resolve());
             child.once("error", () => resolve());
           });
+          // The job's resources terminate the CLI if the SDK's own shutdown leaves it running.
+          void this.own(child, `${EXIT_GRACE_MS} millis`).catch(() => {});
           return child;
         },
         env: {

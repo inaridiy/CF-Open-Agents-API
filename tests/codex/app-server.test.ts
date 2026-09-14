@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { Exit, Scope } from "effect";
 import { afterEach, expect, it } from "vitest";
 
+import { runPromise } from "../../packages/agent-api/src/index.js";
 import { AppServer } from "../../packages/supervisor/src/json-rpc.js";
 
 /**
@@ -28,6 +30,19 @@ afterEach(async () => {
   for (const callback of cleanup.reverse()) await callback();
   cleanup.length = 0;
 });
+/** Acquire an app-server into its own Scope; the cleanup closes the Scope, which terminates it. */
+async function acquire(binary: string, directory: string, onDiagnostic: (line: string) => void) {
+  const scope = await runPromise(Scope.make());
+  cleanup.push(() => runPromise(Scope.close(scope, Exit.void)));
+  const server = await runPromise(
+    Scope.extend(AppServer.acquire({ binary, directory, home: directory, onDiagnostic }), scope),
+  );
+  return {
+    server,
+    exited: runPromise(server.exited),
+    request: (method: string, params: unknown) => runPromise(server.request(method, params)),
+  };
+}
 async function fakeBinary() {
   const directory = await mkdtemp(join(tmpdir(), "cf-fake-app-server-"));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
@@ -44,19 +59,10 @@ async function fakeBinary() {
 it("drops a malformed app-server line without failing the request in flight", async () => {
   const { directory, binary } = await fakeBinary();
   const diagnostics: string[] = [];
-  const exited = Promise.withResolvers<void>();
-  const server = new AppServer({
-    binary,
-    directory,
-    home: directory,
-    onMessage: () => {},
-    onExit: () => exited.resolve(),
-    onDiagnostic: (line) => diagnostics.push(line),
-  });
-  cleanup.push(() => server.stop());
-  await expect(server.request("initialize", {})).resolves.toEqual({ method: "initialize" });
+  const { request } = await acquire(binary, directory, (line) => diagnostics.push(line));
+  await expect(request("initialize", {})).resolves.toEqual({ method: "initialize" });
   expect(diagnostics.some((line) => line.includes("dropped malformed message"))).toBe(true);
-  await expect(server.request("thread/start", {})).resolves.toEqual({ method: "thread/start" });
+  await expect(request("thread/start", {})).resolves.toEqual({ method: "thread/start" });
 });
 
 it("writes to an exited app-server are dropped instead of crashing the process", async () => {
@@ -67,18 +73,11 @@ it("writes to an exited app-server are dropped instead of crashing the process",
   cleanup.push(async () => {
     process.off("uncaughtException", onUncaught);
   });
-  const exited = Promise.withResolvers<void>();
   const diagnostics: string[] = [];
-  const server = new AppServer({
-    binary,
-    directory,
-    home: directory,
-    onMessage: () => {},
-    onExit: () => exited.resolve(),
-    onDiagnostic: (line) => diagnostics.push(line),
-  });
-  cleanup.push(() => server.stop());
-  await server.request("initialize", {});
+  const { server, exited, request } = await acquire(binary, directory, (line) =>
+    diagnostics.push(line),
+  );
+  await request("initialize", {});
   server.notify("exit-now");
   // Racing writes while the child is going away exercise the broken-pipe path.
   for (let i = 0; i < 50; i++) {
@@ -87,27 +86,19 @@ it("writes to an exited app-server are dropped instead of crashing the process",
     server.reject(i);
     await delay(2);
   }
-  await exited.promise;
+  await exited;
   server.notify("after-exit");
   server.respond(1, {});
-  await expect(server.request("initialize", {})).rejects.toThrow("App-server is closed");
+  await expect(request("initialize", {})).rejects.toThrow("App-server is closed");
   await delay(50);
   expect(uncaught).toEqual([]);
 });
 
 it("the exit of the app-server rejects requests that were still pending", async () => {
   const { directory, binary } = await fakeBinary();
-  const server = new AppServer({
-    binary,
-    directory,
-    home: directory,
-    onMessage: () => {},
-    onExit: () => {},
-    onDiagnostic: () => {},
-  });
-  cleanup.push(() => server.stop());
-  await server.request("initialize", {});
-  const pending = server.request("never-answered", {});
+  const { server, request } = await acquire(binary, directory, () => {});
+  await request("initialize", {});
+  const pending = request("never-answered", {});
   server.notify("exit-now");
   await expect(pending).rejects.toThrow("App-server exited");
   await once(server as unknown as NodeJS.EventEmitter, "never").catch(() => {});

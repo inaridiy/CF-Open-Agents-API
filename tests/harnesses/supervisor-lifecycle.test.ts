@@ -2,11 +2,12 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { expect, it } from "vitest";
 
-import type {
-  Execution,
-  RuntimeBatch,
-  RuntimeCommand,
-  RuntimeEvent,
+import {
+  type Execution,
+  type RuntimeBatch,
+  type RuntimeCommand,
+  type RuntimeEvent,
+  runPromise,
 } from "../../packages/agent-api/src/index.js";
 import { type NativeOptions, ToolJob } from "../../packages/supervisor/src/job.js";
 import { EVENT_LOG_LIMIT } from "../../packages/supervisor/src/lifecycle.js";
@@ -58,7 +59,7 @@ class ProbeJob extends ToolJob {
   }
   protected override async closeRuntime() {}
   delegate(prompt: string) {
-    return this.delegations.call("cf_delegate", { model: "helper", prompt });
+    return this.perform(this.delegations.call("cf_delegate", { model: "helper", prompt }));
   }
   call(name = "lookup", invocation?: string) {
     return this.externalTool(name, {}, invocation);
@@ -103,14 +104,14 @@ it("a delegated child that overflows the event log fails the parent instead of t
     diagnostics: (line) => diagnostics.push(line),
   });
   try {
-    await job.start();
+    await runPromise(job.start());
     await job.delegate("overflow");
     await expect.poll(() => job.status, { timeout: 5_000, interval: 25 }).toBe("failed");
-    expect(job.poll(0).error).toBe("native_output_limit");
+    expect((await runPromise(job.poll(0))).error).toBe("native_output_limit");
     await delay(50);
     expect(unhandled).toEqual([]);
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await delegate.close();
   }
 });
@@ -123,16 +124,18 @@ it("a tool registered during an image fetch survives the result that raced it", 
   });
   const job = new ProbeJob(execution, { ...baseOptions, mediaUrl: media.url });
   try {
-    await job.start();
+    await runPromise(job.start());
     const first = job.call();
-    const firstCall = job.poll(0).events[0]?.event;
+    const firstCall = (await runPromise(job.poll(0))).events[0]?.event;
     if (firstCall?.type !== "function_call") throw new Error("Missing first call");
-    const result = job.control("first-result", {
-      type: "tool_result",
-      callId: firstCall.callId,
-      success: true,
-      output: [{ type: "input_image", image_url: "https://image.fixture/proof.png" }],
-    });
+    const result = runPromise(
+      job.control("first-result", {
+        type: "tool_result",
+        callId: firstCall.callId,
+        success: true,
+        output: [{ type: "input_image", image_url: "https://image.fixture/proof.png" }],
+      }),
+    );
     // The second call registers while the first result is still fetching its image.
     await delay(50);
     const second = job.call();
@@ -141,18 +144,20 @@ it("a tool registered during an image fetch survives the result that raced it", 
     await result;
     expect((await first).content[0]).toMatchObject({ type: "image", mimeType: "image/png" });
     expect(job.status).toBe("waiting");
-    const secondCall = job.poll(0).events.at(-1)?.event;
+    const secondCall = (await runPromise(job.poll(0))).events.at(-1)?.event;
     if (secondCall?.type !== "function_call") throw new Error("Missing second call");
-    await job.control("second-result", {
-      type: "tool_result",
-      callId: secondCall.callId,
-      success: true,
-      output: "late",
-    });
+    await runPromise(
+      job.control("second-result", {
+        type: "tool_result",
+        callId: secondCall.callId,
+        success: true,
+        output: "late",
+      }),
+    );
     expect((await second).content).toEqual([{ type: "text", text: "late" }]);
     expect(job.status).toBe("running");
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await media.close();
   }
 });
@@ -167,9 +172,9 @@ it("a transient media failure is retryable under the same operation ID", async (
   });
   const job = new ProbeJob(execution, { ...baseOptions, mediaUrl: media.url });
   try {
-    await job.start();
+    await runPromise(job.start());
     const pending = job.call();
-    const call = job.poll(0).events[0]?.event;
+    const call = (await runPromise(job.poll(0))).events[0]?.event;
     if (call?.type !== "function_call") throw new Error("Missing call");
     const command: RuntimeCommand = {
       type: "tool_result",
@@ -177,12 +182,12 @@ it("a transient media failure is retryable under the same operation ID", async (
       success: true,
       output: [{ type: "input_image", image_url: "https://image.fixture/proof.png" }],
     };
-    await expect(job.control("same-op", command)).rejects.toThrow();
-    await job.control("same-op", command);
+    await expect(runPromise(job.control("same-op", command))).rejects.toThrow();
+    await runPromise(job.control("same-op", command));
     expect((await pending).content[0]).toMatchObject({ type: "image" });
     expect(attempts).toBe(2);
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await media.close();
   }
 });
@@ -193,23 +198,25 @@ it("code execution errors only count calls the code itself raised", async () => 
   );
   const job = new ProbeJob(execution, { ...baseOptions, programmaticUrl: runner.url });
   try {
-    await job.start();
+    await runPromise(job.start());
     // A native function call is outstanding while the model runs code.
     const native = job.call();
     const result = await job.code({ code: "throw new Error('boom')" });
     expect(result.isError).toBe(true);
     expect(job.status).toBe("waiting");
-    const call = job.poll(0).events[0]?.event;
+    const call = (await runPromise(job.poll(0))).events[0]?.event;
     if (call?.type !== "function_call") throw new Error("Missing call");
-    await job.control("native-result", {
-      type: "tool_result",
-      callId: call.callId,
-      success: true,
-      output: "ok",
-    });
+    await runPromise(
+      job.control("native-result", {
+        type: "tool_result",
+        callId: call.callId,
+        success: true,
+        output: "ok",
+      }),
+    );
     expect((await native).isError).toBe(false);
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await runner.close();
   }
 });
@@ -231,19 +238,19 @@ it("stopping a parent with an unresponsive delegate route completes within its b
     delegationTimeouts: { requestMs: 500, cancelMs: 300, settleMs: 200 },
   });
   try {
-    await job.start();
+    await runPromise(job.start());
     await job.delegate("hang");
     const started = Date.now();
-    await job.control("cancel", { type: "cancel" });
+    await runPromise(job.control("cancel", { type: "cancel" }));
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(job.status).toBe("cancelled");
     expect(
-      job
-        .poll(0)
-        .events.some(({ event }) => event.type === "subagent_turn" && event.status === "cancelled"),
+      (await runPromise(job.poll(0))).events.some(
+        ({ event }) => event.type === "subagent_turn" && event.status === "cancelled",
+      ),
     ).toBe(true);
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await delegate.close();
   }
 });

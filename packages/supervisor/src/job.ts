@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -19,24 +20,44 @@ import {
   type RuntimeBatch,
   type RuntimeCommand,
   type RuntimeEvent,
-  runPromise,
-  runSync,
   type ServiceError,
   type WorkspaceToolName,
   workspaceTools,
 } from "cf-open-agents-api";
-import { Deferred, Effect, Exit, Fiber, Ref, Scope } from "effect";
+import {
+  Cause,
+  Data,
+  Deferred,
+  type Duration,
+  Effect,
+  ExecutionStrategy,
+  Exit,
+  FiberId,
+  MutableRef,
+  Option,
+  Scope,
+} from "effect";
 import { z } from "zod";
 
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
-import { describeFailure, JobLifecycle, Operations, once } from "./lifecycle.js";
+import {
+  CheckpointUnavailable,
+  describeFailure,
+  ExecutionStopped,
+  type InvalidCursor,
+  JobLog,
+  once,
+  Operations,
+  Wake,
+} from "./lifecycle.js";
 import { imageContent } from "./media.js";
+import { ownProcess } from "./process.js";
 import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
 import { RemoteTools } from "./remote-tools.js";
 import { executeWorkspace } from "./workspace.js";
 
-type ToolResult = {
+export type ToolResult = {
   content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
   isError: boolean;
 };
@@ -47,41 +68,98 @@ export interface ToolScope {
   turnId: string;
 }
 
+/** A tool the caller named cannot be called from here; the message says why. */
+export class ToolUnavailable extends Data.TaggedError("ToolUnavailable")<{
+  readonly message: string;
+}> {}
+export type ToolError = ToolUnavailable | ServiceError;
+
 export interface NativeJob {
   readonly execution: Execution;
   readonly status: RuntimeBatch["status"];
-  start(bundle?: unknown): Promise<void>;
-  poll(after: number): RuntimeBatch;
-  control(operationId: string, command: RuntimeCommand): Promise<void>;
-  checkpoint(): Promise<NativeBundle>;
-  stop(): Promise<void>;
+  start(bundle?: unknown): Effect.Effect<void, ServiceError>;
+  /** Events after `after`; with `wait`, blocks up to that long for news unless the outcome is terminal. */
+  poll(after: number, wait?: Duration.DurationInput): Effect.Effect<RuntimeBatch, InvalidCursor>;
+  control(operationId: string, command: RuntimeCommand): Effect.Effect<void, ServiceError>;
+  checkpoint(): Effect.Effect<NativeBundle, ServiceError>;
+  stop(): Effect.Effect<void>;
   failStart(error: unknown): void;
-  mcp?(request: Request): Promise<Response>;
-  codeTool?(name: string, args: unknown, invocation: string): Promise<JsonValue>;
-  codeTools?(invocation: string): Promise<string[]>;
+  mcp?(request: Request): Effect.Effect<Response, ServiceError>;
+  codeTool?(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError>;
+  codeTools?(invocation: string): Effect.Effect<string[], ToolError>;
   workspace?(
     name: WorkspaceToolName,
     args: unknown,
-  ): Promise<{ text: string; exitCode: number | null }>;
+  ): Effect.Effect<{ text: string; exitCode: number | null }, ServiceError>;
 }
 
-export interface NativeOptions {
+/** What every native runtime needs from its deployment. */
+export interface JobOptions {
   directory: string;
-  modelBaseUrl: string;
   sandboxUrl: string;
-  supervisorUrl: string;
-  opencodeBinary: string;
-  diagnostics(line: string): void;
+  diagnostics: (line: string) => void;
   programmaticUrl?: string;
-  mediaUrl?: string;
   delegateUrl?: string;
   /** Bounds for delegate round trips; tests shorten them. */
   delegationTimeouts?: DelegationOptions["timeouts"];
 }
+export interface NativeOptions extends JobOptions {
+  modelBaseUrl: string;
+  supervisorUrl: string;
+  opencodeBinary: string;
+  mediaUrl?: string;
+}
 
-/** Shared transport/lifecycle bookkeeping; inference remains in the native harness. */
-export abstract class ToolJob implements NativeJob {
-  protected readonly lifecycle = new JobLifecycle();
+const toServiceError =
+  (operation: string) =>
+  (cause: unknown): ServiceError =>
+    cause instanceof ApiError ? cause : new OperationError({ operation, cause });
+
+/**
+ * Lifecycle shared by every native runtime. `start` creates the job's Scope and
+ * registers the stop sequence as finalizers; every process, fiber and relay is
+ * acquired into a child scope that closes last. `stop()` closes the Scope, so the
+ * order below is the only definition of shutdown:
+ *
+ *   requestCancel → delegations.cancelAll → interruptTurn → log sealed → abort →
+ *   pending calls failed → teardown (remote tools, runtime closed) → resources closed
+ *   (task and relay fibers interrupted and awaited, processes terminated).
+ *
+ * Native SDK callbacks run outside any fiber; `perform` hands their Effects to a
+ * worker fiber the resource scope owns, so stopping interrupts them for real.
+ */
+export abstract class Job<Prepared = void> implements NativeJob {
+  protected readonly lifecycle = new JobLog();
+  protected readonly abort = new AbortController();
+  protected readonly delegations: Delegations;
+  abstract readonly home: string;
+  private readonly transition = Effect.unsafeMakeSemaphore(1);
+  private readonly operations = new Operations();
+  /** The job's Scope, created by `start`; `stop` closes it. */
+  private readonly owner = MutableRef.make(Option.none<Scope.CloseableScope>());
+  /** Child scope holding the runtime, its fibers and relays; closed last. */
+  private readonly resources = MutableRef.make(Option.none<Scope.CloseableScope>());
+  private readonly inbox = MutableRef.make<Effect.Effect<void, never, Scope.Scope>[]>([]);
+  private readonly wake = new Wake();
+  /** Completed by a native callback that needs the job stopped; a daemon fiber runs the stop. */
+  private readonly stopRequested = Deferred.unsafeMake<void>(FiberId.none);
+  constructor(
+    readonly execution: Execution,
+    protected readonly options: JobOptions,
+  ) {
+    this.delegations = new Delegations(execution, {
+      endpoint: options.delegateUrl ?? "http://delegate.internal",
+      signal: this.abort.signal,
+      emit: (event) => this.emit(event),
+      fail: (error) => {
+        this.lifecycle.fail(error);
+        this.requestStop();
+      },
+      settled: () => this.settled(),
+      diagnostics: (line) => options.diagnostics(line),
+      ...(options.delegationTimeouts ? { timeouts: options.delegationTimeouts } : {}),
+    });
+  }
   get status() {
     return this.lifecycle.status;
   }
@@ -91,77 +169,221 @@ export abstract class ToolJob implements NativeJob {
   protected get cancelling() {
     return this.lifecycle.cancelling;
   }
-  protected sessionId = "";
-  protected readonly abort = new AbortController();
-  private readonly scope = runSync(Scope.make());
-  private task?: Fiber.RuntimeFiber<void, never>;
-  private readonly pending = Ref.unsafeMake(
-    new Map<string, Deferred.Deferred<ToolResult, Error>>(),
+  /** Native thread/session identifier a checkpoint records; undefined until known. */
+  protected abstract get thread(): string | undefined;
+  /** Bring the runtime up inside the resource Scope: processes, consumers, relays. */
+  protected abstract acquire(bundle?: unknown): Effect.Effect<void, unknown, Scope.Scope>;
+  /** Ask the runtime to end the turn gracefully before the log seals; bounded by the implementation. */
+  protected interruptTurn(): Effect.Effect<void, unknown> {
+    return Effect.void;
+  }
+  /** Fail calls still waiting on a client result; runs after the log is sealed. */
+  protected abandon(): void {}
+  /** Close what `acquire` opened outside the resource Scope; runs before that Scope closes. */
+  protected teardown(): Effect.Effect<void, unknown> {
+    return Effect.void;
+  }
+  /** Runs after the runtime has stopped and before the home is captured. */
+  protected beforeCapture(): Effect.Effect<void, unknown> {
+    return Effect.void;
+  }
+  /** A delegated child reached a terminal status. */
+  protected settled(): void {}
+  /** Work done before the memoized operation, so a transient failure stays retryable under the same ID. */
+  protected abstract prepareCommand(command: RuntimeCommand): Effect.Effect<Prepared, ServiceError>;
+  /**
+   * `command_rejected` means the command can never apply to this execution; the
+   * HarnessDO forwards it as such. Other failures are transient I/O errors.
+   */
+  protected abstract apply(
+    operationId: string,
+    command: RuntimeCommand,
+    prepared: Prepared,
+  ): Effect.Effect<void, unknown>;
+
+  start(bundle?: unknown): Effect.Effect<void, ServiceError> {
+    return this.transition.withPermits(1)(
+      Effect.gen(this, function* () {
+        if (this.closing) return yield* new ExecutionStopped();
+        const scope = yield* Scope.make();
+        MutableRef.set(this.owner, Option.some(scope));
+        yield* Scope.extend(this.bringUp(bundle), scope);
+        // A stop requested from a native callback must not run on a fiber the stop
+        // interrupts, so it gets its own; it ends as soon as the job has stopped.
+        yield* Deferred.await(this.stopRequested).pipe(
+          Effect.zipRight(this.stop()),
+          Effect.forkDaemon,
+        );
+      }).pipe(
+        Effect.onError((cause) =>
+          Effect.sync(() => this.failStart(cause)).pipe(Effect.zipRight(this.stopped)),
+        ),
+        Effect.mapError(toServiceError("native.start")),
+      ),
+    );
+  }
+  /** Finalizers run in reverse registration order: read this list bottom-up for the stop sequence. */
+  private bringUp(bundle?: unknown): Effect.Effect<void, unknown, Scope.Scope> {
+    return Effect.gen(this, function* () {
+      const resources = yield* Scope.fork(yield* Effect.scope, ExecutionStrategy.sequential);
+      yield* Effect.addFinalizer(() => this.teardown().pipe(this.diagnosed("teardown")));
+      yield* Effect.addFinalizer(() => Effect.sync(() => this.abandon()));
+      yield* Effect.addFinalizer(() => Effect.sync(() => this.abort.abort()));
+      yield* Effect.addFinalizer(() => Effect.sync(() => this.lifecycle.close()));
+      yield* Effect.addFinalizer(() => this.interruptTurn().pipe(this.diagnosed("interrupt")));
+      yield* Effect.addFinalizer(() => this.delegations.cancelAll());
+      yield* Effect.addFinalizer(() => Effect.sync(() => this.lifecycle.requestCancel()));
+      MutableRef.set(this.resources, Option.some(resources));
+      yield* Scope.extend(this.worker.pipe(Effect.forkScoped), resources);
+      yield* Scope.extend(this.acquire(bundle), resources);
+    });
+  }
+  private diagnosed(step: string) {
+    return <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<void> =>
+      effect.pipe(
+        Effect.asVoid,
+        Effect.catchAllCause((cause) =>
+          Effect.sync(() => this.options.diagnostics(`${step} failed: ${describeFailure(cause)}`)),
+        ),
+      );
+  }
+  /** Runs Effects handed over from callback land; each becomes a child fiber of this worker. */
+  private readonly worker = Effect.forever(
+    Effect.gen(this, function* () {
+      const woken = this.wake.wait();
+      const items = MutableRef.getAndSet(this.inbox, []);
+      yield* Effect.forEach(items, (item) => Effect.fork(item), { discard: true });
+      yield* woken;
+    }),
   );
-  private readonly operations = new Operations();
+  /**
+   * Run an Effect on behalf of a native callback (an SDK tool handler, a JSON-RPC
+   * request) as a fiber owned by this job's resources. Stopping the job interrupts
+   * it; the Promise then rejects with the squashed cause.
+   */
+  protected perform<A, E>(effect: Effect.Effect<A, E, Scope.Scope>): Promise<A> {
+    const { promise, resolve, reject } = Promise.withResolvers<A>();
+    if (this.closing || Option.isNone(MutableRef.get(this.resources))) {
+      reject(new ExecutionStopped());
+      return promise;
+    }
+    MutableRef.update(this.inbox, (items) => [
+      ...items,
+      effect.pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() =>
+            Exit.match(exit, {
+              onFailure: (cause) => reject(Cause.squash(cause)),
+              onSuccess: resolve,
+            }),
+          ),
+        ),
+        Effect.ignore,
+      ),
+    ]);
+    this.wake.notify();
+    return promise;
+  }
+  /** Terminate a process the runtime spawned when this job's resources close. */
+  protected own(child: ChildProcess, grace: Duration.DurationInput): Promise<void> {
+    return this.perform(ownProcess(child, grace).pipe(Effect.asVoid));
+  }
+  /** The native turn: completion waits for delegated children, like native Codex children. */
+  protected run(task: () => Promise<void>): void {
+    void this.perform(
+      io("native.run", () => task()).pipe(
+        Effect.zipRight(this.delegations.settle()),
+        Effect.tap(() => Effect.sync(() => this.lifecycle.setStatus("completed"))),
+        Effect.catchAllCause((cause) =>
+          Effect.sync(() => {
+            // A stop interrupts the task deliberately; that is not a harness failure.
+            if (!this.closing) this.failStart(cause);
+          }),
+        ),
+      ),
+    ).catch(() => {});
+  }
+  private readonly stopped: Effect.Effect<void> = once(
+    Effect.gen(this, function* () {
+      const scope = MutableRef.get(this.owner);
+      // Never started: nothing to release, but the log seals so late results are refused.
+      if (Option.isSome(scope))
+        yield* Scope.close(scope.value, Exit.void).pipe(this.diagnosed("stop"));
+      else this.lifecycle.close();
+      yield* Deferred.complete(this.stopRequested, Effect.void);
+    }),
+  );
+  stop(): Effect.Effect<void> {
+    return this.transition.withPermits(1)(this.stopped);
+  }
+  /** Stop from callback land; the daemon forked by `start` performs it. */
+  protected requestStop(): void {
+    Deferred.unsafeDone(this.stopRequested, Effect.void);
+  }
+  private readonly saved = once(
+    Effect.gen(this, function* () {
+      const thread = this.thread;
+      if (this.status !== "completed" || !thread)
+        return yield* new CheckpointUnavailable({
+          reason: "Native turn must complete before checkpointing",
+        });
+      yield* this.stop();
+      yield* this.beforeCapture();
+      return yield* capture(this.home, thread);
+    }).pipe(Effect.mapError(toServiceError("native.checkpoint"))),
+  );
+  checkpoint(): Effect.Effect<NativeBundle, ServiceError> {
+    return this.saved;
+  }
+  control(operationId: string, command: RuntimeCommand): Effect.Effect<void, ServiceError> {
+    return Effect.gen(this, function* () {
+      const prepared = yield* this.prepareCommand(command);
+      yield* this.operations.perform(
+        operationId,
+        command,
+        this.transition.withPermits(1)(
+          this.apply(operationId, command, prepared).pipe(
+            Effect.mapError(toServiceError("native.control")),
+          ),
+        ),
+      );
+    });
+  }
+  /** Cancel under the transition permit: the memoized cancel command joins any stop in flight. */
+  protected get cancel(): Effect.Effect<void> {
+    return this.stopped;
+  }
+  poll(after: number, wait?: Duration.DurationInput) {
+    return this.lifecycle.poll(after, wait);
+  }
+  /** The public error is a stable code; the native reason goes to diagnostics. */
+  failStart(error: unknown): void {
+    this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
+    this.lifecycle.fail("native_harness_failed");
+  }
+  /** Exceeding the retained event budget fails the job; the runtime is then stopped. */
+  protected emit(event: RuntimeEvent): void {
+    if (!this.lifecycle.emit(event) && this.status === "failed" && !this.closing)
+      this.requestStop();
+  }
+}
+
+/** The client-tool bridge shared by the SDK-driven runtimes; inference remains in the native harness. */
+export abstract class ToolJob extends Job<ToolResult["content"]> {
+  protected sessionId = "";
   protected readonly remoteTools = new RemoteTools(this.abort.signal, (event) => this.emit(event));
-  protected readonly delegations: Delegations;
+  private readonly pending = new Map<string, Deferred.Deferred<ToolResult, ExecutionStopped>>();
   private readonly discovered = new Set<string>();
   /** Client function calls raised by each live code invocation; settled calls leave the set. */
   private readonly codeCalls = new Map<string, Set<string>>();
-  private readonly saved = once("native.checkpoint", async () => {
-    if (this.status !== "completed" || !this.sessionId)
-      throw new Error("Native turn must complete before checkpointing");
-    await this.stop();
-    return capture(this.home, this.sessionId);
-  });
-  private readonly stopped = once("native.stop", async () => {
-    // Children are told first, while their terminal events are still recorded and
-    // this job can still reach its HarnessDO route; closing then seals the log.
-    // A task that finishes meanwhile reads as cancelled, never completed.
-    this.lifecycle.requestCancel();
-    await this.delegations.cancelAll();
-    // A runtime that can stop gracefully reports its final usage before the log seals.
-    await this.interruptRuntime().catch((error) =>
-      this.options.diagnostics(`interrupt failed: ${describeFailure(error)}`),
-    );
-    this.lifecycle.close();
-    this.abort.abort();
-    const pending = runSync(Ref.getAndSet(this.pending, new Map()));
-    for (const result of pending.values())
-      runSync(Deferred.fail(result, new Error("Execution stopped")));
-    await this.remoteTools.close();
-    await this.closeRuntime();
-    await runPromise(Scope.close(this.scope, Exit.void));
-    if (this.task) await runPromise(Fiber.await(this.task));
-  });
-  abstract readonly home: string;
   constructor(
-    readonly execution: Execution,
-    protected readonly options: NativeOptions,
+    execution: Execution,
+    protected override readonly options: NativeOptions,
   ) {
-    this.delegations = new Delegations(execution, {
-      endpoint: options.delegateUrl ?? "http://delegate.internal",
-      signal: this.abort.signal,
-      emit: (event) => this.emit(event),
-      fail: (error) => {
-        this.lifecycle.fail(error);
-        void this.stop().catch(() => options.diagnostics("Failed to stop after child failure"));
-      },
-      diagnostics: (line) => options.diagnostics(line),
-      ...(options.delegationTimeouts ? { timeouts: options.delegationTimeouts } : {}),
-    });
+    super(execution, options);
   }
-  start(bundle?: unknown): Promise<void> {
-    return runPromise(
-      this.lifecycle.transition.withPermits(1)(
-        io("native.start", async () => {
-          if (this.closing) throw new Error("Execution has stopped");
-          await this.open(bundle);
-        }).pipe(
-          Effect.onError((cause) =>
-            Effect.sync(() => this.failStart(cause)).pipe(
-              Effect.zipRight(this.stopped.pipe(Effect.orDie)),
-            ),
-          ),
-        ),
-      ),
-    );
+  protected get thread() {
+    return this.sessionId || undefined;
   }
   protected abstract open(bundle?: unknown): Promise<void>;
   protected abstract closeRuntime(): Promise<void>;
@@ -183,45 +405,32 @@ export abstract class ToolJob implements NativeJob {
       new ApiError(409, "command_rejected", "This harness cannot steer an active turn"),
     );
   }
+  protected acquire(bundle?: unknown) {
+    return io("native.open", () => this.open(bundle));
+  }
+  /** Reset the native home, restore a checkpoint into it and connect remote MCP tools. */
   protected async prepare(bundle?: unknown): Promise<string | undefined> {
     await rm(this.home, { recursive: true, force: true });
     await mkdir(this.home, { recursive: true });
-    const previous = bundle ? await restore(this.home, bundle) : undefined;
+    const previous = bundle ? await this.perform(restore(this.home, bundle)) : undefined;
     await this.remoteTools.open(this.execution);
     return previous;
   }
-  /** Exceeding the retained event budget fails the job; the runtime is then stopped. */
-  protected emit(event: RuntimeEvent): void {
-    if (!this.lifecycle.emit(event) && this.status === "failed" && !this.closing)
-      void this.stop().catch(() => this.options.diagnostics("Failed to stop after output limit"));
+  protected override interruptTurn() {
+    return io("native.interrupt", () => this.interruptRuntime());
   }
-  protected run(task: () => Promise<void>): void {
-    this.task = runSync(
-      io("native.run", async () => {
-        await task();
-        // Like native Codex children, delegated children finish before the parent completes.
-        await this.delegations.settle();
-      }).pipe(
-        Effect.tap(() => Effect.sync(() => this.lifecycle.setStatus("completed"))),
-        Effect.catchAllCause((cause) =>
-          Effect.sync(() => {
-            // A stop interrupts the task deliberately; that is not a harness failure.
-            if (!this.closing) this.failStart(cause);
-          }),
-        ),
-        Effect.forkIn(this.scope),
-      ),
-    );
+  protected override abandon(): void {
+    const failure = Effect.fail(new ExecutionStopped());
+    for (const result of this.pending.values()) Deferred.unsafeDone(result, failure);
+    this.pending.clear();
   }
-  /** The public error is a stable code; the native reason goes to diagnostics. */
-  failStart(error: unknown): void {
-    this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
-    this.lifecycle.fail("native_harness_failed");
+  protected override teardown() {
+    return Effect.gen(this, function* () {
+      yield* io("native.remoteTools.close", () => this.remoteTools.close());
+      yield* io("native.close", () => this.closeRuntime());
+    });
   }
-  poll(after: number): RuntimeBatch {
-    return this.lifecycle.poll(after);
-  }
-  async workspace(
+  private async runWorkspace(
     name: WorkspaceToolName,
     args: unknown,
     scope?: ToolScope,
@@ -232,33 +441,31 @@ export abstract class ToolJob implements NativeJob {
       this.emit(scope ? { ...event, ...scope } : event),
     );
   }
-
+  workspace(name: WorkspaceToolName, args: unknown) {
+    return io("native.workspace", () => this.runWorkspace(name, args));
+  }
+  /** Raise a client function call; the Promise settles with the routed result or the stop. */
   protected externalTool(
     name: string,
     args: unknown,
     invocation?: string,
     scope?: ToolScope,
   ): Promise<ToolResult> {
-    return runPromise(
-      Effect.gen(this, function* () {
-        if (this.closing || this.abort.signal.aborted)
-          return yield* Effect.fail(new Error("Execution has stopped"));
-        const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
-        const result = yield* Deferred.make<ToolResult, Error>();
-        yield* Ref.update(this.pending, (pending) => new Map(pending).set(callId, result));
-        if (invocation) this.codeCalls.get(invocation)?.add(callId);
-        this.emit({
-          type: "function_call",
-          id: callId,
-          callId,
-          name,
-          arguments: z.json().parse(args),
-          ...scope,
-        });
-        this.lifecycle.setStatus("waiting");
-        return yield* Deferred.await(result);
-      }),
-    );
+    if (this.closing || this.abort.signal.aborted) return Promise.reject(new ExecutionStopped());
+    const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
+    const result = Deferred.unsafeMake<ToolResult, ExecutionStopped>(FiberId.none);
+    this.pending.set(callId, result);
+    if (invocation) this.codeCalls.get(invocation)?.add(callId);
+    this.emit({
+      type: "function_call",
+      id: callId,
+      callId,
+      name,
+      arguments: z.json().parse(args),
+      ...scope,
+    });
+    this.lifecycle.setStatus("waiting");
+    return this.perform(Deferred.await(result));
   }
   protected async executeCode(input: unknown) {
     const invocation = crypto.randomUUID();
@@ -280,36 +487,46 @@ export abstract class ToolJob implements NativeJob {
     } catch (error) {
       this.lifecycle.fail("programmatic_execution_uncertain");
       this.abort.abort();
-      void this.stop().catch(() => this.options.diagnostics("Failed to stop code execution"));
+      this.requestStop();
       throw error;
     } finally {
       this.codeCalls.delete(invocation);
     }
   }
-  async codeTools(invocation: string): Promise<string[]> {
-    if (!this.codeCalls.has(invocation)) throw new Error("No active code invocation");
-    return [
-      ...(this.execution.agent.tools ?? []).flatMap((tool) =>
-        tool.type === "function" ? [tool.name] : [],
-      ),
-      ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
-      ...this.remoteTools.tools.map((tool) => tool.codeName),
-    ];
+  codeTools(invocation: string): Effect.Effect<string[], ToolUnavailable> {
+    return Effect.suspend(() =>
+      this.codeCalls.has(invocation)
+        ? Effect.succeed([
+            ...(this.execution.agent.tools ?? []).flatMap((tool) =>
+              tool.type === "function" ? [tool.name] : [],
+            ),
+            ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
+            ...this.remoteTools.tools.map((tool) => tool.codeName),
+          ])
+        : new ToolUnavailable({ message: "No active code invocation" }),
+    );
   }
-  async codeTool(name: string, args: unknown, invocation: string): Promise<JsonValue> {
-    if (!(await this.codeTools(invocation)).includes(name))
-      throw new Error("Tool is not assigned to this code invocation");
-    if (!codeEnabled(this.execution)) throw new Error("Programmatic tool calling is disabled");
-    if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
-      const result = await this.workspace(name as WorkspaceToolName, args);
-      return {
-        content: [{ type: "text", text: result.text }],
-        isError: result.exitCode !== null && result.exitCode !== 0,
-      };
-    }
-    if (this.remoteTools.tools.some((tool) => tool.codeName === name))
-      return this.remoteTools.call(name, args);
-    return this.externalTool(name, functionArguments(this.execution, name, args), invocation);
+  codeTool(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError> {
+    return Effect.gen(this, function* () {
+      if (!(yield* this.codeTools(invocation)).includes(name))
+        return yield* new ToolUnavailable({
+          message: "Tool is not assigned to this code invocation",
+        });
+      if (!codeEnabled(this.execution))
+        return yield* new ToolUnavailable({ message: "Programmatic tool calling is disabled" });
+      if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
+        const result = yield* this.workspace(name as WorkspaceToolName, args);
+        return {
+          content: [{ type: "text", text: result.text }],
+          isError: result.exitCode !== null && result.exitCode !== 0,
+        };
+      }
+      if (this.remoteTools.tools.some((tool) => tool.codeName === name))
+        return yield* io("native.remoteTool", () => this.remoteTools.call(name, args));
+      return yield* io("native.codeTool", () =>
+        this.externalTool(name, functionArguments(this.execution, name, args), invocation),
+      );
+    });
   }
   protected toolDefinitions(): Tool[] {
     const functions = (this.execution.agent.tools ?? []).flatMap((tool, index) =>
@@ -386,7 +603,7 @@ export abstract class ToolJob implements NativeJob {
     if (name === programmaticTool.name && codeEnabled(this.execution))
       return this.executeCode(args);
     if (DELEGATION_TOOLS.has(name) && this.delegations.enabled)
-      return this.delegations.call(name, args);
+      return this.perform(this.delegations.call(name, args));
     if (name === "cf_tool_search") {
       const { query } = z.object({ query: z.string().min(1).max(1000) }).parse(args);
       const terms = query.toLowerCase().split(/\s+/);
@@ -416,7 +633,7 @@ export abstract class ToolJob implements NativeJob {
       );
     }
     if (Object.hasOwn(workspaceTools, name)) {
-      const result = await this.workspace(name as WorkspaceToolName, args, scope);
+      const result = await this.runWorkspace(name as WorkspaceToolName, args, scope);
       return {
         content: [{ type: "text" as const, text: result.text }],
         isError: result.exitCode !== null && result.exitCode !== 0,
@@ -434,7 +651,7 @@ export abstract class ToolJob implements NativeJob {
       scope,
     );
   }
-  async mcp(request: Request): Promise<Response> {
+  mcp(request: Request): Effect.Effect<Response, ServiceError> {
     const server = new Server(
       { name: "cf-workspace", version: "1" },
       { capabilities: { tools: {} } },
@@ -449,33 +666,22 @@ export abstract class ToolJob implements NativeJob {
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-    return runPromise(
-      Effect.scoped(
-        Effect.gen(function* () {
-          yield* Effect.acquireRelease(Effect.succeed(server), (server) =>
-            io("mcp.close", () => server.close()).pipe(Effect.orDie),
-          );
-          yield* io("mcp.connect", () => server.connect(transport));
-          return yield* io("mcp.request", () => transport.handleRequest(request));
-        }),
-      ),
-    );
-  }
-  control(operationId: string, command: RuntimeCommand): Promise<void> {
-    return runPromise(
-      Effect.gen(this, function* () {
-        // Remote image parts are fetched before the memoized operation, so a transient
-        // media failure stays retryable under the same operation ID.
-        const content = command.type === "tool_result" ? yield* this.toolContent(command) : [];
-        yield* this.operations.perform(
-          operationId,
-          command,
-          this.lifecycle.transition.withPermits(1)(this.apply(operationId, command, content)),
+    return Effect.scoped(
+      Effect.gen(function* () {
+        yield* Effect.acquireRelease(Effect.succeed(server), (server) =>
+          io("mcp.close", () => server.close()).pipe(Effect.orDie),
         );
+        yield* io("mcp.connect", () => server.connect(transport));
+        return yield* io("mcp.request", () => transport.handleRequest(request));
       }),
     );
   }
-  private toolContent(command: Extract<RuntimeCommand, { type: "tool_result" }>) {
+  /**
+   * Remote image parts are fetched before the memoized operation, so a transient
+   * media failure stays retryable under the same operation ID.
+   */
+  protected prepareCommand(command: RuntimeCommand) {
+    if (command.type !== "tool_result") return Effect.succeed<ToolResult["content"]>([]);
     const output = command.output;
     if (typeof output === "string")
       return Effect.succeed<ToolResult["content"]>([{ type: "text", text: output }]);
@@ -489,11 +695,7 @@ export abstract class ToolJob implements NativeJob {
       ),
     );
   }
-  /**
-   * `command_rejected` means the command can never apply to this execution; the
-   * HarnessDO forwards it as such. Other failures are transient I/O errors.
-   */
-  private apply(operationId: string, command: RuntimeCommand, content: ToolResult["content"]) {
+  protected apply(operationId: string, command: RuntimeCommand, content: ToolResult["content"]) {
     return Effect.gen(this, function* () {
       const rejected = (message: string) => new ApiError(409, "command_rejected", message);
       if (command.type === "steer") {
@@ -509,7 +711,7 @@ export abstract class ToolJob implements NativeJob {
       }
       if (command.type === "cancel") {
         // Idempotent: closing marks the outcome cancelled unless it is already terminal.
-        yield* this.stopped;
+        yield* this.cancel;
         return;
       }
       const child = this.delegations.owns(command.callId);
@@ -517,43 +719,18 @@ export abstract class ToolJob implements NativeJob {
         // The result belongs to a delegated child's function call.
         if (this.closing) return yield* rejected("Execution has stopped");
         // A child the HarnessDO already closed can never take the result.
-        yield* io("native.delegate", () =>
-          this.delegations.routeToolResult(child, operationId, command),
-        ).pipe(
-          Effect.mapError((error) =>
-            error instanceof OperationError && error.cause instanceof ApiError
-              ? error.cause
-              : error,
-          ),
-        );
+        yield* this.delegations.routeToolResult(child, operationId, command);
         return;
       }
       if (this.closing || this.status !== "waiting")
         return yield* rejected("Execution is not waiting for tools");
       // Remove the call atomically: registrations that raced the image fetch survive.
-      const entry = yield* Ref.modify(this.pending, (pending) => {
-        const result = pending.get(command.callId);
-        if (!result) return [undefined, pending] as const;
-        const next = new Map(pending);
-        next.delete(command.callId);
-        return [{ result, remaining: next.size }, next] as const;
-      });
-      if (!entry) return yield* rejected("No matching pending function call");
+      const result = this.pending.get(command.callId);
+      if (!result) return yield* rejected("No matching pending function call");
+      this.pending.delete(command.callId);
       for (const raised of this.codeCalls.values()) raised.delete(command.callId);
-      this.lifecycle.setStatus(entry.remaining ? "waiting" : "running");
-      yield* Deferred.succeed(entry.result, { content, isError: !command.success });
-    }).pipe(
-      Effect.mapError((cause): ServiceError =>
-        cause instanceof ApiError
-          ? cause
-          : new OperationError({ operation: "native.control", cause }),
-      ),
-    );
-  }
-  checkpoint(): Promise<NativeBundle> {
-    return runPromise(this.saved);
-  }
-  stop(): Promise<void> {
-    return runPromise(this.lifecycle.transition.withPermits(1)(this.stopped));
+      this.lifecycle.setStatus(this.pending.size ? "waiting" : "running");
+      yield* Deferred.succeed(result, { content, isError: !command.success });
+    });
   }
 }
