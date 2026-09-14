@@ -242,7 +242,7 @@ export const createSessionSchema = z.strictObject({
     .optional(),
   metadata: metadataSchema,
   stream: z.boolean().optional(),
-  vault_ids: z.array(z.string().min(1)).max(100).optional(),
+  vault_ids: z.array(z.string().min(1)).max(100).nullable().optional(),
 });
 /** `/cf/v1` extension: continue a session's committed state in a new session. */
 export const forkSessionSchema = z.strictObject({
@@ -301,6 +301,25 @@ export function identifier(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 }
 
+/** Remote images a turn may reference; data URLs travel inline and are not counted. */
+export const IMAGE_LIMIT = 256;
+export function remoteImageURLs(
+  parts: Iterable<{ type: string; image_url?: string }>,
+  into = new Set<string>(),
+): Set<string> {
+  for (const part of parts)
+    if (part.type === "input_image" && part.image_url && !part.image_url.startsWith("data:"))
+      into.add(part.image_url);
+  return into;
+}
+export function assertImageLimit(urls: ReadonlySet<string>): void {
+  if (urls.size > IMAGE_LIMIT)
+    throw new ApiError(
+      413,
+      "image_limit",
+      `At most ${IMAGE_LIMIT} distinct remote images per request`,
+    );
+}
 export function inputMessages(input: NonNullable<CreateSession["input"]>): InputMessage[] {
   return typeof input === "string"
     ? [{ role: "user", content: [{ type: "input_text", text: input }] }]

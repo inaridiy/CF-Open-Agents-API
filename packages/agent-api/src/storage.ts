@@ -150,9 +150,11 @@ export class SqlStore {
   list<T>(
     kind: string,
     query: PageQuery,
-    filter?:
-      | { field: "agent_id" | "environment_id" | "turn_id" | "item.turn_id"; value: string }
-      | { expiresAfter: number },
+    filter?: {
+      field?: "agent_id" | "environment_id" | "turn_id" | "item.turn_id" | "resource.purpose";
+      value?: string;
+      expiresAfter?: number;
+    },
   ): {
     object: "list";
     data: T[];
@@ -164,17 +166,21 @@ export class SqlStore {
       .selectFrom("records")
       .select(["id", "value"])
       .where("kind", "=", kind);
-    if (filter && "field" in filter)
+    if (filter?.field !== undefined && filter.value !== undefined)
       selection = selection.where(
         sql<string>`json_extract(value, ${`$.${filter.field}`})`,
         "=",
         filter.value,
       );
-    if (filter && "expiresAfter" in filter)
+    if (filter?.expiresAfter !== undefined)
       selection = selection.where((eb) =>
         eb.or([
           eb(sql<number>`json_extract(value, '$.resource.expires_at')`, "is", null),
-          eb(sql<number>`json_extract(value, '$.resource.expires_at')`, ">", filter.expiresAfter),
+          eb(
+            sql<number>`json_extract(value, '$.resource.expires_at')`,
+            ">",
+            filter.expiresAfter ?? 0,
+          ),
         ]),
       );
     if (query.after) {
@@ -183,7 +189,7 @@ export class SqlStore {
         .select(["seq", "id"])
         .where("kind", "=", kind)
         .where("id", "=", query.after);
-      if (filter && "field" in filter)
+      if (filter?.field !== undefined && filter.value !== undefined)
         cursorQuery = cursorQuery.where(
           sql<string>`json_extract(value, ${`$.${filter.field}`})`,
           "=",

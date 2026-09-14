@@ -18,7 +18,15 @@ import type {
   PageQuery,
   Turn,
 } from "./protocol.js";
-import { ApiError, canonicalJSON, identifier, type RpcResult, rpcFailure } from "./protocol.js";
+import {
+  ApiError,
+  assertImageLimit,
+  canonicalJSON,
+  identifier,
+  type RpcResult,
+  remoteImageURLs,
+  rpcFailure,
+} from "./protocol.js";
 import {
   type AgentRegistration,
   type Checkpoint,
@@ -295,6 +303,9 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       if (current === status) return;
       // A creation retry reports pending again; a settled environment never regresses.
       if (status === "pending" && current !== undefined) return;
+      // Only a connected sandbox can disconnect, and a failed setup never reconnects.
+      if (status === "disconnected" && current !== "connected") return;
+      if (status === "connected" && current === "failed") return;
       this.db.put("environment", "status", status);
       this.emit({
         type: `agent.session.environment.${status}`,
@@ -468,6 +479,20 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                 "Wait for the current turn to become idle",
               );
             const driver = this.driver(record);
+            const images = new Set<string>();
+            for (const event of events) {
+              if (event.type === "agent.session.input.message")
+                remoteImageURLs(
+                  event.input.flatMap((message) => message.content),
+                  images,
+                );
+              else if (
+                event.type === "agent.session.input.tool_result" &&
+                Array.isArray(event.output)
+              )
+                remoteImageURLs(event.output, images);
+            }
+            assertImageLimit(images);
             for (const event of events) {
               switch (event.type) {
                 case "agent.session.input.message": {
@@ -559,6 +584,11 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
               }
             }
             this.db.put("idempotency", key, fingerprint);
+            // Accepted input counts as activity even when it only queues a command.
+            record = {
+              ...record,
+              session: { ...record.session, last_active_at: Math.floor(Date.now() / 1_000) },
+            };
             this.save(record);
           }),
         );
@@ -1017,6 +1047,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         status: indeterminate ? "failed" : "idle",
         error: error ?? null,
         required_actions: [],
+        last_active_at: Math.floor(Date.now() / 1_000),
       },
     };
     this.save(next);

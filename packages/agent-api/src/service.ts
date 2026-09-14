@@ -33,6 +33,7 @@ import type {
 import {
   ApiError,
   agentConfigSchema,
+  assertImageLimit,
   COMPATIBILITY,
   canonicalJSON,
   createSessionSchema,
@@ -45,6 +46,7 @@ import {
   parse,
   type RpcResult,
   remoteApiError,
+  remoteImageURLs,
   reservedDelegationName,
   savedAgentSchema,
   sessionPageSchema,
@@ -193,8 +195,12 @@ export function createAgentService<Env extends AgentBindings>(
         }
       if (tools.some((tool) => tool.type === "mcp") && !driver.capabilities.mcp)
         throw unsupported("The selected harness does not support MCP servers");
-      if (tools.some((tool) => tool.type === "web_search") && !driver.capabilities.webSearch)
-        throw unsupported("The selected harness does not support web search");
+      // Hosted search needs both a runtime that drives it and a model connection that provides it.
+      if (
+        tools.some((tool) => tool.type === "web_search") &&
+        !(driver.capabilities.webSearch && registration.webSearch === true)
+      )
+        throw unsupported("The selected harness or model alias does not support web search");
       if (
         tools.some(
           (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
@@ -299,6 +305,7 @@ export function createAgentService<Env extends AgentBindings>(
           const input = yield* attempt("api.validate", () =>
             parse(createSessionSchema, parameters),
           );
+          yield* attempt("api.images", () => assertInputImages(input.input));
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint(input);
           const previous = unwrap(
@@ -545,6 +552,7 @@ export function createAgentService<Env extends AgentBindings>(
       return runPromise(
         Effect.gen(this, function* () {
           const input = yield* attempt("api.validate", () => parse(forkSessionSchema, parameters));
+          yield* attempt("api.images", () => assertInputImages(input.input));
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint({ fork: id, ...input });
           const previous = unwrap(
@@ -819,6 +827,17 @@ export function createAgentService<Env extends AgentBindings>(
   /** The router is built once per isolate; every handler reads its entrypoint from `c.env`. */
   function buildApplication() {
     const app = new Hono<RouteEnv<Env>>();
+    // Every response, including errors and streams, carries a request ID the SDK surfaces.
+    app.use("*", async (c, next) => {
+      await next();
+      const id = identifier("req");
+      try {
+        c.res.headers.set("x-request-id", id);
+      } catch {
+        c.res = new Response(c.res.body, c.res);
+        c.res.headers.set("x-request-id", id);
+      }
+    });
     app.use("*", async (c, next) => {
       const tenant = await options.authenticate(c.req.raw, c.env.env);
       if (!tenant) throw new ApiError(401, "unauthorized", "Authentication required");
@@ -846,7 +865,7 @@ export function createAgentService<Env extends AgentBindings>(
           : remoteApiError(error);
       if (!known) console.error("Agent API request failed", { message: error.message });
       const status = known ? known.status : 500;
-      return Response.json(
+      const response = Response.json(
         {
           error: {
             message: known ? known.message : "Internal server error",
@@ -857,6 +876,10 @@ export function createAgentService<Env extends AgentBindings>(
         },
         { status },
       );
+      // The SDK retries 409 by default; these conflicts never resolve by retrying.
+      if (known && PERMANENT_CONFLICTS.has(known.code))
+        response.headers.set("x-should-retry", "false");
+      return response;
     });
     app.get("/cf/v1/capabilities", (c) =>
       Response.json({
@@ -940,7 +963,7 @@ export function createAgentService<Env extends AgentBindings>(
     );
     app.post("/v1/skills/:id", async (c) =>
       Response.json(
-        await c.env.catalog(c.get("tenant")).updateSkill(c.req.param("id"), await c.req.json()),
+        await c.env.catalog(c.get("tenant")).updateSkill(c.req.param("id"), await jsonBody(c)),
       ),
     );
     app.delete("/v1/skills/:id", async (c) =>
@@ -985,10 +1008,10 @@ export function createAgentService<Env extends AgentBindings>(
     });
     app.get("/v1/files", async (c) => {
       const { purpose, ...page } = parse(
-        pageSchema.extend({ purpose: z.literal("user_data").optional() }),
+        pageSchema.extend({ purpose: z.string().max(64).optional() }),
         c.req.query(),
       );
-      return Response.json(await c.env.catalog(c.get("tenant")).files(page));
+      return Response.json(await c.env.catalog(c.get("tenant")).files(page, purpose));
     });
     app.get("/v1/files/:id", async (c) =>
       Response.json((await c.env.catalog(c.get("tenant")).file(c.req.param("id"))).resource),
@@ -1013,7 +1036,7 @@ export function createAgentService<Env extends AgentBindings>(
       return Response.json({ id: record.resource.id, object: "file", deleted: true });
     });
     app.post("/v1/agents/sessions", async (c) => {
-      const input = parse(createSessionSchema, await c.req.json());
+      const input = parse(createSessionSchema, await jsonBody(c));
       const session = await c.env.createSession(
         c.get("tenant"),
         input,
@@ -1033,7 +1056,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(await c.env.retrieveSession(c.get("tenant"), c.req.param("id"))),
     );
     app.post("/v1/agents/sessions/:id", async (c) => {
-      const input = parse(z.strictObject({ metadata: metadataSchema }), await c.req.json());
+      const input = parse(z.strictObject({ metadata: metadataSchema }), await jsonBody(c));
       const stub = await c.env.session(c.get("tenant"), c.req.param("id"));
       return Response.json(
         input.metadata === undefined
@@ -1045,7 +1068,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(await c.env.deleteSession(c.get("tenant"), c.req.param("id"))),
     );
     app.post("/v1/agents/sessions/:id/events", async (c) => {
-      const input = parse(eventsSchema, await c.req.json());
+      const input = parse(eventsSchema, await jsonBody(c));
       await c.env.submitEvents(
         c.get("tenant"),
         c.req.param("id"),
@@ -1184,7 +1207,7 @@ export function createAgentService<Env extends AgentBindings>(
       });
     });
     app.post("/v1/agents", async (c) => {
-      const input = parse(savedAgentSchema, await c.req.json());
+      const input = parse(savedAgentSchema, await jsonBody(c));
       c.env.validateModel(input.model, input, false);
       return Response.json(
         await c.env
@@ -1199,7 +1222,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(await c.env.catalog(c.get("tenant")).agent(c.req.param("id"))),
     );
     app.post("/v1/agents/:id", async (c) => {
-      const input = parse(savedAgentSchema.partial(), await c.req.json());
+      const input = parse(savedAgentSchema.partial(), await jsonBody(c));
       const catalog = c.env.catalog(c.get("tenant"));
       const previous = await catalog.agent(c.req.param("id"));
       c.env.validateModel(
@@ -1222,7 +1245,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(
         await c.env
           .catalog(c.get("tenant"))
-          .createTemplate(parse(templateSchema, await c.req.json())),
+          .createTemplate(parse(templateSchema, await jsonBody(c))),
       ),
     );
     app.get("/v1/agents/environments/templates", async (c) =>
@@ -1237,7 +1260,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(
         await c.env
           .catalog(c.get("tenant"))
-          .updateTemplate(c.req.param("id"), parse(templateSchema, await c.req.json())),
+          .updateTemplate(c.req.param("id"), parse(templateSchema, await jsonBody(c))),
       ),
     );
     app.delete("/v1/agents/environments/templates/:id", async (c) =>
@@ -1245,10 +1268,16 @@ export function createAgentService<Env extends AgentBindings>(
     );
     app.get("/v1/agents/environments/:id", async (c) => {
       const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
-      const session = await c.env.retrieveSession(c.get("tenant"), spec.sessionId);
+      const stub = await c.env.session(c.get("tenant"), spec.sessionId);
+      const session = await stub.retrieve();
       if (session.environment.type !== "openai_hosted")
         throw new ApiError(404, "not_found", "Environment not found");
       const { files, plugins, skills } = session.environment;
+      const status = await runPromise(
+        options.environments?.(c.env.env).status(spec) ?? Effect.succeed("failed"),
+      );
+      // A sandbox that went away, or came back after a restore, is reflected as a session event.
+      if (status === "disconnected" || status === "connected") await stub.environmentStatus(status);
       return Response.json({
         id: spec.id,
         object: "agent.environment",
@@ -1256,9 +1285,7 @@ export function createAgentService<Env extends AgentBindings>(
         files,
         plugins,
         skills,
-        status: await runPromise(
-          options.environments?.(c.env.env).status(spec) ?? Effect.succeed("failed"),
-        ),
+        status,
       });
     });
     app.post("/v1/agents/environments/:id/files", async (c) => {
@@ -1267,7 +1294,7 @@ export function createAgentService<Env extends AgentBindings>(
       const driver = options.environments?.(c.env.env);
       if (!driver)
         throw new ApiError(503, "environment_unavailable", "Environment driver is unavailable");
-      const input = parse(environmentFileSchema, await c.req.json());
+      const input = parse(environmentFileSchema, await jsonBody(c));
       if (input.type === "file_id") {
         const file = await c.env.catalog(c.get("tenant")).file(input.file_id);
         spec.inputFiles = {
@@ -1289,7 +1316,7 @@ export function createAgentService<Env extends AgentBindings>(
     });
     app.post("/v1/vaults", async (c) =>
       Response.json(
-        await c.env.catalog(c.get("tenant")).createVault(parse(vaultSchema, await c.req.json())),
+        await c.env.catalog(c.get("tenant")).createVault(parse(vaultSchema, await jsonBody(c))),
       ),
     );
     const vaultQuery = (url: string) => {
@@ -1315,7 +1342,7 @@ export function createAgentService<Env extends AgentBindings>(
       Response.json(
         await c.env
           .catalog(c.get("tenant"))
-          .createCredential(c.req.param("id"), parse(credentialSchema, await c.req.json())),
+          .createCredential(c.req.param("id"), parse(credentialSchema, await jsonBody(c))),
       ),
     );
     app.get("/v1/vaults/:id/credentials", async (c) =>
@@ -1337,7 +1364,7 @@ export function createAgentService<Env extends AgentBindings>(
           .rotateCredential(
             c.req.param("id"),
             c.req.param("credential"),
-            parse(rotateCredentialSchema, await c.req.json()),
+            parse(rotateCredentialSchema, await jsonBody(c)),
           ),
       ),
     );
@@ -1364,6 +1391,33 @@ export function createAgentService<Env extends AgentBindings>(
     return app;
   }
   return { AgentWorker, SessionDO };
+}
+
+/** Conflicts a retry cannot resolve; the SDK honors `x-should-retry: false`. */
+const PERMANENT_CONFLICTS = new Set([
+  "idempotency_conflict",
+  "active_turn",
+  "session_failed",
+  "turn_checkpointing",
+  "active_turn_not_steerable",
+  "outcome_unknown",
+  "network_policy_conflict",
+  "invalid_session_state",
+  "not_deleted",
+  "environment_conflict",
+]);
+function assertInputImages(input: CreateSession["input"]): void {
+  if (Array.isArray(input))
+    assertImageLimit(remoteImageURLs(input.flatMap((message) => message.content)));
+}
+/**
+ * The official SDK sends no body when every parameter of an update or create call is
+ * omitted; an absent or empty body means "no changes", not malformed JSON.
+ */
+async function jsonBody(c: { req: { raw: Request; text(): Promise<string> } }): Promise<unknown> {
+  if (!c.req.raw.body) return {};
+  const text = await c.req.text();
+  return text.trim() ? JSON.parse(text) : {};
 }
 
 /** OpenAI's error envelope categorizes by status; the SDK selects error classes by status too. */
