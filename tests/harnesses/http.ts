@@ -1,9 +1,9 @@
 import { once } from "node:events";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 /** Real HTTP boundary, including streaming bodies and disconnect cancellation. */
 export async function serveFetch(fetch: (request: Request) => Promise<Response>) {
-  const server = createServer(async (incoming, outgoing) => {
+  const handle = async (incoming: IncomingMessage, outgoing: ServerResponse) => {
     const abort = new AbortController();
     outgoing.on("close", () => abort.abort());
     try {
@@ -34,6 +34,9 @@ export async function serveFetch(fetch: (request: Request) => Promise<Response>)
         outgoing.end();
       }
     }
+  };
+  const server = createServer((incoming, outgoing) => {
+    void handle(incoming, outgoing);
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

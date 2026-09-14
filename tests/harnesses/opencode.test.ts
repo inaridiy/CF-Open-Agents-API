@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { expect, it } from "vitest";
+
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
@@ -126,11 +128,8 @@ async function harness(modelUrl: string) {
   const directory = join(root, "harness");
   await mkdir(directory);
   const diagnostics: string[] = [];
-  let supervisor: ReturnType<typeof createSupervisor> | undefined;
-  const server = await serveFetch(async (request) =>
-    supervisor ? supervisor.app.fetch(request) : new Response(null, { status: 503 }),
-  );
-  supervisor = createSupervisor({
+  const server = await serveFetch(async (request) => supervisor.app.fetch(request));
+  const supervisor = createSupervisor({
     binary: "codex",
     directory,
     modelBaseUrl: `${modelUrl}/v1`,
@@ -148,7 +147,7 @@ async function harness(modelUrl: string) {
     return response;
   };
   const poll = async (turnId: string) =>
-    (await (await fetch(`${server.url}/jobs/${turnId}`)).json()) as RuntimeBatch;
+    (await fetch(`${server.url}/jobs/${turnId}`)).json<RuntimeBatch>();
   const untilStatus = async (turnId: string, statuses: RuntimeBatch["status"][], ms = 40_000) => {
     const started = Date.now();
     for (;;) {

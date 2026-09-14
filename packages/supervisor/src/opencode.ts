@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
+
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import type {
   AssistantMessage,
@@ -15,8 +16,9 @@ import type {
   ToolPart,
 } from "@opencode-ai/sdk/v2/types";
 import { ApiError, type Execution, type InputMessage, type RuntimeEvent } from "cf-open-agents-api";
+
 import { type NativeOptions, ToolJob } from "./job.js";
-import type { TurnErrorCode } from "./lifecycle.js";
+import { describeFailure, type TurnErrorCode } from "./lifecycle.js";
 import { imageContent } from "./media.js";
 
 type Client = ReturnType<typeof createOpencodeClient>;
@@ -71,7 +73,7 @@ export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>)
     case "StructuredOutputError":
       return {
         code: "internal_error",
-        detail: `Model did not produce output matching the requested schema after ${String(data.retries ?? 0)} retries: ${message}`,
+        detail: `Model did not produce output matching the requested schema after ${typeof data.retries === "number" ? data.retries : 0} retries: ${message}`,
       };
     case "APIError": {
       // OpenCode retries retryable statuses (429, 5xx, connection failures) up to five
@@ -414,7 +416,7 @@ export class OpenCodeJob extends ToolJob {
     const closeChild = (child: ChildState, status: "completed" | "failed") => {
       if (child.closed) return;
       child.closed = true;
-      for (const messageId of [...pendingText.keys()])
+      for (const messageId of Array.from(pendingText.keys()))
         if (pendingText.get(messageId)?.some((entry) => entry.scope?.turnId === child.turnId))
           flushText(messageId, "final_answer");
       this.emit({
@@ -540,7 +542,8 @@ export class OpenCodeJob extends ToolJob {
       const result = await client.session.prompt(this.promptRequest(input), {
         signal: this.abort.signal,
       });
-      if (streamError) throw streamError;
+      if (streamError)
+        throw streamError instanceof Error ? streamError : new Error(describeFailure(streamError));
       const info = result.data?.info;
       if (!result.data || !info) throw new Error("OpenCode returned no assistant message");
       if (info.error) {
@@ -583,7 +586,7 @@ export class OpenCodeJob extends ToolJob {
       record(last.info);
       publishUsage(usage.values());
       for (const child of this.children.values()) closeChild(child, "completed");
-      for (const messageId of [...pendingText.keys()]) flushText(messageId, "final_answer");
+      for (const messageId of Array.from(pendingText.keys())) flushText(messageId, "final_answer");
       const finalText = last.parts.filter(
         (part): part is Extract<Part, { type: "text" }> => part.type === "text",
       );
