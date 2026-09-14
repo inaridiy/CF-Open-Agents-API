@@ -102,11 +102,11 @@ See [Claude Code LLM gateways](https://code.claude.com/docs/en/llm-gateway).
 
 ## Sandbox replacement
 
-| Harness | Actual integration | Native state |
-| --- | --- | --- |
-| Codex 0.154.0 | Native remote `exec-server` in Sandbox Container | Isolated CODEX_HOME |
-| Claude Agent SDK 0.3.268 | `toolAliases` redirect Bash/Read/Write/Edit to SDK MCP tools that call the assigned Sandbox | Isolated CLAUDE_CONFIG_DIR |
-| OpenCode 1.18.30 | Same-name plugin tools replace bash/read/write/edit and call the assigned Sandbox | Isolated XDG data/state directories |
+| Harness                  | Actual integration                                                                          | Native state                        |
+| ------------------------ | ------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Codex 0.154.0            | Native remote `exec-server` in Sandbox Container                                            | Isolated CODEX_HOME                 |
+| Claude Agent SDK 0.3.268 | `toolAliases` redirect Bash/Read/Write/Edit to SDK MCP tools that call the assigned Sandbox | Isolated CLAUDE_CONFIG_DIR          |
+| OpenCode 1.18.30         | Same-name plugin tools replace bash/read/write/edit and call the assigned Sandbox           | Isolated XDG data/state directories |
 
 Claude's `sandbox` option configures local OS isolation; it is not a generic remote
 Sandbox provider. `spawnClaudeCodeProcess` replaces the whole subprocess launcher.
@@ -183,10 +183,14 @@ const session = await client.beta.agents.sessions.create({
 const stream = client.beta.agents.sessions.stream(session.id, {
   input: "Find the Cloudflare Durable Objects documentation.",
   toolHandlers: {
-    web_search: async (args) => ({ results: await search.call(args, {
-      tenantId: "your-authenticated-tenant", sessionId: session.id,
-      operationId: crypto.randomUUID(), signal: stream.controller.signal,
-    }) }),
+    web_search: async (args) => ({
+      results: await search.call(args, {
+        tenantId: "your-authenticated-tenant",
+        sessionId: session.id,
+        operationId: crypto.randomUUID(),
+        signal: stream.controller.signal,
+      }),
+    }),
   },
 });
 for await (const event of stream) console.log(event.type);

@@ -2,6 +2,7 @@ import type { Effect } from "effect";
 import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/environments";
 import type { EnvironmentFile } from "openai/resources/beta/agents/environments/files";
 import { z } from "zod";
+
 import type { ServiceError } from "./effect.js";
 import type { EnvironmentFileInput, HostedConfiguration } from "./environment-config.js";
 import type { ResolvedInputFile } from "./files.js";

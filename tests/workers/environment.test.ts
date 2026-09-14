@@ -5,14 +5,16 @@ import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import type { AgentSessionEvent } from "openai/resources/beta/agents/agents";
 import { afterEach, expect, it } from "vitest";
+
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
+import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }
@@ -26,13 +28,13 @@ const api = new OpenAI({
 });
 const stub = (id: string) => env.SESSIONS.getByName(JSON.stringify([tenant, id]));
 const replay = async (id: string) =>
-  (await (
+  await (
     await exports.default.fetch(
       new Request(`https://api.test/cf/v1/sessions/${id}/events?after=0`, {
         headers: { authorization: `Bearer ${tenant}` },
       }),
     )
-  ).json()) as { seq: number; event: AgentSessionEvent }[];
+  ).json<{ seq: number; event: AgentSessionEvent }[]>();
 const resetActivity = (id: string) =>
   runInDurableObject<SessionDO, void>(stub(id), (instance) => {
     const record = instance.db.require<SessionRecord>("state", "session");

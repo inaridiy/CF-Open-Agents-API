@@ -1,5 +1,6 @@
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+
 import { decodeEffect, io, runPromise } from "cf-open-agents-api";
 import { Context, Effect, Layer, Ref, Schema } from "effect";
 
@@ -43,7 +44,7 @@ const excluded = new Set([
 export function capture(home: string, threadId: string): Promise<NativeBundle> {
   const program = Effect.gen(function* () {
     const fs = yield* CheckpointFiles;
-    const state = yield* Ref.make({ bytes: 0, files: {} as Record<string, string> });
+    const state = yield* Ref.make({ bytes: 0, files: {} });
     const visit = (relative: string): Effect.Effect<void, Error> =>
       Effect.gen(function* () {
         for (const entry of yield* fs.list(join(home, relative))) {

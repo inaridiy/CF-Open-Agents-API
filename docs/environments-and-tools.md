@@ -22,10 +22,18 @@ const visual = await client.beta.agents.sessions.create({
   environment: { type: "none" },
 });
 for await (const event of client.beta.agents.sessions.stream(visual.id, {
-  input: [{ role: "user", content: [
-    { type: "input_text", text: "Explain this screenshot and check the relevant documentation." },
-    { type: "input_image", image_url: screenshotUrl },
-  ] }],
+  input: [
+    {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "Explain this screenshot and check the relevant documentation.",
+        },
+        { type: "input_image", image_url: screenshotUrl },
+      ],
+    },
+  ],
 })) {
   if (event.type === "agent.session.turn.output_text.delta") console.log(event.delta);
   if (event.type === "agent.session.turn.reasoning_summary_text.delta") console.log(event.delta);
@@ -110,11 +118,16 @@ Upload changes and list files independently of a model turn:
 
 ```ts
 await client.beta.agents.environments.files.create(environment.id, {
-  type: "inline", path: "/workspace/notes.txt", data: btoa("Include a summary."),
+  type: "inline",
+  path: "/workspace/notes.txt",
+  data: btoa("Include a summary."),
 });
 for await (const file of client.beta.agents.environments.files.list(environment.id, {
-  path: "/workspace", order: "asc", limit: 20,
-})) console.log(file.path, file.size_bytes);
+  path: "/workspace",
+  order: "asc",
+  limit: 20,
+}))
+  console.log(file.path, file.size_bytes);
 ```
 
 Use byte-safe base64 encoding for binary or non-Latin text; `btoa` above receives ASCII.
@@ -152,15 +165,27 @@ when creating the credential; returned resources omit the token.
 const vault = await client.beta.agents.vaults.create({ name: "application-tools" });
 const credential = await client.beta.agents.vaults.credentials.create(vault.id, {
   name: "knowledge-service",
-  auth: { type: "static_bearer", mcp_server_url: "https://tools.example.com/mcp", token: env.MCP_TOKEN },
+  auth: {
+    type: "static_bearer",
+    mcp_server_url: "https://tools.example.com/mcp",
+    token: env.MCP_TOKEN,
+  },
 });
 const withMcp = await client.beta.agents.sessions.create({
-  agent: { model: "coding", tools: [{
-    type: "mcp", server_label: "knowledge", connection_origin: "service",
-    transport: { type: "http", server_url: "https://tools.example.com/mcp" },
-    credential_id: credential.id,
-    allowed_tools: ["lookup"], required: true,
-  }] },
+  agent: {
+    model: "coding",
+    tools: [
+      {
+        type: "mcp",
+        server_label: "knowledge",
+        connection_origin: "service",
+        transport: { type: "http", server_url: "https://tools.example.com/mcp" },
+        credential_id: credential.id,
+        allowed_tools: ["lookup"],
+        required: true,
+      },
+    ],
+  },
   environment: { type: "openai_hosted" },
   vault_ids: [vault.id],
 });
@@ -193,8 +218,12 @@ const batch = await client.beta.agents.sessions.create({
     model: "coding",
     tools: [
       { type: "programmatic_tool_calling" },
-      { type: "function", name: "lookup", description: "Look up one record",
-        parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      {
+        type: "function",
+        name: "lookup",
+        description: "Look up one record",
+        parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+      },
     ],
   },
   environment: { type: "openai_hosted" },
@@ -231,7 +260,8 @@ let rootTurnId: string | undefined;
 for await (const event of client.beta.agents.sessions.stream(parallel.id, {
   input: "Have a reviewer check this repository while you write the summary.",
 })) {
-  if (event.type === "agent.session.turn.created" && !event.turn.subagent_id) rootTurnId = event.turn.id;
+  if (event.type === "agent.session.turn.created" && !event.turn.subagent_id)
+    rootTurnId = event.turn.id;
   if (event.type === "agent.session.turn.output_text.delta" && event.turn_id === rootTurnId)
     console.log(event.delta);
   if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id)
@@ -241,7 +271,8 @@ for await (const child of client.beta.agents.sessions.subagents.list(parallel.id
   console.log(child.id, child.status);
   for await (const item of client.beta.agents.sessions.subagents.items.list(child.id, {
     session_id: parallel.id,
-  })) console.log(item.type);
+  }))
+    console.log(item.type);
 }
 ```
 
@@ -265,8 +296,11 @@ runtime or model. Overrides use the session-create `agent` shape:
 ```ts
 const forked = await fetch(`https://agents.internal/cf/v1/sessions/${session.id}/fork`, {
   method: "POST",
-  headers: { authorization: `Bearer ${env.API_TOKEN}`, "content-type": "application/json",
-    "Idempotency-Key": "review-with-claude-1" },
+  headers: {
+    authorization: `Bearer ${env.API_TOKEN}`,
+    "content-type": "application/json",
+    "Idempotency-Key": "review-with-claude-1",
+  },
   body: JSON.stringify({ agent: { model: "claude" }, metadata: { forked_from: session.id } }),
 });
 const review = await forked.json();

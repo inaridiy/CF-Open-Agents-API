@@ -2,9 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { simulateReadableStream } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { expect, it } from "vitest";
+
 import type {
   Execution,
   RuntimeBatch,
@@ -104,7 +106,9 @@ function scriptedGateway(plan: "wait" | "leave") {
           const waited = plan === "leave" || history.includes("CHILD_ANSWER");
           const tool = !spawned ? find("cf_delegate") : !waited ? find("cf_wait") : undefined;
           if (!waited && !tool)
-            throw new Error(`Missing delegation tool: ${definitions.map((t) => t.name)}`);
+            throw new Error(
+              `Missing delegation tool: ${definitions.map((t) => t.name).join(", ")}`,
+            );
           return {
             stream: simulateReadableStream({
               chunks: [
@@ -190,9 +194,8 @@ it.each(harnesses)(
     const delegate = await scripted.server;
     const gateway = scriptedGateway("wait");
     const model = await serveFetch((request) => gateway.fetch(request, {}));
-    let supervisor: ReturnType<typeof createSupervisor>;
     const server = await serveFetch(async (request) => supervisor.app.fetch(request));
-    supervisor = createSupervisor({
+    const supervisor = createSupervisor({
       binary: "codex",
       opencodeBinary: resolve("node_modules/.bin/opencode"),
       directory,
@@ -307,9 +310,8 @@ it.each(harnesses)(
     const delegate = await scripted.server;
     const gateway = scriptedGateway("leave");
     const model = await serveFetch((request) => gateway.fetch(request, {}));
-    let supervisor: ReturnType<typeof createSupervisor>;
     const server = await serveFetch(async (request) => supervisor.app.fetch(request));
-    supervisor = createSupervisor({
+    const supervisor = createSupervisor({
       binary: "codex",
       opencodeBinary: resolve("node_modules/.bin/opencode"),
       directory,
@@ -377,9 +379,8 @@ it("rejects a tool result for a delegated child the HarnessDO already closed", a
   const delegate = await scripted.server;
   const gateway = scriptedGateway("wait");
   const model = await serveFetch((request) => gateway.fetch(request, {}));
-  let supervisor: ReturnType<typeof createSupervisor>;
   const server = await serveFetch(async (request) => supervisor.app.fetch(request));
-  supervisor = createSupervisor({
+  const supervisor = createSupervisor({
     binary: "codex",
     opencodeBinary: resolve("node_modules/.bin/opencode"),
     directory,

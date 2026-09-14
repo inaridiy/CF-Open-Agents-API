@@ -17,12 +17,12 @@ Start with the [Service Binding guide](https://github.com/inaridiy/CF-Open-Agent
 [Direct RPC](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/rpc.md) and
 [hosted HTTP](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/http-api.md) are also supported connection paths.
 
-| Import | Purpose |
-| --- | --- |
-| `cf-open-agents-api` | Wire schemas, types, errors and runtime driver contracts |
-| `cf-open-agents-api/cloudflare` | Worker/DO factory, typed RPC, Container and environment drivers |
-| `cf-open-agents-api/models` | AI SDK models, OpenAI-compatible connections and native protocol presets |
-| `cf-open-agents-api/tools` | Function tools, search presets and immutable skill bundles |
+| Import                          | Purpose                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `cf-open-agents-api`            | Wire schemas, types, errors and runtime driver contracts                 |
+| `cf-open-agents-api/cloudflare` | Worker/DO factory, typed RPC, Container and environment drivers          |
+| `cf-open-agents-api/models`     | AI SDK models, OpenAI-compatible connections and native protocol presets |
+| `cf-open-agents-api/tools`      | Function tools, search presets and immutable skill bundles               |
 
 See the [library API](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/library-api.md)
 for factory options, RPC methods, peers and installation from a source checkout/local tarball.

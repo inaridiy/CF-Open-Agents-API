@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import {
   type HookCallback,
   type McpSdkServerConfigWithInstance,
@@ -16,6 +17,7 @@ import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ApiError, type Execution, type InputMessage, workspaceTools } from "cf-open-agents-api";
 import { z } from "zod";
+
 import { type NativeOptions, ToolJob, type ToolScope } from "./job.js";
 import type { TurnErrorCode } from "./lifecycle.js";
 import { imageContent } from "./media.js";
@@ -150,7 +152,7 @@ export class ClaudeCodeJob extends ToolJob {
   private get outputFormat(): Options["outputFormat"] {
     const format = this.execution.agent.text?.format;
     return format?.type === "json_schema"
-      ? { type: "json_schema", schema: format.schema as Record<string, unknown> }
+      ? { type: "json_schema", schema: format.schema }
       : undefined;
   }
   private async userMessage(messages: InputMessage[]): Promise<SDKUserMessage["message"]> {
@@ -204,7 +206,7 @@ export class ClaudeCodeJob extends ToolJob {
           inputSchema: schema.extend({ [SCOPE_KEY]: z.string().optional() }),
         },
         (args) => {
-          const { [SCOPE_KEY]: scopeId, ...rest } = args as Record<string, unknown>;
+          const { [SCOPE_KEY]: scopeId, ...rest } = args;
           const child =
             typeof scopeId === "string"
               ? this.children.find((entry) => entry.scope.subagentId === scopeId)

@@ -2,7 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { expect, it } from "vitest";
+
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { createModelGateway, nativeModel } from "../../packages/agent-api/src/models.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
@@ -135,11 +137,10 @@ async function harness(script: (request: Request, index: number) => Reply) {
   const directory = await mkdtemp(join(tmpdir(), "cf-claude-"));
   const diagnostics: string[] = [];
   const fixture = await anthropicFixture(script);
-  let supervisor: ReturnType<typeof createSupervisor> | undefined;
   const server = await serveFetch(async (request) =>
     supervisor ? supervisor.app.fetch(request) : new Response(null, { status: 503 }),
   );
-  supervisor = createSupervisor({
+  const supervisor = createSupervisor({
     binary: "codex",
     opencodeBinary: resolve("node_modules/.bin/opencode"),
     directory,
@@ -160,7 +161,7 @@ async function harness(script: (request: Request, index: number) => Reply) {
     return { ok: response.ok, status: response.status, body: body_ };
   };
   const poll = async (turnId: string) =>
-    (await (await fetch(`${server.url}/jobs/${turnId}`)).json()) as RuntimeBatch;
+    await (await fetch(`${server.url}/jobs/${turnId}`)).json<RuntimeBatch>();
   /** Drive the job, answering client function calls with `answer`, until it stops. */
   const finish = async (
     turnId: string,

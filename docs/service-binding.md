@@ -10,7 +10,7 @@ Deploy/configure the [Agent Worker](deployment.md), then add this to the caller'
 
 ```jsonc
 {
-  "services": [{ "binding": "AGENTS", "service": "cf-open-agents-api" }]
+  "services": [{ "binding": "AGENTS", "service": "cf-open-agents-api" }],
 }
 ```
 
@@ -51,10 +51,13 @@ Inside your Worker handler, create an idle session, then subscribe and submit in
 
 ```ts
 const client = agentClient(env);
-const session = await client.beta.agents.sessions.create({
-  agent: { model: "coding" },
-  environment: { type: "openai_hosted" },
-}, { headers: { "Idempotency-Key": "session-for-task-123" } });
+const session = await client.beta.agents.sessions.create(
+  {
+    agent: { model: "coding" },
+    environment: { type: "openai_hosted" },
+  },
+  { headers: { "Idempotency-Key": "session-for-task-123" } },
+);
 
 let answer = "";
 for await (const event of client.beta.agents.sessions.stream(session.id, {
@@ -62,8 +65,10 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
   idempotencyKey: "task-123-turn-1",
 })) {
   if (event.type === "agent.session.turn.output_text.delta") answer += event.delta;
-  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id) throw new Error("Turn failed");
-  if (event.type === "agent.session.turn.cancelled" && !event.turn.subagent_id) throw new Error("Turn cancelled");
+  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id)
+    throw new Error("Turn failed");
+  if (event.type === "agent.session.turn.cancelled" && !event.turn.subagent_id)
+    throw new Error("Turn cancelled");
 }
 return Response.json({ session_id: session.id, answer });
 ```
@@ -85,10 +90,17 @@ The SDK stream helper can execute named handlers and submit their results:
 
 ```ts
 const clockSession = await client.beta.agents.sessions.create({
-  agent: { model: "coding", tools: [{
-    type: "function", name: "get_time", description: "Read the current UTC time",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-  }] },
+  agent: {
+    model: "coding",
+    tools: [
+      {
+        type: "function",
+        name: "get_time",
+        description: "Read the current UTC time",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+      },
+    ],
+  },
   environment: { type: "none" },
 });
 for await (const event of client.beta.agents.sessions.stream(clockSession.id, {
@@ -104,15 +116,21 @@ Without a handler, inspect `session.required_actions` when status becomes `requi
 For each function call, send its exact `call_id` and `turn_id`:
 
 ```ts
-await client.beta.agents.sessions.events.create(session.id, {
-  events: [{
-    type: "agent.session.input.tool_result",
-    call_id: action.call_id,
-    turn_id: action.turn_id,
-    success: true,
-    output: JSON.stringify(result),
-  }],
-}, { headers: { "Idempotency-Key": `result-${action.call_id}` } });
+await client.beta.agents.sessions.events.create(
+  session.id,
+  {
+    events: [
+      {
+        type: "agent.session.input.tool_result",
+        call_id: action.call_id,
+        turn_id: action.turn_id,
+        success: true,
+        output: JSON.stringify(result),
+      },
+    ],
+  },
+  { headers: { "Idempotency-Key": `result-${action.call_id}` } },
+);
 ```
 
 Authenticate and authorize application tool operations in your own code.

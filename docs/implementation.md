@@ -7,15 +7,15 @@ are available in [GitHub Actions](https://github.com/inaridiy/CF-Open-Agents-API
 
 ## Validation boundaries
 
-| Command | Evidence |
-| --- | --- |
-| `pnpm check` | Documentation, agent guidance, checker fixtures, types, lint, real workerd/SQLite tests and builds |
-| `pnpm test:codex` | Real Codex app-server/exec-server, external functions and history recovery |
-| `pnpm test:harnesses` | Three native runtimes, SDK model protocols, tools, cancellation and restored history |
+| Command                | Evidence                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- |
+| `pnpm check`           | Documentation, agent guidance, checker fixtures, types, lint, real workerd/SQLite tests and builds      |
+| `pnpm test:codex`      | Real Codex app-server/exec-server, external functions and history recovery                              |
+| `pnpm test:harnesses`  | Three native runtimes, SDK model protocols, tools, cancellation and restored history                    |
 | `pnpm test:containers` | Worker/Container transport, separate Sandbox execution, skills and R2 restore after compute destruction |
-| `pnpm types` | Generated Worker binding/runtime declarations |
-| `pnpm deploy:check` | Both images and the Worker deployment bundle, without deployment |
-| `pnpm test:package` | Packed library installation, public entrypoint imports and consumer type compatibility |
+| `pnpm types`           | Generated Worker binding/runtime declarations                                                           |
+| `pnpm deploy:check`    | Both images and the Worker deployment bundle, without deployment                                        |
+| `pnpm test:package`    | Packed library installation, public entrypoint imports and consumer type compatibility                  |
 
 Runtime suites use local scripted model endpoints. They establish integration and
 recovery behavior; they do not measure model quality or establish every upstream

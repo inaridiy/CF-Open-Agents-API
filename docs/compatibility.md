@@ -9,35 +9,35 @@ runtime feature is unavailable. Full official API compatibility is still in prog
 Query `/cf/v1/capabilities` for deployed model aliases, delegation targets and
 harness capability flags.
 
-| Surface | Current implementation |
-| --- | --- |
-| Agents | Create, retrieve, list, update, delete; sessions keep their original agent configuration |
-| Sessions | Create, retrieve, list with `agent_id` filtering, metadata update, delete when inactive |
-| Inputs | Text and image messages, cancellation; string or content-array function results with images |
-| Active input | Steers the existing Codex turn; Claude Code and OpenCode reject active steering |
-| Output | Assistant text, function calls, command executions, MCP calls, reasoning summaries, usage; Codex web search and native collaboration items |
-| Streaming | Live SSE; durable replay is a separate `/cf/v1` extension |
-| Turns | Retrieve and cursor-paginated list; completion follows durable checkpoint commit |
-| Usage | Per-turn and session token counts for all harnesses, cached input and reasoning output breakdown; preserved across eviction and native restore |
-| Runtime streaming | Reasoning summary parts/deltas, command stdout deltas, user input notifications; partial output closes as incomplete at turn termination |
-| Idempotency | Session creation, forks and submitted input batches; conflicting reuse is 409 |
-| Agent settings | Reasoning effort/summary, text verbosity/JSON schema and service tier applied natively by Codex; Claude Code maps a non-`none` effort to adaptive thinking; OpenCode records the settings without applying them |
-| Environment | `none`, or Cloudflare Sandbox using the `openai_hosted` wire spelling |
-| Environment configuration | Environment variables, network policy, package installation, setup commands, initial files, inline skills/plugins, skill references and capability directories for every harness |
-| Templates | Tenant-owned create, retrieve, list, update and delete; confidential configuration is redacted from responses |
-| Files | Files API `user_data` upload/retrieve/list/content/delete; initial and later environment uploads using inline base64 or `file_id`; token-paginated environment listings |
-| Skills | `/v1/skills` create, retrieve, list, update, delete; immutable versions with default/latest selection and ZIP content download; sessions pin the resolved version |
-| Artifacts | Immutable `/workspace/outputs` files published by completed turns; list, retrieve, download and delete |
-| Subagents | Codex native spawn/control projection; deployment-configured cross-runtime delegation for every harness; child state/items/turns and child function results; child completion waits for root checkpoint commit |
-| MCP | HTTP and stdio configuration, allowed tools and required servers for every harness; service-origin HTTP proxy with request metadata and attached Vault credentials; environment-origin servers run in the Sandbox |
-| Vaults | Tenant-owned Vault/credential CRUD, redacted secrets, credential rotation, matching service-origin MCP authentication and serialized OAuth refresh |
-| Function tools | Client function tools, deferred loading and tool search for all three harnesses |
-| Programmatic tools | `programmatic_tool_calling` runs model-written JavaScript in an isolated Dynamic Worker with an allowlisted tool bridge; requires the `CODE_LOADER` binding |
-| Web search | Codex `disabled`, `cached` and `live` modes, context size, domain filters and location; requires a supporting native Responses connection |
-| Native resume | Native history checkpoints for all three harnesses |
-| Forks | `/cf/v1` extension: continue a committed session on the same or another harness |
-| Harnesses | Codex, Claude Code, OpenCode; additional harnesses require a driver |
-| Asset helpers | Immutable R2 publishing/integrity checks, progressive skill read tool and sandbox provisioning hook |
+| Surface                   | Current implementation                                                                                                                                                                                            |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agents                    | Create, retrieve, list, update, delete; sessions keep their original agent configuration                                                                                                                          |
+| Sessions                  | Create, retrieve, list with `agent_id` filtering, metadata update, delete when inactive                                                                                                                           |
+| Inputs                    | Text and image messages, cancellation; string or content-array function results with images                                                                                                                       |
+| Active input              | Steers the existing Codex turn; Claude Code and OpenCode reject active steering                                                                                                                                   |
+| Output                    | Assistant text, function calls, command executions, MCP calls, reasoning summaries, usage; Codex web search and native collaboration items                                                                        |
+| Streaming                 | Live SSE; durable replay is a separate `/cf/v1` extension                                                                                                                                                         |
+| Turns                     | Retrieve and cursor-paginated list; completion follows durable checkpoint commit                                                                                                                                  |
+| Usage                     | Per-turn and session token counts for all harnesses, cached input and reasoning output breakdown; preserved across eviction and native restore                                                                    |
+| Runtime streaming         | Reasoning summary parts/deltas, command stdout deltas, user input notifications; partial output closes as incomplete at turn termination                                                                          |
+| Idempotency               | Session creation, forks and submitted input batches; conflicting reuse is 409                                                                                                                                     |
+| Agent settings            | Reasoning effort/summary, text verbosity/JSON schema and service tier applied natively by Codex; Claude Code maps a non-`none` effort to adaptive thinking; OpenCode records the settings without applying them   |
+| Environment               | `none`, or Cloudflare Sandbox using the `openai_hosted` wire spelling                                                                                                                                             |
+| Environment configuration | Environment variables, network policy, package installation, setup commands, initial files, inline skills/plugins, skill references and capability directories for every harness                                  |
+| Templates                 | Tenant-owned create, retrieve, list, update and delete; confidential configuration is redacted from responses                                                                                                     |
+| Files                     | Files API `user_data` upload/retrieve/list/content/delete; initial and later environment uploads using inline base64 or `file_id`; token-paginated environment listings                                           |
+| Skills                    | `/v1/skills` create, retrieve, list, update, delete; immutable versions with default/latest selection and ZIP content download; sessions pin the resolved version                                                 |
+| Artifacts                 | Immutable `/workspace/outputs` files published by completed turns; list, retrieve, download and delete                                                                                                            |
+| Subagents                 | Codex native spawn/control projection; deployment-configured cross-runtime delegation for every harness; child state/items/turns and child function results; child completion waits for root checkpoint commit    |
+| MCP                       | HTTP and stdio configuration, allowed tools and required servers for every harness; service-origin HTTP proxy with request metadata and attached Vault credentials; environment-origin servers run in the Sandbox |
+| Vaults                    | Tenant-owned Vault/credential CRUD, redacted secrets, credential rotation, matching service-origin MCP authentication and serialized OAuth refresh                                                                |
+| Function tools            | Client function tools, deferred loading and tool search for all three harnesses                                                                                                                                   |
+| Programmatic tools        | `programmatic_tool_calling` runs model-written JavaScript in an isolated Dynamic Worker with an allowlisted tool bridge; requires the `CODE_LOADER` binding                                                       |
+| Web search                | Codex `disabled`, `cached` and `live` modes, context size, domain filters and location; requires a supporting native Responses connection                                                                         |
+| Native resume             | Native history checkpoints for all three harnesses                                                                                                                                                                |
+| Forks                     | `/cf/v1` extension: continue a committed session on the same or another harness                                                                                                                                   |
+| Harnesses                 | Codex, Claude Code, OpenCode; additional harnesses require a driver                                                                                                                                               |
+| Asset helpers             | Immutable R2 publishing/integrity checks, progressive skill read tool and sandbox provisioning hook                                                                                                               |
 
 The wire schemas reject unknown or unsupported fields. Input content consists of
 text and images; Files API objects seed environments rather than appearing as
@@ -70,18 +70,18 @@ runtime; they do not guarantee the selected provider's features or billing behav
 `harness`, `model` and `delegates`. Session creation validates a configuration
 against the flags of the selected alias's driver before any state exists:
 
-| Flag | Gate |
-| --- | --- |
-| `functions`, `sandbox` | Client function tools; `openai_hosted` environments |
-| `images` | `input_image` messages and image function results |
-| `mcp` | `mcp` tools |
-| `toolSearch` | `tool_search` and `defer_loading` functions |
-| `webSearch` | `web_search` tools (Codex) |
-| `programmaticToolCalling` | `programmatic_tool_calling`; requires the `CODE_LOADER` binding |
-| `environmentCapabilities` | Environment skills, plugins and capability directories |
-| `subagents` | Native subagents (Codex); delegation applies when the alias lists `delegates` |
-| `steer` | Input while a turn is active |
-| `toolsFixedAtStart` | The native thread cannot change its tool set after starting (Codex); forks that change tools carry a transcript |
+| Flag                      | Gate                                                                                                            |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `functions`, `sandbox`    | Client function tools; `openai_hosted` environments                                                             |
+| `images`                  | `input_image` messages and image function results                                                               |
+| `mcp`                     | `mcp` tools                                                                                                     |
+| `toolSearch`              | `tool_search` and `defer_loading` functions                                                                     |
+| `webSearch`               | `web_search` tools (Codex)                                                                                      |
+| `programmaticToolCalling` | `programmatic_tool_calling`; requires the `CODE_LOADER` binding                                                 |
+| `environmentCapabilities` | Environment skills, plugins and capability directories                                                          |
+| `subagents`               | Native subagents (Codex); delegation applies when the alias lists `delegates`                                   |
+| `steer`                   | Input while a turn is active                                                                                    |
+| `toolsFixedAtStart`       | The native thread cannot change its tool set after starting (Codex); forks that change tools carry a transcript |
 
 Custom drivers declare the flags they implement; the Container drivers enable
 everything above except native subagents and web search outside Codex.
@@ -135,14 +135,14 @@ checkpoint objects with their source and start with an empty item list. Codex
 also keeps the dynamic tool set its thread started with, so deployment changes
 to `delegates` reach new sessions and transcript forks, not resumed threads.
 
-| Hosted-service boundary | This deployment |
-| --- | --- |
-| `openai_hosted` | Cloudflare Sandbox with its configured network and storage |
-| `self_hosted.remote_url`, Noise relay, environment connection handshakes | Not implemented |
-| Web search infrastructure | Provided by the configured Responses provider |
-| Programmatic tool calling | Cloudflare Dynamic Workers through the `CODE_LOADER` binding |
-| OpenAI billing, organization policy, hosted expiry and physical garbage collection | Operator/provider responsibilities |
-| Nested delegation, resuming a delegated child | Not supported; restored Codex children retain history but restart inactive |
+| Hosted-service boundary                                                            | This deployment                                                            |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `openai_hosted`                                                                    | Cloudflare Sandbox with its configured network and storage                 |
+| `self_hosted.remote_url`, Noise relay, environment connection handshakes           | Not implemented                                                            |
+| Web search infrastructure                                                          | Provided by the configured Responses provider                              |
+| Programmatic tool calling                                                          | Cloudflare Dynamic Workers through the `CODE_LOADER` binding               |
+| OpenAI billing, organization policy, hosted expiry and physical garbage collection | Operator/provider responsibilities                                         |
+| Nested delegation, resuming a delegated child                                      | Not supported; restored Codex children retain history but restart inactive |
 
 See [environments, tools and delegation](environments-and-tools.md).
 
@@ -179,26 +179,26 @@ Tenant catalogs isolate session discovery, input files, skills, templates and Va
 Service Binding RPC callers are trusted to provide the correct tenant; binding
 HTTP requests still authenticate normally.
 
-| Limit | Current value |
-| --- | --- |
-| JSON request body | 16 MiB |
-| Model input content | 100 parts/message or function result; image URL/data URL up to 1,000,000 characters, subject to SQLite record limits |
-| Initial environment files | 50; inline 5 MiB/file and 10 MiB total |
-| Files API `user_data` object | 50 MiB/file; optional expiry 1 hour–30 days |
-| Skill upload | 16 MiB archive, 32 MiB extracted; ZIP64, encrypted, symlink and device entries rejected |
-| Artifacts | 200 MiB/file and 500 MiB/turn |
-| Serialized SQLite record, including keys | 1,900,000 UTF-8 bytes |
-| Native checkpoint | 32 MiB |
-| Supervisor output buffer per execution | 8 MB, including streamed deltas and completed items |
-| Turn deadline | 15 minutes by default, including external tool waiting and delegated children |
-| Claude Code/OpenCode turn steps | 32 |
-| Portable AI SDK inference | 8,192 output tokens; 120-second timeout by default |
-| Private model gateway | 4 MiB input, 8 MiB output |
-| Programmatic code | 128 KB code, 1,000 ms CPU, 120 s wall time, 64 tool calls (8 concurrent), 128 KB arguments/call, 1 MiB results, 256 KB return value |
-| Delegated children | `max_concurrent_subagents` (default 6); prompt up to 128,000 characters |
-| Fork transcript | 96,000 characters; older entries omitted first |
-| SSE | 64 KiB/listener buffer plus at most one event; 64 listeners/session |
-| Workspace backup TTL | 30 days |
+| Limit                                    | Current value                                                                                                                       |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| JSON request body                        | 16 MiB                                                                                                                              |
+| Model input content                      | 100 parts/message or function result; image URL/data URL up to 1,000,000 characters, subject to SQLite record limits                |
+| Initial environment files                | 50; inline 5 MiB/file and 10 MiB total                                                                                              |
+| Files API `user_data` object             | 50 MiB/file; optional expiry 1 hour–30 days                                                                                         |
+| Skill upload                             | 16 MiB archive, 32 MiB extracted; ZIP64, encrypted, symlink and device entries rejected                                             |
+| Artifacts                                | 200 MiB/file and 500 MiB/turn                                                                                                       |
+| Serialized SQLite record, including keys | 1,900,000 UTF-8 bytes                                                                                                               |
+| Native checkpoint                        | 32 MiB                                                                                                                              |
+| Supervisor output buffer per execution   | 8 MB, including streamed deltas and completed items                                                                                 |
+| Turn deadline                            | 15 minutes by default, including external tool waiting and delegated children                                                       |
+| Claude Code/OpenCode turn steps          | 32                                                                                                                                  |
+| Portable AI SDK inference                | 8,192 output tokens; 120-second timeout by default                                                                                  |
+| Private model gateway                    | 4 MiB input, 8 MiB output                                                                                                           |
+| Programmatic code                        | 128 KB code, 1,000 ms CPU, 120 s wall time, 64 tool calls (8 concurrent), 128 KB arguments/call, 1 MiB results, 256 KB return value |
+| Delegated children                       | `max_concurrent_subagents` (default 6); prompt up to 128,000 characters                                                             |
+| Fork transcript                          | 96,000 characters; older entries omitted first                                                                                      |
+| SSE                                      | 64 KiB/listener buffer plus at most one event; 64 listeners/session                                                                 |
+| Workspace backup TTL                     | 30 days                                                                                                                             |
 
 The SQL limit reserves room below the platform's
 [2 MB row limit](https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits).

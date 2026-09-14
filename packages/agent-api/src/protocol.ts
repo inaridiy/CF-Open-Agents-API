@@ -6,6 +6,7 @@ import type {
   AgentSession as UpstreamSession,
 } from "openai/resources/beta/agents/agents";
 import { z } from "zod";
+
 import { agentToolSchema, credentialFreeTools, type functionToolSchema } from "./agent-tools.js";
 import { hostedConfigurationSchema } from "./environment-config.js";
 

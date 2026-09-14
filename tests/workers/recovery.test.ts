@@ -3,16 +3,18 @@ import { abortAllDurableObjects, reset, runInDurableObject } from "cloudflare:te
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
 import type { RuntimeDriver } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
+import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }

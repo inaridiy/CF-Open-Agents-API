@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+
 import { checkHarness } from "./check-harness.mjs";
 
 function fixture(t) {
@@ -29,10 +30,10 @@ function fixture(t) {
   return { root, write };
 }
 
-test("a self-contained checkout validates without a source catalog", (t) => {
+void test("a self-contained checkout validates without a source catalog", (t) => {
   assert.deepEqual(checkHarness(fixture(t).root), []);
 });
-test("broken documentation and missing distribution evidence fail validation", (t) => {
+void test("broken documentation and missing distribution evidence fail validation", (t) => {
   const { root, write } = fixture(t);
   write("docs/guide.md", "[Missing guide](gone.md)\n");
   write("skills-lock.json", '{"skills":{}}');
@@ -42,7 +43,7 @@ test("broken documentation and missing distribution evidence fail validation", (
   assert.match(errors, /missing upstream provenance/);
   assert.match(errors, /missing upstream LICENSE/);
 });
-test("an alias pointing outside its assigned skill fails validation", (t) => {
+void test("an alias pointing outside its assigned skill fails validation", (t) => {
   const { root } = fixture(t);
   rmSync(join(root, ".claude/skills/provider"));
   symlinkSync("../../docs", join(root, ".claude/skills/provider"));

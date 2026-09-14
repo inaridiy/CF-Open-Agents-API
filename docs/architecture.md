@@ -7,16 +7,16 @@ their agent loops; the AI SDK adapts a single model inference at a time.
 
 ## Service boundaries
 
-| Component | Responsibility |
-| --- | --- |
-| AgentWorker | Authentication, wire validation, tenant routing and HTTP/RPC responses |
-| TenantCatalogDO | Tenant-scoped agents, session discovery and idempotent creation reservations |
-| SessionDO | Input log, turns, required actions, output items, execution identity and events |
-| HarnessDO | Container assignment, model egress, execution transport, delegated children and checkpoint coordination |
-| Harness Container | Node supervisor and the selected native runtime |
-| SandboxDO / Sandbox Container | Separate workspace, shell and file execution environment |
-| Private model gateway | Deployment-owned model registry, provider credentials and protocol translation |
-| R2 | Native conversation checkpoints, workspace backups and immutable skill bundles |
+| Component                     | Responsibility                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------- |
+| AgentWorker                   | Authentication, wire validation, tenant routing and HTTP/RPC responses                                  |
+| TenantCatalogDO               | Tenant-scoped agents, session discovery and idempotent creation reservations                            |
+| SessionDO                     | Input log, turns, required actions, output items, execution identity and events                         |
+| HarnessDO                     | Container assignment, model egress, execution transport, delegated children and checkpoint coordination |
+| Harness Container             | Node supervisor and the selected native runtime                                                         |
+| SandboxDO / Sandbox Container | Separate workspace, shell and file execution environment                                                |
+| Private model gateway         | Deployment-owned model registry, provider credentials and protocol translation                          |
+| R2                            | Native conversation checkpoints, workspace backups and immutable skill bundles                          |
 
 The public `agent.model` selects a deployment preset mapping to a harness and a
 model registry name. A session pins the harness revision and model registry name.

@@ -13,7 +13,14 @@
     "paths": {
       "cf-open-agents-api": ["./packages/agent-api/src/index.ts"],
       "cf-open-agents-api/*": ["./packages/agent-api/src/*.ts"]
-    }
+    },
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "ignoreEffectWarningsInTscExitCode": true,
+        "ignoreEffectSuggestionsInTscExitCode": true
+      }
+    ]
   },
   "include": ["packages/**/*.ts", "examples/**/*.ts", "tests/**/*.ts", "*.config.ts"],
   "exclude": ["**/dist", "node_modules", "examples/worker/env.d.ts", "examples/caller/env.d.ts"]

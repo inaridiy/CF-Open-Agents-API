@@ -2,6 +2,7 @@ import { getSandbox, type ISandbox } from "@cloudflare/sandbox";
 import { Effect, Exit } from "effect";
 import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/environments";
 import type { z } from "zod";
+
 import { installCapabilityArchive } from "./capability-archive.js";
 import type { ContainerBindings } from "./containers.js";
 import { attempt, io, type ServiceError } from "./effect.js";

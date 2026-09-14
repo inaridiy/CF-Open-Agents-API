@@ -1,6 +1,6 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
 import { ApiError, createSessionSchema, parse, remoteApiError } from "cf-open-agents-api";
 import { type AgentRPC, bearerTenant } from "cf-open-agents-api/cloudflare";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import OpenAI from "openai";
 
 /** The example uses the API Worker's single-tenant authenticator and shared token. */

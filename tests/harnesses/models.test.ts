@@ -4,6 +4,7 @@ import { simulateReadableStream } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import OpenAI from "openai";
 import { expect, it } from "vitest";
+
 import {
   aiSDKModel,
   createModelGateway,
@@ -188,9 +189,13 @@ it("OpenAI-compatible preset rewrites the upstream model and uses the configured
     apiKey: "provider-secret",
     model: "provider-model",
     fetch: async (input, init) => {
-      expect(String(input)).toBe("https://provider.test/v1/chat/completions");
+      expect(input instanceof Request ? input.url : String(input)).toBe(
+        "https://provider.test/v1/chat/completions",
+      );
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer provider-secret");
-      expect(JSON.parse(String(init?.body)).model).toBe("provider-model");
+      expect(
+        JSON.parse(typeof init?.body === "string" ? init.body : JSON.stringify(init?.body)).model,
+      ).toBe("provider-model");
       return new Response(
         'data: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{"content":"Compatible model reached."},"finish_reason":null}]}\n\ndata: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
         { headers: { "content-type": "text/event-stream" } },
@@ -426,7 +431,9 @@ it("OpenAI-compatible preset sends reasoning_effort and a json_schema response f
     apiKey: "provider-secret",
     model: "provider-model",
     fetch: async (_input, init) => {
-      const body = JSON.parse(String(init?.body));
+      const body = JSON.parse(
+        typeof init?.body === "string" ? init.body : JSON.stringify(init?.body),
+      );
       expect(body.reasoning_effort).toBe("medium");
       expect(body.response_format).toMatchObject({
         type: "json_schema",

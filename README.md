@@ -20,16 +20,20 @@ const client = new OpenAI({
   apiKey: env.API_TOKEN,
   fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
 });
-const session = await client.beta.agents.sessions.create({
-  agent: { model: "coding" },
-  environment: { type: "openai_hosted" },
-}, { headers: { "Idempotency-Key": "report-session-1" } });
+const session = await client.beta.agents.sessions.create(
+  {
+    agent: { model: "coding" },
+    environment: { type: "openai_hosted" },
+  },
+  { headers: { "Idempotency-Key": "report-session-1" } },
+);
 for await (const event of client.beta.agents.sessions.stream(session.id, {
   input: "Create /workspace/outputs/report.txt explaining this project, then summarize it.",
   idempotencyKey: "report-turn-1",
 })) {
   if (event.type === "agent.session.turn.output_text.delta") console.log(event.delta);
-  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id) throw new Error("Agent turn failed");
+  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id)
+    throw new Error("Agent turn failed");
 }
 ```
 
@@ -38,12 +42,12 @@ The hostname is a routing label: requests travel through the Service Binding.
 The protocol spelling `openai_hosted` selects **Cloudflare compute** in this implementation.
 `coding` is a deployment-owned preset; change its runtime/model mapping to fit your application.
 
-| Connection | Start here |
-| --- | --- |
+| Connection                                           | Start here                                   |
+| ---------------------------------------------------- | -------------------------------------------- |
 | **Another Worker → Service Binding → OpenAI client** | [Recommended guide](docs/service-binding.md) |
-| Another Worker → direct typed RPC | [RPC guide](docs/rpc.md) |
-| Node, Python, or another service → hosted HTTP API | [HTTP guide](docs/http-api.md) |
-| Embed/configure the library | [Library API](docs/library-api.md) |
+| Another Worker → direct typed RPC                    | [RPC guide](docs/rpc.md)                     |
+| Node, Python, or another service → hosted HTTP API   | [HTTP guide](docs/http-api.md)               |
+| Embed/configure the library                          | [Library API](docs/library-api.md)           |
 
 ## Try the complete Worker example
 
@@ -112,25 +116,26 @@ See [architecture](docs/architecture.md) for recovery and execution limits.
 Native tests need **Codex 0.154.0** on `PATH`; pnpm installs the pinned Claude/OpenCode runtimes.
 Local test suites use scripted inference and need no production credentials.
 
-| Command | Purpose |
-| --- | --- |
-| `pnpm dev:caller` | Run the caller and its Agent Worker Service Binding |
-| `pnpm dev` | Run the Agent Worker directly on localhost:8787 |
-| `pnpm check` | Documentation, harness, scripts, types, lint, Worker tests, build |
-| `pnpm check:docs` | Verify documented commands, exports, bindings and pins |
-| `pnpm check:harness` | Check documentation links and development instructions |
-| `pnpm test:scripts` | Check development scripts |
-| `pnpm test:package` | Install and typecheck the packed library |
-| `pnpm typecheck` | Check TypeScript |
-| `pnpm lint` | Check formatting and lint rules |
-| `pnpm test` | Worker, SQLite, SDK, Service Binding and asset tests |
-| `pnpm test:codex` | Real Codex with a scripted model endpoint |
-| `pnpm test:harnesses` | All three native runtimes, model gateway and recovery |
-| `pnpm test:containers` | Real local Containers and R2 recovery with scripted inference |
-| `pnpm build` | Build ESM and declaration files |
-| `pnpm types` | Generate example Worker binding types |
-| `pnpm deploy:check` | Check deployment bundles and images without deploying |
-| `pnpm format` | Format code and imports |
+| Command                   | Purpose                                                           |
+| ------------------------- | ----------------------------------------------------------------- |
+| `pnpm dev:caller`         | Run the caller and its Agent Worker Service Binding               |
+| `pnpm dev`                | Run the Agent Worker directly on localhost:8787                   |
+| `pnpm check`              | Documentation, harness, scripts, types, lint, Worker tests, build |
+| `pnpm check:docs`         | Verify documented commands, exports, bindings and pins            |
+| `pnpm check:harness`      | Check documentation links and development instructions            |
+| `pnpm test:scripts`       | Check development scripts                                         |
+| `pnpm test:package`       | Install and typecheck the packed library                          |
+| `pnpm typecheck`          | Check TypeScript                                                  |
+| `pnpm lint`               | Type-aware lint (oxlint) and formatting (oxfmt) checks            |
+| `pnpm effect:diagnostics` | Effect language-service diagnostics for the whole project         |
+| `pnpm test`               | Worker, SQLite, SDK, Service Binding and asset tests              |
+| `pnpm test:codex`         | Real Codex with a scripted model endpoint                         |
+| `pnpm test:harnesses`     | All three native runtimes, model gateway and recovery             |
+| `pnpm test:containers`    | Real local Containers and R2 recovery with scripted inference     |
+| `pnpm build`              | Build ESM and declaration files                                   |
+| `pnpm types`              | Generate example Worker binding types                             |
+| `pnpm deploy:check`       | Check deployment bundles and images without deploying             |
+| `pnpm format`             | Format code and imports                                           |
 
 See [deployment](docs/deployment.md) for hosting, [contributing](CONTRIBUTING.md) for validation,
 and [library API](docs/library-api.md) for installing from a source checkout.

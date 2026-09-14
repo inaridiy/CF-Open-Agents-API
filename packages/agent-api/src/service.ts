@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { HostedSkill } from "openai/resources/beta/agents/agents";
 import { z } from "zod";
+
 import { sessionTools } from "./agent-tools.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource } from "./catalog.js";
@@ -1116,45 +1117,44 @@ export function createAgentService<Env extends AgentBindings>(
     );
     app.get("/v1/agents/sessions/:id/subagents", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagents(
-          parse(pageSchema, c.req.query()),
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagents(parse(pageSchema, c.req.query())),
       ),
     );
     app.get("/v1/agents/sessions/:id/subagents/:subagent", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagent(
-          c.req.param("subagent"),
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagent(c.req.param("subagent")),
       ),
     );
     app.get("/v1/agents/sessions/:id/subagents/:subagent/items", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagentItems(
-          c.req.param("subagent"),
-          parse(pageSchema, c.req.query()),
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagentItems(c.req.param("subagent"), parse(pageSchema, c.req.query())),
       ),
     );
     app.get("/v1/agents/sessions/:id/subagents/:subagent/turns", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagentTurns(
-          c.req.param("subagent"),
-          parse(pageSchema, c.req.query()),
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagentTurns(c.req.param("subagent"), parse(pageSchema, c.req.query())),
       ),
     );
     app.get("/v1/agents/sessions/:id/subagents/:subagent/turns/:turn", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagentTurn(
-          c.req.param("subagent"),
-          c.req.param("turn"),
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagentTurn(c.req.param("subagent"), c.req.param("turn")),
       ),
     );
     app.get("/v1/agents/sessions/:id/subagents/:subagent/turns/:turn/items", async (c) =>
       Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).subagentItems(
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).subagentItems(
           c.req.param("subagent"),
           parse(pageSchema, c.req.query()),
           c.req.param("turn"),
@@ -1168,10 +1168,9 @@ export function createAgentService<Env extends AgentBindings>(
       );
       const { environment_id, ...page } = query;
       return Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).artifacts(
-          page,
-          environment_id ?? undefined,
-        ),
+        await (
+          await c.env.session(c.get("tenant"), c.req.param("id"))
+        ).artifacts(page, environment_id ?? undefined),
       );
     });
     app.get("/v1/agents/sessions/:id/artifacts/:artifact", async (c) => {
@@ -1181,9 +1180,9 @@ export function createAgentService<Env extends AgentBindings>(
       return Response.json(resource);
     });
     app.get("/v1/agents/sessions/:id/artifacts/:artifact/content", async (c) => {
-      const artifact = await (await c.env.session(c.get("tenant"), c.req.param("id"))).artifact(
-        c.req.param("artifact"),
-      );
+      const artifact = await (
+        await c.env.session(c.get("tenant"), c.req.param("id"))
+      ).artifact(c.req.param("artifact"));
       const object = await options.objects?.(c.env.env).get(artifact.key);
       if (!object) throw new ApiError(404, "not_found", "Artifact content not found");
       return new Response(object.body, {

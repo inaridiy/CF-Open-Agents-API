@@ -11,15 +11,15 @@ the CI workflow runs the full matrix for integration. Scripted suites use local
 fixtures without production credentials. Clearly distinguish scripted inference
 from real-provider evidence.
 
-| Change | Checks and completion evidence |
-| --- | --- |
-| Prose, agent instructions, skill inventory | `pnpm check:docs` and `pnpm check:harness`; inspect the diff. |
-| Development checker scripts | The documentation/harness checks, `pnpm test:scripts`, and `pnpm lint` |
-| API/session/storage logic, runtime dependencies or test behavior | `pnpm check`; correctness fixes need a behavioral regression at the affected boundary |
+| Change                                                            | Checks and completion evidence                                                                                    |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Prose, agent instructions, skill inventory                        | `pnpm check:docs` and `pnpm check:harness`; inspect the diff.                                                     |
+| Development checker scripts                                       | The documentation/harness checks, `pnpm test:scripts`, and `pnpm lint`                                            |
+| API/session/storage logic, runtime dependencies or test behavior  | `pnpm check`; correctness fixes need a behavioral regression at the affected boundary                             |
 | Supervisor, model gateway, native protocols or checkpoint formats | `pnpm check`, `pnpm test:codex`, `pnpm test:harnesses`; exercise the affected native runtime and history recovery |
-| Container transport, Sandbox tools, R2 restore or Docker images | The applicable code/native checks plus `pnpm test:containers`; see [deployment prerequisites](docs/deployment.md) |
-| Public package exports, dependencies or release assembly | `pnpm check`, `pnpm test:package`; native and Container checks when their dependency tree changes |
-| Worker bindings/configuration or deployment packaging | `pnpm types`, `pnpm build`, `pnpm deploy:check`; transport changes also require Container smoke |
+| Container transport, Sandbox tools, R2 restore or Docker images   | The applicable code/native checks plus `pnpm test:containers`; see [deployment prerequisites](docs/deployment.md) |
+| Public package exports, dependencies or release assembly          | `pnpm check`, `pnpm test:package`; native and Container checks when their dependency tree changes                 |
+| Worker bindings/configuration or deployment packaging             | `pnpm types`, `pnpm build`, `pnpm deploy:check`; transport changes also require Container smoke                   |
 
 Match recurring diagnostics against [known issues](docs/known-issues.md). See [scope and completion](#scope-and-completion) for contribution boundaries.
 

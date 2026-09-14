@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 import { env } from "cloudflare:test";
 import { expect, it } from "vitest";
+
 import { runProgrammatic } from "../../packages/agent-api/src/programmatic.js";
 
 const loader = (env as unknown as { CODE_LOADER: WorkerLoader }).CODE_LOADER;

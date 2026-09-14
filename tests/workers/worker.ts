@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Effect } from "effect";
 import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/environments";
+
 import ExampleCallerWorker from "../../examples/caller/src/index.js";
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
 import type { EnvironmentDriver } from "../../packages/agent-api/src/environments.js";

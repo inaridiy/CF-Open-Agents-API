@@ -1,9 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { expect, it } from "vitest";
+
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
@@ -18,7 +20,7 @@ it.each(["complete", "cancel", "immediate"])(
     });
     let searched = false;
     let spawned = false;
-    const server = createServer(async (request, response) => {
+    const handle = async (request: IncomingMessage, response: ServerResponse) => {
       const chunks: Uint8Array[] = [];
       for await (const chunk of request) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
@@ -90,6 +92,9 @@ it.each(["complete", "cancel", "immediate"])(
         },
       });
       response.end();
+    };
+    const server = createServer((request, response) => {
+      void handle(request, response);
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();

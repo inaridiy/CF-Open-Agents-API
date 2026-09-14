@@ -4,13 +4,15 @@ import { reset } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
+import type * as WorkerModule from "./worker.js";
 import type { TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }
@@ -27,7 +29,10 @@ const raw = (path: string, init: RequestInit = {}) =>
   exports.default.fetch(
     new Request(`https://api.test${path}`, {
       ...init,
-      headers: { authorization: `Bearer ${tenant}`, ...(init.headers ?? {}) },
+      headers: {
+        authorization: `Bearer ${tenant}`,
+        ...Object.fromEntries(new Headers(init.headers)),
+      },
     }),
   );
 const json = (path: string, body: unknown, headers: Record<string, string> = {}) =>
@@ -47,14 +52,14 @@ it("accepts vault_ids: null on create and fork as an empty list", async () => {
   expect(session.vault_ids).toEqual([]);
   const fork = await json(`/cf/v1/sessions/${session.id}/fork`, { vault_ids: null });
   expect(fork.status).toBe(200);
-  expect(((await fork.json()) as { vault_ids: string[] }).vault_ids).toEqual([]);
+  expect((await fork.json<{ vault_ids: string[] }>()).vault_ids).toEqual([]);
 });
 
 it("treats an absent or empty request body as no changes instead of malformed JSON", async () => {
   const agent = await api.beta.agents.create({ model: "test", name: "bodyless" });
   const bare = await raw(`/v1/agents/${agent.id}`, { method: "POST" });
   expect(bare.status).toBe(200);
-  expect(((await bare.json()) as { name: string }).name).toBe("bodyless");
+  expect((await bare.json<{ name: string }>()).name).toBe("bodyless");
   const empty = await raw(`/v1/agents/${agent.id}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -78,7 +83,7 @@ it("treats an absent or empty request body as no changes instead of malformed JS
     body: "{not json",
   });
   expect(broken.status).toBe(400);
-  expect(((await broken.json()) as { error: { code: string } }).error.code).toBe("invalid_json");
+  expect((await broken.json<{ error: { code: string } }>()).error.code).toBe("invalid_json");
 });
 
 it("round-trips hyphenated function names and MCP server labels", async () => {
@@ -157,7 +162,7 @@ it("marks permanent conflicts as not retryable and stamps every response with a 
     { "Idempotency-Key": "conflict-key" },
   );
   expect(conflict.status).toBe(409);
-  expect(((await conflict.json()) as { error: { code: string } }).error.code).toBe(
+  expect((await conflict.json<{ error: { code: string } }>()).error.code).toBe(
     "idempotency_conflict",
   );
   expect(conflict.headers.get("x-should-retry")).toBe("false");
@@ -255,11 +260,12 @@ it("uses OpenAI's error types for rate limits and server errors", async () => {
     expect(streams.every((response) => response.status === 200)).toBe(true);
     const limited = await raw(`/v1/agents/sessions/${session.id}/events`);
     expect(limited.status).toBe(429);
-    expect(
-      ((await limited.json()) as { error: { type: string; code: string } }).error,
-    ).toMatchObject({ type: "rate_limit_error", code: "stream_limit" });
+    expect((await limited.json<{ error: { type: string; code: string } }>()).error).toMatchObject({
+      type: "rate_limit_error",
+      code: "stream_limit",
+    });
   } finally {
-    await Promise.all(streams.map((response) => response.body?.cancel()));
+    await Promise.all(streams.map((response) => response.body?.cancel() ?? Promise.resolve()));
   }
   // The Service Binding fixture has no object storage, so a file upload is a server error.
   const form = new FormData();
@@ -273,7 +279,7 @@ it("uses OpenAI's error types for rate limits and server errors", async () => {
     }),
   );
   expect(unavailable.status).toBe(503);
-  expect(
-    ((await unavailable.json()) as { error: { type: string; code: string } }).error,
-  ).toMatchObject({ type: "server_error", code: "storage_unavailable" });
+  expect((await unavailable.json<{ error: { type: string; code: string } }>()).error).toMatchObject(
+    { type: "server_error", code: "storage_unavailable" },
+  );
 });

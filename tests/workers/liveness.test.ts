@@ -3,6 +3,7 @@ import { reset, runDurableObjectAlarm, runInDurableObject } from "cloudflare:tes
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
 import { ApiError } from "../../packages/agent-api/src/protocol.js";
 import type {
   PromiseRuntimeDriver,
@@ -11,13 +12,14 @@ import type {
 } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import { type SessionRecord, TRANSCRIPT_LIMIT } from "../../packages/agent-api/src/session.js";
+import type * as WorkerModule from "./worker.js";
 import type { CatalogDO, SessionDO, TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }
@@ -574,7 +576,7 @@ it("the HTTP layer authenticates before buffering and follows the OpenAI error e
     }),
   );
   expect(forked.status).toBe(200);
-  expect(((await forked.json()) as { status: string }).status).toBe("idle");
+  expect((await forked.json<{ status: string }>()).status).toBe("idle");
 });
 
 it("session agents omit tool_search as the SDK's session type does, while saved agents keep it", async () => {

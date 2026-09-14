@@ -1,5 +1,6 @@
 import type { FilePart, ModelMessage, ToolResultPart, UserContent } from "ai";
 import { z } from "zod";
+
 import { ApiError, canonicalJSON } from "../protocol.js";
 
 export interface ModelInput {

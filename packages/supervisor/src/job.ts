@@ -1,4 +1,5 @@
 import { mkdir, rm } from "node:fs/promises";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
@@ -26,6 +27,7 @@ import {
 } from "cf-open-agents-api";
 import { Deferred, Effect, Exit, Fiber, Ref, Scope } from "effect";
 import { z } from "zod";
+
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
 import { describeFailure, JobLifecycle, Operations, once } from "./lifecycle.js";
@@ -479,11 +481,10 @@ export abstract class ToolJob implements NativeJob {
       return Effect.succeed<ToolResult["content"]>([{ type: "text", text: output }]);
     return io("native.toolImages", () =>
       Promise.all(
-        output.map(
-          async (part): Promise<ToolResult["content"][number]> =>
-            part.type === "input_text"
-              ? { type: "text", text: part.text }
-              : imageContent(part.image_url, this.abort.signal, this.options.mediaUrl),
+        output.map(async (part): Promise<ToolResult["content"][number]> =>
+          part.type === "input_text"
+            ? { type: "text", text: part.text }
+            : imageContent(part.image_url, this.abort.signal, this.options.mediaUrl),
         ),
       ),
     );
@@ -542,11 +543,10 @@ export abstract class ToolJob implements NativeJob {
       this.lifecycle.setStatus(entry.remaining ? "waiting" : "running");
       yield* Deferred.succeed(entry.result, { content, isError: !command.success });
     }).pipe(
-      Effect.mapError(
-        (cause): ServiceError =>
-          cause instanceof ApiError
-            ? cause
-            : new OperationError({ operation: "native.control", cause }),
+      Effect.mapError((cause): ServiceError =>
+        cause instanceof ApiError
+          ? cause
+          : new OperationError({ operation: "native.control", cause }),
       ),
     );
   }

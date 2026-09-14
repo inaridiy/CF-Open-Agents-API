@@ -6,6 +6,7 @@ import type {
   Subagent,
 } from "openai/resources/beta/agents/agents";
 import type { SessionArtifact } from "openai/resources/beta/agents/sessions/artifacts";
+
 import { attempt, io, runPromise } from "./effect.js";
 import type { EnvironmentSpec } from "./environments.js";
 import type {
@@ -230,16 +231,17 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   initialize(record: SessionRecord): AgentSession {
     const existing = this.db.get<SessionRecord>("state", "session");
     if (existing) return existing.session;
+    let migrated = record;
     this.db.transaction(() => {
-      record = this.migrate(record);
-      this.save(record);
+      migrated = this.migrate(record);
+      this.save(migrated);
       this.emit({
         event_id: identifier("evt"),
         type: "agent.session.created",
-        session: record.session,
+        session: migrated.session,
       });
     });
-    return record.session;
+    return migrated.session;
   }
   private record(): SessionRecord {
     const original = this.db.require<SessionRecord>("state", "session");
@@ -1154,7 +1156,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.detach(controller);
   }
   private closeListeners(): void {
-    for (const listener of [...this.listeners.keys()]) this.closeListener(listener);
+    for (const listener of this.listeners.keys()) this.closeListener(listener);
   }
   /** A creation stream covers the initial turn only, or nothing when no input was given. */
   private initialSettled(event: AgentSessionEvent): boolean {

@@ -2,6 +2,7 @@ import { Data, Effect, Schema } from "effect";
 import type { Credential } from "openai/resources/beta/agents/vaults/credentials";
 import type { Vault } from "openai/resources/beta/agents/vaults/vaults";
 import { z } from "zod";
+
 import { attempt, io } from "./effect.js";
 import { requestWithoutRedirect } from "./http.js";
 import {

@@ -11,7 +11,9 @@ Import the public contract from the Cloudflare entry point:
 
 ```ts
 import type { AgentRPC } from "cf-open-agents-api/cloudflare";
-interface Env { AGENTS: Fetcher & AgentRPC }
+interface Env {
+  AGENTS: Fetcher & AgentRPC;
+}
 ```
 
 When the caller can import the deployment's Worker class, Cloudflare's `Service<AgentWorker>` type also describes its binding.
@@ -26,14 +28,30 @@ The service still checks session ownership within that tenant.
 
 ```ts
 const tenant = authenticatedUser.tenantId;
-const session = await env.AGENTS.createSession(tenant, {
-  agent: { model: "coding" },
-  environment: { type: "openai_hosted" },
-}, "task-123-session");
-await env.AGENTS.submitEvents(tenant, session.id, [{
-  type: "agent.session.input.message",
-  input: [{ role: "user", content: [{ type: "input_text", text: "Create a report in /workspace/outputs." }] }],
-}], "task-123-input");
+const session = await env.AGENTS.createSession(
+  tenant,
+  {
+    agent: { model: "coding" },
+    environment: { type: "openai_hosted" },
+  },
+  "task-123-session",
+);
+await env.AGENTS.submitEvents(
+  tenant,
+  session.id,
+  [
+    {
+      type: "agent.session.input.message",
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "Create a report in /workspace/outputs." }],
+        },
+      ],
+    },
+  ],
+  "task-123-input",
+);
 return Response.json({ session_id: session.id });
 ```
 

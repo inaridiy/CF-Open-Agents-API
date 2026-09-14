@@ -1,4 +1,5 @@
 import type { FinishReason, LanguageModelUsage } from "ai";
+
 import { ApiError } from "../protocol.js";
 import type { ModelInput } from "./input.js";
 

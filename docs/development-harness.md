@@ -7,14 +7,14 @@
 
 ## Skills and ownership
 
-| Skill | Purpose | Source |
-| --- | --- | --- |
-| [durable-objects](../.agents/skills/durable-objects/SKILL.md) | SQLite DO state, RPC, alarms and concurrency | Cloudflare |
-| [effect-ts](../.agents/skills/effect-ts/SKILL.md) | Effect repository setup | Effect-TS |
-| [sandbox-next](../.agents/skills/sandbox-next/SKILL.md) | Preview Sandbox lifecycle and backups | Cloudflare |
-| [workers-best-practices](../.agents/skills/workers-best-practices/SKILL.md) | Worker runtime and bindings | Cloudflare |
-| [wrangler](../.agents/skills/wrangler/SKILL.md) | Wrangler commands and configuration | Cloudflare |
-| [native-harness-change](../.agents/skills/native-harness-change/SKILL.md) | Native adapters, gateway and recovery | This repository |
+| Skill                                                                       | Purpose                                      | Source          |
+| --------------------------------------------------------------------------- | -------------------------------------------- | --------------- |
+| [durable-objects](../.agents/skills/durable-objects/SKILL.md)               | SQLite DO state, RPC, alarms and concurrency | Cloudflare      |
+| [effect-ts](../.agents/skills/effect-ts/SKILL.md)                           | Effect repository setup                      | Effect-TS       |
+| [sandbox-next](../.agents/skills/sandbox-next/SKILL.md)                     | Preview Sandbox lifecycle and backups        | Cloudflare      |
+| [workers-best-practices](../.agents/skills/workers-best-practices/SKILL.md) | Worker runtime and bindings                  | Cloudflare      |
+| [wrangler](../.agents/skills/wrangler/SKILL.md)                             | Wrangler commands and configuration          | Cloudflare      |
+| [native-harness-change](../.agents/skills/native-harness-change/SKILL.md)   | Native adapters, gateway and recovery        | This repository |
 
 `.agents/skills/` contains the installed snapshots. `.claude/skills/` contains
 relative aliases. [skills-lock.json](../skills-lock.json) preserves installer

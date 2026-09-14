@@ -1,10 +1,12 @@
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { afterEach, expect, it } from "vitest";
+
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { CodexJob, type CodexOptions, turnErrorCode } from "../../packages/supervisor/src/codex.js";
 
@@ -57,12 +59,15 @@ async function runCodex(
   const directory = await mkdtemp(join(tmpdir(), "cf-codex-errors-"));
   cleanup.push(() => rm(directory, { recursive: true, force: true }));
   const requests: Record<string, unknown>[] = [];
-  const provider = createServer(async (request, response) => {
+  const handle = async (request: IncomingMessage, response: ServerResponse) => {
     const chunks: Uint8Array[] = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
     requests.push(body);
     script(body, response, requests.length);
+  };
+  const provider = createServer((request, response) => {
+    void handle(request, response);
   });
   provider.listen(0, "127.0.0.1");
   await once(provider, "listening");

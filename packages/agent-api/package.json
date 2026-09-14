@@ -2,8 +2,16 @@
   "name": "cf-open-agents-api",
   "version": "0.1.0",
   "description": "Unofficial, independent implementation of the OpenAI Agents API on Cloudflare Workers, Durable Objects and Containers, running Codex, Claude Code or OpenCode against models you configure",
-  "type": "module",
+  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
+  "bugs": {
+    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
+  },
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inaridiy/CF-Open-Agents-API.git",
+    "directory": "packages/agent-api"
+  },
   "files": [
     "dist",
     "src",
@@ -12,6 +20,7 @@
     "NOTICE",
     "CHANGELOG.md"
   ],
+  "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -30,6 +39,11 @@
       "default": "./dist/models.js"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "tag": "alpha"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "node ../../scripts/prepare-package.mjs"
@@ -44,6 +58,11 @@
     "yaml": "2.9.1",
     "zod": "^4.6.2"
   },
+  "devDependencies": {
+    "ai": "7.0.97",
+    "effect": "3.22.2",
+    "openai": "7.15.0"
+  },
   "peerDependencies": {
     "ai": "^7.0.97",
     "effect": "^3.22.2",
@@ -53,24 +72,5 @@
     "ai": {
       "optional": true
     }
-  },
-  "devDependencies": {
-    "ai": "7.0.97",
-    "effect": "3.22.2",
-    "openai": "7.15.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/inaridiy/CF-Open-Agents-API.git",
-    "directory": "packages/agent-api"
-  },
-  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
-  "bugs": {
-    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
-  },
-  "publishConfig": {
-    "access": "public",
-    "tag": "alpha",
-    "provenance": true
   }
 }

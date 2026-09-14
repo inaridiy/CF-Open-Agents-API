@@ -3,6 +3,7 @@
 import { reset, runDurableObjectAlarm } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
+
 import { agentClient } from "../../examples/caller/src/index.js";
 import type {
   AgentSession,

@@ -8,6 +8,7 @@ import {
   tool,
 } from "ai";
 import { Context, Effect, Layer } from "effect";
+
 import { attempt, io, runPromise, type ServiceError } from "./effect.js";
 import { requestWithoutRedirect } from "./http.js";
 import { readModelBodyEffect } from "./models/body.js";
@@ -59,7 +60,7 @@ const structuredOutput = (schema: OutputSchema | undefined) =>
           ...(schema.name ? { name: schema.name } : {}),
           ...(schema.description ? { description: schema.description } : {}),
         })
-      : Output.json({ ...(schema.name ? { name: schema.name } : {}) });
+      : Output.json(schema.name ? { name: schema.name } : {});
 const settingsOf = (input: ModelInput): ModelSettings => ({
   ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
   ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
@@ -76,7 +77,7 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
         instructions:
           input.messages
             .filter((message) => message.role === "system")
-            .map((message) => message.content as string)
+            .map((message) => message.content)
             .join("\n\n") || undefined,
         messages: input.messages.filter((message) => message.role !== "system"),
         tools: Object.fromEntries(
@@ -131,6 +132,8 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
               throw new Error("Upstream model request failed");
             case "finish":
               yield { type: "finish", reason: part.finishReason, usage: part.totalUsage };
+              break;
+            default:
               break;
           }
         }

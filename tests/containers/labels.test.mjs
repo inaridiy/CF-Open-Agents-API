@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+
 import {
   isServerLabel,
   sanitizeServerLabel,
@@ -7,7 +8,7 @@ import {
 
 // Run after `pnpm build`: node --test tests/containers/labels.test.mjs
 
-test("plugin-derived MCP labels are always valid server labels", () => {
+void test("plugin-derived MCP labels are always valid server labels", () => {
   assert.equal(sanitizeServerLabel("my-plugin_search"), "my_plugin_search");
   assert.equal(sanitizeServerLabel("9lives"), "_9lives");
   assert.equal(sanitizeServerLabel("a".repeat(100)).length, 64);
@@ -15,7 +16,7 @@ test("plugin-derived MCP labels are always valid server labels", () => {
     assert.ok(isServerLabel(sanitizeServerLabel(candidate)), candidate);
 });
 
-test("labels never collide with reserved or previously derived labels", () => {
+void test("labels never collide with reserved or previously derived labels", () => {
   const taken = new Set(["fixture"]);
   assert.equal(sanitizeServerLabel("fixture", taken), "fixture_2");
   taken.add("fixture_2");

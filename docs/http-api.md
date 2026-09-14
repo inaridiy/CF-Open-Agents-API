@@ -22,16 +22,20 @@ const client = new OpenAI({
   baseURL: "https://agents.example.com/v1",
   apiKey: process.env.AGENT_API_TOKEN,
 });
-const session = await client.beta.agents.sessions.create({
-  agent: { model: "coding" },
-  environment: { type: "openai_hosted" },
-}, { headers: { "Idempotency-Key": "task-123-session" } });
+const session = await client.beta.agents.sessions.create(
+  {
+    agent: { model: "coding" },
+    environment: { type: "openai_hosted" },
+  },
+  { headers: { "Idempotency-Key": "task-123-session" } },
+);
 for await (const event of client.beta.agents.sessions.stream(session.id, {
   input: "Create /workspace/outputs/report.txt and summarize it.",
   idempotencyKey: "task-123-input",
 })) {
   if (event.type === "agent.session.turn.output_text.delta") process.stdout.write(event.delta);
-  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id) throw new Error("Turn failed");
+  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id)
+    throw new Error("Turn failed");
 }
 ```
 

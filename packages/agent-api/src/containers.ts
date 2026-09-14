@@ -2,6 +2,7 @@ import { Container } from "@cloudflare/containers";
 import { getSandbox, type ISandbox, Sandbox } from "@cloudflare/sandbox";
 import { Effect, Schema } from "effect";
 import { z } from "zod";
+
 import type { McpToolConfig } from "./agent-tools.js";
 import type { CatalogObject } from "./catalog.js";
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
@@ -16,8 +17,8 @@ import { fetchAssignedImage } from "./media.js";
 import { readModelBody } from "./models/body.js";
 import { constrainCodexSearch } from "./models/codex-search.js";
 import { discoverCapabilities } from "./portable-capabilities.js";
-import { runProgrammatic } from "./programmatic.js";
 import { programmaticInputSchema } from "./programmatic-contract.js";
+import { runProgrammatic } from "./programmatic.js";
 import { ApiError } from "./protocol.js";
 import type {
   Checkpoint,
@@ -115,7 +116,8 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
     super(ctx, env);
     // Internet access is enabled unless the environment's network policy disabled it.
     // The policy is stored before the Container starts (see configureNetwork).
-    ctx.blockConcurrencyWhile(async () => {
+    // The runtime awaits this; the constructor itself cannot.
+    void ctx.blockConcurrencyWhile(async () => {
       this.enableInternet = (await ctx.storage.get<boolean>("environment_internet")) ?? true;
     });
   }

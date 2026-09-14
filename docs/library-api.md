@@ -19,26 +19,26 @@ The repository example uses `workspace:*`; it does not require an npm publicatio
 
 ## Entry points
 
-| Import | Exports |
-| --- | --- |
-| `cf-open-agents-api` | Wire schemas/types, `ApiError`, `remoteApiError`, runtime contracts, Effect boundary helpers |
+| Import                          | Exports                                                                                                    |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `cf-open-agents-api`            | Wire schemas/types, `ApiError`, `remoteApiError`, runtime contracts, Effect boundary helpers               |
 | `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, DO/Container classes and drivers |
-| `cf-open-agents-api/models` | `aiSDKModel`, `nativeModel`, `openAICompatibleModel`, `createModelGateway` |
-| `cf-open-agents-api/tools` | Function tool contracts, search presets, immutable asset/skill helpers |
+| `cf-open-agents-api/models`     | `aiSDKModel`, `nativeModel`, `openAICompatibleModel`, `createModelGateway`                                 |
+| `cf-open-agents-api/tools`      | Function tool contracts, search presets, immutable asset/skill helpers                                     |
 
 See [the composition root](../examples/worker/src/index.ts) for a complete deployment.
 `createAgentService(options)` returns `AgentWorker` and `SessionDO` classes configured together.
 Subclass/export both, and bind the tenant catalog, harness, Sandbox, and R2 resources in Wrangler.
 
-| Factory option | Purpose |
-| --- | --- |
-| `agents` | Public model aliases mapped to `{ harness, model, delegates? }` |
-| `harnesses(env)` | Execution drivers, usually `containerHarnesses` |
-| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null` |
-| `objects(env)` | R2 bucket used for configuration and artifact content |
-| `environments(env)` | Hosted environment driver, usually `containerEnvironments` |
-| `maxTurnMs` | Turn deadline; default 15 minutes |
-| `pollIntervalMs` | Durable reconciliation interval; default one second |
+| Factory option               | Purpose                                                         |
+| ---------------------------- | --------------------------------------------------------------- |
+| `agents`                     | Public model aliases mapped to `{ harness, model, delegates? }` |
+| `harnesses(env)`             | Execution drivers, usually `containerHarnesses`                 |
+| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null`                |
+| `objects(env)`               | R2 bucket used for configuration and artifact content           |
+| `environments(env)`          | Hosted environment driver, usually `containerEnvironments`      |
+| `maxTurnMs`                  | Turn deadline; default 15 minutes                               |
+| `pollIntervalMs`             | Durable reconciliation interval; default one second             |
 
 `openai_hosted` is the upstream wire name for this deployment's Cloudflare Sandbox.
 Provider keys belong in `createModelGateway`'s Worker, not in client configuration or native runtime snapshots.
@@ -49,17 +49,17 @@ Provider keys belong in `createModelGateway`'s Worker, not in client configurati
 Every method takes a trusted `tenant` first.
 Types come from the package's exported schemas; `PageQuery` accepts `after`, `limit`, and `order`.
 
-| Method | Result |
-| --- | --- |
-| `createSession(tenant, parameters, key?)` | `AgentSession` |
+| Method                                       | Result                                                                                    |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `createSession(tenant, parameters, key?)`    | `AgentSession`                                                                            |
 | `forkSession(tenant, id, parameters?, key?)` | `AgentSession`; `/cf/v1` extension, see [forks](environments-and-tools.md#fork-a-session) |
-| `retrieveSession(tenant, id)` | `AgentSession` |
-| `listSessions(tenant, query?)` | `ListPage<AgentSession>`; optional `agent_id` filter |
-| `submitEvents(tenant, id, events, key?)` | `void` |
-| `listItems(tenant, id, query?)` | `ListPage<AgentSessionItem>` |
-| `listTurns(tenant, id, query?)` | `ListPage<Turn>` |
-| `retrieveTurn(tenant, id, turnId)` | `Turn` |
-| `deleteSession(tenant, id)` | `{ id, object: "agent.session.deleted", deleted: true }` |
+| `retrieveSession(tenant, id)`                | `AgentSession`                                                                            |
+| `listSessions(tenant, query?)`               | `ListPage<AgentSession>`; optional `agent_id` filter                                      |
+| `submitEvents(tenant, id, events, key?)`     | `void`                                                                                    |
+| `listItems(tenant, id, query?)`              | `ListPage<AgentSessionItem>`                                                              |
+| `listTurns(tenant, id, query?)`              | `ListPage<Turn>`                                                                          |
+| `retrieveTurn(tenant, id, turnId)`           | `Turn`                                                                                    |
+| `deleteSession(tenant, id)`                  | `{ id, object: "agent.session.deleted", deleted: true }`                                  |
 
 All results are promises. Defaults and validation match the corresponding HTTP operations.
 For streaming and other official resources, use `AGENTS.fetch` through the OpenAI client.

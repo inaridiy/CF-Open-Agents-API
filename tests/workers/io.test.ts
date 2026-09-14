@@ -3,6 +3,7 @@ import { abortAllDurableObjects, reset, runInDurableObject } from "cloudflare:te
 import { env } from "cloudflare:workers";
 import { Effect, Fiber } from "effect";
 import { afterEach, expect, it } from "vitest";
+
 import { runPromise } from "../../packages/agent-api/src/effect.js";
 import { copyKnownLength } from "../../packages/agent-api/src/files.js";
 import { proxyMcp } from "../../packages/agent-api/src/mcp.js";
@@ -218,7 +219,7 @@ it("OAuth interruption aborts the request and preserves unknown outcome across e
               "abort",
               () => {
                 aborted.resolve();
-                reject(request.signal.reason);
+                reject(request.signal.reason as Error);
               },
               { once: true },
             );

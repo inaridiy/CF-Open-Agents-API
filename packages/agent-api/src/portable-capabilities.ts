@@ -1,6 +1,7 @@
 import type { ISandbox } from "@cloudflare/sandbox";
 import { parseDocument } from "yaml";
 import { z } from "zod";
+
 import { type McpToolConfig, mcpToolSchema } from "./agent-tools.js";
 
 /** Discovery reads bounded metadata only. Skill bodies remain in the Sandbox. */

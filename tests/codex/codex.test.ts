@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { afterEach, expect, it } from "vitest";
+
 import type { Execution, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
@@ -25,7 +27,7 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
   const requests: Record<string, unknown>[] = [];
   let commandIssued = false;
   let functionIssued = false;
-  const provider = createServer(async (request, response) => {
+  const handle = async (request: IncomingMessage, response: ServerResponse) => {
     const chunks: Uint8Array[] = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
@@ -89,6 +91,9 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
       },
     });
     response.end();
+  };
+  const provider = createServer((request, response) => {
+    void handle(request, response);
   });
   provider.listen(0, "127.0.0.1");
   await once(provider, "listening");

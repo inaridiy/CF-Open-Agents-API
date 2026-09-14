@@ -2,9 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+
 import { simulateReadableStream } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { expect, it } from "vitest";
+
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/models.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
@@ -100,9 +102,8 @@ it.each(["claude-code", "opencode"])(
       ),
     }));
     const model = await serveFetch((request) => gateway.fetch(request, {}));
-    let supervisor: ReturnType<typeof createSupervisor>;
     const server = await serveFetch(async (request) => supervisor.app.fetch(request));
-    supervisor = createSupervisor({
+    const supervisor = createSupervisor({
       binary: "codex",
       opencodeBinary: resolve("node_modules/.bin/opencode"),
       directory,

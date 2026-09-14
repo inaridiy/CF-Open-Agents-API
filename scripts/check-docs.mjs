@@ -3,8 +3,11 @@ import { readFile } from "node:fs/promises";
 
 const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
 const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+// npm lifecycle hooks run on install and are not commands a developer types.
+const lifecycle = new Set(["prepare", "prepack", "postinstall", "preinstall", "prepublishOnly"]);
 for (const command of Object.keys(manifest.scripts))
-  assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
+  if (!lifecycle.has(command))
+    assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
 const library = JSON.parse(
   await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
 );

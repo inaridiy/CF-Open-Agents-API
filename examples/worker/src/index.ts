@@ -1,4 +1,3 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
 import { createOpenAI } from "@ai-sdk/openai";
 import {
   type AgentBindings,
@@ -13,6 +12,7 @@ import {
   SandboxContainer,
 } from "cf-open-agents-api/cloudflare";
 import { aiSDKModel, createModelGateway, nativeModel } from "cf-open-agents-api/models";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { createWorkersAI } from "workers-ai-provider";
 
 interface Bindings extends AgentBindings, ContainerBindings {

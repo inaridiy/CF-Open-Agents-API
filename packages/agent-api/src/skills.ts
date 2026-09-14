@@ -3,6 +3,7 @@ import type { Skill } from "openai/resources/skills/skills";
 import type { SkillVersion } from "openai/resources/skills/versions/versions";
 import { parseDocument } from "yaml";
 import { z } from "zod";
+
 import { ApiError, canonicalJSON, identifier, type PageQuery, parse } from "./protocol.js";
 import { readSkillZip } from "./skill-zip.js";
 import type { SqlStore } from "./storage.js";

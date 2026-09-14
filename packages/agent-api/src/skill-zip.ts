@@ -1,5 +1,7 @@
-import { crc32, inflateRawSync, type ZlibOptions } from "node:zlib";
+import { crc32, inflateRawSync } from "node:zlib";
+
 import { z } from "zod";
+
 import { ApiError } from "./protocol.js";
 
 export interface SkillZipEntry {
@@ -103,7 +105,7 @@ export function readSkillZip(data: Uint8Array, limit: number): Map<string, Skill
         const result: unknown = inflateRawSync(source, {
           maxOutputLength: Math.max(1, expanded),
           info: true,
-        } as ZlibOptions & { info: true });
+        });
         const decoded = inflated.parse(result);
         if (decoded.engine.bytesWritten !== source.length) throw invalid();
         bytes = decoded.buffer;

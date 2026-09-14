@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import type { FileObject } from "openai/resources/files";
 import { z } from "zod";
+
 import { attempt, io } from "./effect.js";
 import { ApiError, identifier, parse } from "./protocol.js";
 

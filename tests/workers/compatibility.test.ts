@@ -4,13 +4,15 @@ import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import type { AgentSessionEvent, InputContentParam } from "openai/resources/beta/agents/agents";
 import { afterEach, expect, it } from "vitest";
+
+import type * as WorkerModule from "./worker.js";
 import type { TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }

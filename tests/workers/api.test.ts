@@ -9,14 +9,16 @@ import {
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
+import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }
@@ -257,9 +259,7 @@ it("provides durable replay through a separate extension", async () => {
   );
   const events = await response.json<{ seq: number; event: { type: string } }[]>();
   expect(events.some(({ event }) => event.type === "agent.session.turn.completed")).toBe(true);
-  expect(events.map(({ seq }) => seq)).toEqual(
-    [...events.map(({ seq }) => seq)].sort((a, b) => a - b),
-  );
+  expect(events.map(({ seq }) => seq)).toEqual(events.map(({ seq }) => seq).sort((a, b) => a - b));
 });
 
 it("the official SDK stream helper observes a complete ordered turn", async () => {

@@ -15,6 +15,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
+
 import { ClaudeCodeJob } from "./claude-code.js";
 import { CodexJob, type CodexOptions } from "./codex.js";
 import type { NativeJob, NativeOptions } from "./job.js";
@@ -57,10 +58,10 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
     recent.push(line.length > 4096 ? `${line.slice(0, 4096)}…` : line);
     if (recent.length > 200) recent.shift();
   };
-  options = { ...options, diagnostics };
+  const configured: Options = { ...options, diagnostics };
   // Serialize ownership changes and snapshots, while callbacks remain available during startup.
   const lifecycle = Effect.unsafeMakeSemaphore(1);
-  const layer = Layer.succeed(NativeRuntime, { create: factory, options });
+  const layer = Layer.succeed(NativeRuntime, { create: factory, options: configured });
   const lookup = (turn: string) =>
     Effect.gen(function* () {
       const current = yield* Ref.get(active);
