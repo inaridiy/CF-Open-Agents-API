@@ -1,70 +1,87 @@
 # Deployment and verification
 
-The example is one Worker owning all DO classes, two Container images, two R2
-buckets, and a private loopback `Models` Service Binding. `HarnessDO` uses `basic`
-(1 GiB) and `SandboxDO` uses `standard-1` (4 GiB); tune these after measurement.
-The Sandbox package and image both pin `0.13.0-next.751.1`.
+The example in `examples/worker` is one Worker that exports every class: `AgentWorker`, `SessionDO`, `TenantCatalogDO`, `HarnessDO`, `SandboxDO`, `ContainerProxy` and the `Models` entrypoint. It binds two Container images, two R2 buckets, a loopback Service Binding to `Models`, a `CODE_LOADER` worker loader and the `AI` binding. `HarnessDO` uses the `basic` instance type and `SandboxDO` uses `standard-1`; tune both after measurement. The Sandbox package and its image both pin `0.13.0-next.751.1`.
 
-Run `pnpm deploy:check` to validate both the Agent Worker and caller bundles, and
-build the Container images without publishing them. Run `pnpm types` after changing Wrangler bindings. Deploying is a
-separate operator action; no remote deployment is part of the local tests.
+Running any harness needs this repository's Docker images: `docker/Harness.Dockerfile` (the supervisor, Codex and OpenCode on Node 24) and `docker/Sandbox.Dockerfile` (Cloudflare's sandbox image plus `python3` and Codex `exec-server`). Wrangler builds them from `examples/worker/wrangler.jsonc`.
 
-## Production configuration
+## Production walkthrough
 
-Create the `cf-open-agents-api-checkpoints` and `cf-open-agents-api-workspaces` R2 buckets, or change
-the example configuration to your bucket names. Set secrets through Wrangler:
+1. Create the R2 buckets, or rename them in `examples/worker/wrangler.jsonc` (`BACKUP_BUCKET_NAME` must equal the `BACKUP_BUCKET` binding's bucket name; `pnpm check:docs` verifies that):
 
-- `API_TOKEN`: at least 32 unpredictable characters for the example HTTP auth.
-- `OPENAI_API_KEY`: model key used only by the private model gateway.
-- `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`: scoped to the workspace backup bucket.
-- `CLOUDFLARE_R2_ACCOUNT_ID`: account used for R2 presigned URLs.
+   ```sh
+   pnpm exec wrangler r2 bucket create cf-open-agents-api-checkpoints
+   pnpm exec wrangler r2 bucket create cf-open-agents-api-workspaces
+   ```
 
-`BACKUP_BUCKET_NAME` is a non-secret Wrangler variable. Leave `LOCAL_BACKUPS`
-unset in production. The Sandbox SDK's backup code creates scoped presigned URLs;
-the sandbox does not receive permanent R2 or model credentials.
+2. Create an R2 API token with object read and write on the workspaces bucket. The Sandbox SDK uses it to sign the presigned URLs that the sandbox container uses for backups and restores.
 
-Replace the example's single-tenant authenticator for a multi-tenant deployment.
-Only trusted Workers should hold a Service Binding to this API. Set account-level
-rate limits and usage budgets appropriate to your deployment before public access.
-The library's turn deadline and instance cap do not constitute a billing budget.
-The example disables `workers.dev` and preview URLs; a Service Binding works without
-an Internet-facing route. Add a route deliberately when hosting the HTTP API.
+3. Set the secrets. Each is read by exactly one component:
 
-The `coding` preset uses Codex with native Responses passthrough so images, native
-reasoning, web search and structured-output settings reach the configured provider.
-The private gateway enforces the session's search mode: `disabled` removes the
-search tool, `cached` disables external web access, and `live` enables it. This
-also corrects Codex 0.154.0 promoting cached search under full-access execution.
-Other presets use
-the portable AI SDK adapter; see [model protocols](extending.md#model-protocols).
+   | Secret                                                  | Read by                                                                                                   |
+   | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+   | `API_TOKEN`                                             | The example authenticator `bearerTenant` in `examples/worker/src/index.ts`; at least 32 random characters |
+   | `OPENAI_API_KEY`                                        | The example model gateway (`nativeModel` and `aiSDKModel` presets); never leaves the Worker               |
+   | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`              | `@cloudflare/sandbox`, to create scoped presigned URLs for workspace backups                              |
+   | `CLOUDFLARE_R2_ACCOUNT_ID` (or `CLOUDFLARE_ACCOUNT_ID`) | `@cloudflare/sandbox`, to address the R2 endpoint                                                         |
 
-The `environments: containerEnvironments` option enables configured environments.
-The checkpoints bucket also stores private environment configuration, input files
-and immutable artifacts. Vault secrets are stored in the tenant's Catalog DO;
-service-origin MCP requests obtain credentials through that private boundary.
-Model-provider credentials remain in the model gateway. Environment MCP commands
-and package/setup commands execute in the Sandbox with its configured network policy.
+   ```sh
+   cd examples/worker
+   for name in API_TOKEN OPENAI_API_KEY R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY CLOUDFLARE_R2_ACCOUNT_ID; do
+     pnpm exec wrangler secret put "$name"
+   done
+   ```
+
+   `BACKUP_BUCKET_NAME` is a plain variable read by the Sandbox SDK. `LOCAL_BACKUPS` is read by the library and must stay unset in production; it switches backups to Wrangler's local bucket emulation. The sandbox container itself never receives R2 or model credentials, only short-lived presigned URLs.
+
+4. Decide how the API is reached. The example sets `workers_dev: false` and `preview_urls: false`; a Service Binding works without any public route. Add a custom domain or route only if you host the HTTP API, and replace the single-tenant authenticator first.
+
+5. Deploy:
+
+   ```sh
+   pnpm build
+   pnpm deploy:check                                  # dry run of both Workers, builds both images
+   pnpm exec wrangler deploy --config examples/worker/wrangler.jsonc
+   pnpm exec wrangler deploy --config examples/caller/wrangler.jsonc   # optional
+   ```
+
+   The first deploy pushes both images to Cloudflare's registry and can take several minutes.
+
+6. Verify:
+
+   ```sh
+   pnpm exec wrangler containers list
+   pnpm exec wrangler containers images list
+   ```
+
+   Then create a session with `environment: { type: "openai_hosted" }` through the caller or your own client and retrieve `GET /v1/agents/environments/{id}`; `status: "connected"` proves that the sandbox container started and that the harness container can reach it. `pnpm exec wrangler tail --config examples/worker/wrangler.jsonc` shows `Native harness diagnostics` when a native execution stops, which is the first place to look when a turn fails with `native_harness_failed`.
+
+## Presets and models
+
+The example registers four presets. `coding` runs Codex through `nativeModel` with the Responses protocol, so images, native reasoning, hosted web search (`webSearch: true`) and structured output reach OpenAI unchanged. `claude` and `opencode` run the other runtimes through the portable AI SDK adapter against the same key. `workers` runs Codex against Workers AI. `coding`, `claude` and `opencode` list each other as `delegates`. See [extending](extending.md) for the options.
+
+The gateway enforces a session's search mode at model egress: `disabled` removes the search tool, `cached` disables external web access, `live` enables it. This also corrects Codex `0.154.0` promoting cached search to live under full-access execution.
+
+## Scaling and cost
+
+- `max_instances` on each container class caps concurrent sessions with a running turn. Every session with an environment uses one harness container and one sandbox container while a turn runs. A delegated child adds a harness container and shares the sandbox.
+- Both classes set `sleepAfter` to 10 minutes. An idle session keeps its pair alive for that long after the last activity, then the platform stops them. You pay for the running time.
+- The sandbox is reused between turns while it holds the last committed workspace. A turn that starts on a reused sandbox costs a container wake-up at most. A turn after a cancel, a failure, a container loss or a fork pays a restore: an R2 read, package installation and setup commands again.
+- A completed turn writes one native checkpoint object (up to 32 MiB), one workspace backup (30-day TTL) and the artifacts under `/workspace/outputs`. Nothing deletes old objects; see [checkpoint operations](#checkpoint-operations).
+- The turn deadline (`maxTurnMs`, 15 minutes by default) bounds a single turn, not a session or a tenant. Set account-level limits and provider budgets before exposing the API.
+
+## Security boundaries in the deployment
+
+Only trusted Workers should hold a Service Binding to this API; RPC callers supply the tenant themselves. Environment MCP commands, package installation and setup commands run in the sandbox under its network policy. Vault secrets live in the tenant's catalog object and are attached by the Worker when it proxies service-origin MCP requests. Model credentials live in the gateway. Setup-command effects outside `/workspace` persist while a sandbox is reused; see [SECURITY.md](../SECURITY.md).
 
 ## Checkpoint operations
 
-Native snapshots use immutable per-session/per-generation keys. A successful turn
-commits native and workspace references only after both exist. Failed uploads can
-leave orphan objects. Physical deletion and retention are operator responsibilities
-in this alpha; session deletion removes public discovery, not every R2 object.
+Native snapshots use immutable per-session, per-generation keys. A completed turn commits native and workspace references only after both exist. Failed uploads can leave orphan objects. Physical deletion and retention are operator responsibilities: session deletion purges the session's SQLite storage and discovery, not its R2 objects. A bucket lifecycle rule on `sessions/`, `artifacts/` and the backup bucket is the practical answer.
 
-Workspace snapshots capture files; detached processes cannot be resumed. Snapshot
-at an application quiescent boundary. The backup SDK does not make filesystem and
-external-service writes transactional. Do not use a checkpoint as evidence that an
-external deployment or payment happened exactly once.
+Workspace backups capture files; detached processes cannot resume. Snapshot at an application quiescent boundary. Do not use a checkpoint as evidence that an external deployment or payment happened exactly once.
 
 ## Local runtime notes
 
-`pnpm test` exercises the actual production composition factory in workerd using
-SQLite DOs and a deliberately scripted runtime driver. `pnpm test:codex` exercises
-native Codex with an isolated home and a local scripted Responses server. It never
-uses the operator's Codex login or a real provider key.
-`pnpm test:harnesses` additionally exercises Claude Code and OpenCode, native history
-restoration, and instantiated AI SDK model connections through official SDK clients.
+`pnpm test` exercises the production composition in workerd with SQLite Durable Objects and a scripted runtime driver. `pnpm test:codex` runs real Codex with an isolated home and a scripted Responses server; it never reads your Codex login. `pnpm test:harnesses` adds Claude Code and OpenCode, native history restoration and instantiated AI SDK connections through the official SDK clients.
 
 Run the complete local smoke with:
 
@@ -72,30 +89,9 @@ Run the complete local smoke with:
 pnpm test:containers
 ```
 
-It uses a fresh persistence directory and a scripted local model. For each of the
-three harnesses it verifies native shell execution, Claude/OpenCode
-write/edit/read replacements, a configured environment with a pinned saved skill,
-an inline plugin, a service-origin MCP server with a Vault credential, immutable
-artifacts, isolation from the harness filesystem, a second turn after both
-Containers are destroyed, programmatic tool calling with parallel client calls,
-explicit cancellation, an abandoned workspace call ending as
-`programmatic_execution_uncertain`, a same-harness fork that recovers the
-committed workspace, a delegated subagent on the next runtime sharing that
-workspace, and a cross-runtime fork continuing with the inherited workspace and
-transcript. The Codex fixture also exercises Files API uploads, environment file
-listings, image input, cached search configuration at model egress, reported
-usage and an `environment: none` session. It cleans up the Containers it created.
-Logs and local R2/SQLite evidence remain in the printed temporary directory.
-`CF_SMOKE_HARNESSES=opencode` narrows the run to one runtime while diagnosing.
-When a native execution stops, the Worker logs a bounded tail of the supervisor's
-native stderr as `Native harness diagnostics`; the same tail explains a
-`native_harness_failed` turn in production logs.
-No Cloudflare deployment, provider secret, or paid inference is involved.
+It uses a fresh persistence directory and a scripted model. For each harness it verifies native shell execution, the Claude Code and OpenCode tool replacements, a configured environment with a pinned skill, an inline plugin, a service-origin MCP server with a Vault credential, artifacts, isolation from the harness filesystem, a second turn after both containers are destroyed, sandbox reuse across completed turns and restore after cancellation, programmatic tool calling with parallel client calls, explicit cancellation, an abandoned workspace call ending as `programmatic_execution_uncertain`, a same-harness fork, a delegated subagent on the next runtime sharing the workspace, and a cross-runtime fork with the inherited workspace and transcript. The Codex fixture also covers Files API uploads, environment listings, image input, cached search at model egress, usage and an `environment: none` session. It cleans up the containers it created and leaves logs and local R2/SQLite state in the printed temporary directory. `CF_SMOKE_HARNESSES=opencode` narrows the run to one runtime.
 
-Cloudflare's local Container proxy needs a route back to workerd. Rootless Docker
-with `--detach-netns` can place the actual Docker bridge in a different namespace
-from both the host and `docker run --network host`. In that configuration, run the
-smoke in rootlesskit's network namespace. On Linux with the standard user service:
+Cloudflare's local container proxy needs a route back to workerd. Rootless Docker with `--detach-netns` can place the Docker bridge in a different namespace from both the host and `docker run --network host`. In that configuration, run the smoke inside rootlesskit's network namespace. On Linux with the standard user service:
 
 ```sh
 # These variables describe this task; they do not change the Docker daemon.
@@ -111,9 +107,6 @@ nsenter --user="/proc/$cf_open_agents_pid/ns/user" \
 rm "$cf_open_agents_dns"
 ```
 
-The DNS address above is slirp4netns's default; use your rootlesskit resolver if it
-was customized. The bind mount is private to the test process. No host routes,
-Docker daemon configuration, or system resolver are changed. Ordinary rootful Docker
-does not need this workaround.
+The DNS address is slirp4netns's default; use your rootlesskit resolver if you changed it. The bind mount is private to the test process. No host routes, daemon configuration or system resolver change. Rootful Docker does not need this.
 
-See [known development issues](known-issues.md) for narrowly scoped upstream warnings.
+See [known issues](known-issues.md) for diagnostics that appear in successful local runs.

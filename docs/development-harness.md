@@ -1,11 +1,21 @@
 # Development agent guidance
 
-[AGENTS.md](../AGENTS.md) maps the codebase, constraints and validation commands.
-[CLAUDE.md](../CLAUDE.md) imports that same entrypoint. Select checks from
-[CONTRIBUTING.md](../CONTRIBUTING.md#validation); keep resumable work in
-[project work notes](../.agents/PLANS.md).
+[AGENTS.md](../AGENTS.md) is the entrypoint for coding agents; [CLAUDE.md](../CLAUDE.md) imports it. Choose checks from [CONTRIBUTING.md](../CONTRIBUTING.md#validation) and keep resumable work in [project work notes](../.agents/PLANS.md).
 
-## Skills and ownership
+## Toolchain
+
+| Command                   | What runs                                                                                                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `pnpm lint`               | `ultracite check --type-aware`: oxlint with type-aware rules and an oxfmt formatting check                     |
+| `pnpm format`             | `ultracite fix --type-aware`: applies safe lint fixes and formats                                              |
+| `pnpm typecheck`          | `tsc --noEmit` on TypeScript 7, patched by `@effect/tsgo` so Effect language-service diagnostics appear inline |
+| `pnpm effect:diagnostics` | The Effect language-service diagnostics alone, as text                                                         |
+
+`prepare` runs `effect-tsgo patch --typescript --oxlint` on install; a fresh `pnpm install --frozen-lockfile` is enough. Lint rules live in `oxlint.config.ts` and formatting in `oxfmt.config.ts` (100 columns, Markdown prose wrapping preserved, no trailing commas in JSON so `JSON.parse` readers keep working). Format only the files you touch: `pnpm exec oxfmt <files>`.
+
+## Vendored skills
+
+`.agents/skills/` holds vendored agent skills: instructions a coding agent loads for a task. `.claude/skills/` contains relative symlinks to them.
 
 | Skill                                                                       | Purpose                                      | Source          |
 | --------------------------------------------------------------------------- | -------------------------------------------- | --------------- |
@@ -16,23 +26,12 @@
 | [wrangler](../.agents/skills/wrangler/SKILL.md)                             | Wrangler commands and configuration          | Cloudflare      |
 | [native-harness-change](../.agents/skills/native-harness-change/SKILL.md)   | Native adapters, gateway and recovery        | This repository |
 
-`.agents/skills/` contains the installed snapshots. `.claude/skills/` contains
-relative aliases. [skills-lock.json](../skills-lock.json) preserves installer
-provenance; [NOTICE](../NOTICE) identifies licenses and local modifications.
-Update snapshots deliberately and preserve their upstream license notices.
-Only `native-harness-change` is authored as part of this repository.
+Provenance is checked, not assumed. [skills-lock.json](../skills-lock.json) records each upstream skill's source repository, path and content hash as installed; [NOTICE](../NOTICE) lists the licenses and the commits at which they were verified, and each vendored directory keeps its upstream `LICENSE`. `pnpm check:harness` fails when a skill lacks its `SKILL.md`, its Claude alias, a lock entry with source, path and hash, or its `LICENSE`, and when the lock or the alias directory names a skill that no longer exists. `.agents/harness.json` lists the skills authored here (`localSkills`), which need no upstream provenance. Update a vendored snapshot deliberately, keep its license notice, and record the new hash.
 
-The installed Effect setup skill includes bootstrap examples for other releases.
-This workspace develops and tests against Effect 3.22.2; inspect installed sources
-before changing its code. Sandbox SDK and Docker image revisions must match.
+The vendored Effect skill includes bootstrap examples for other releases. This workspace develops against Effect 3.22.2; inspect installed sources before changing Effect code. Sandbox SDK and Docker image revisions must match.
 
 ## Checks and generated files
 
-`pnpm check:harness` runs the repository-owned `scripts/check-harness.mjs`. It
-checks authored Markdown links, entrypoint imports, skill aliases and provenance.
-Run `pnpm test:scripts` when changing checker behavior. Neither command downloads
-skills or requires access to a private repository.
+`pnpm check:harness` runs `scripts/check-harness.mjs`: relative Markdown links in the documents listed in `.agents/harness.json` and every file under `docs/` must resolve, `CLAUDE.md` must import `AGENTS.md`, and the skill rules above must hold. `pnpm check:docs` runs `scripts/check-docs.mjs`: every non-lifecycle `package.json` script appears in README, the README title matches the repository name, the package README names every export entrypoint, the gateway binds its own Worker, the backup variable matches the R2 binding, and the Sandbox, Codex, OpenCode and Claude Agent SDK pins agree across manifests, Dockerfiles and `harnesses.ts`. Run `pnpm test:scripts` when changing either checker. Neither downloads anything.
 
-`dist/`, `examples/worker/env.d.ts` and `examples/caller/env.d.ts` are generated, ignored outputs. Build them
-with `pnpm build` and `pnpm types`; edit their source rather than checking them in.
-Keep validation fixtures under `tests/` and out of production package exports.
+`dist/`, `examples/worker/env.d.ts` and `examples/caller/env.d.ts` are generated and ignored. Build them with `pnpm build` and `pnpm types`; edit their sources instead. Keep validation fixtures under `tests/` and out of the published package.

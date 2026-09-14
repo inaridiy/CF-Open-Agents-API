@@ -1,12 +1,10 @@
 # Use the OpenAI client through a Service Binding
 
-This is the recommended entry point when your application runs in another Cloudflare Worker.
-You use the official OpenAI client while the Agent Worker owns the API, sessions, and native execution.
-The complete runnable example is [examples/caller](../examples/caller/src/index.ts).
+This is the recommended entry point when your application runs in another Cloudflare Worker. You use the official OpenAI client while the Agent Worker owns the API, the sessions and the native execution. The complete runnable example is [examples/caller](../examples/caller/src/index.ts). Running any harness needs this repository's Docker images; see [deployment](deployment.md).
 
 ## Bind the service
 
-Deploy/configure the [Agent Worker](deployment.md), then add this to the caller's Wrangler configuration:
+Deploy or run the [Agent Worker](deployment.md), then add this to the caller's Wrangler configuration:
 
 ```jsonc
 {
@@ -14,13 +12,9 @@ Deploy/configure the [Agent Worker](deployment.md), then add this to the caller'
 }
 ```
 
-For local development, follow the [README walkthrough](../README.md#try-the-complete-worker-example).
-`pnpm dev:caller` starts both Worker configurations together.
-The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding remains usable.
+For local development, follow the [README walkthrough](../README.md#first-run-without-a-paid-model-key); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
 
-Configure the same `API_TOKEN` on both Workers for the example's single-tenant authenticator.
-It must contain at least 32 unpredictable characters.
-The provider's `OPENAI_API_KEY` belongs only on the Agent Worker.
+Configure the same `API_TOKEN` on both Workers for the example's single-tenant authenticator. It must contain at least 32 unpredictable characters. The provider's `OPENAI_API_KEY` belongs only on the Agent Worker.
 
 ## Connect the official client
 
@@ -40,10 +34,7 @@ function agentClient(env: Env) {
 }
 ```
 
-The custom `fetch` sends the request to the binding, including its path, headers, body and abort signal.
-There is no DNS lookup for `agents.internal`.
-The request still passes through the Agent Worker's HTTP authentication and validation.
-For a multi-tenant application, replace `bearerTenant` with an authenticator that derives the tenant from verified credentials.
+The custom `fetch` sends the request to the binding, including its path, headers, body and abort signal. There is no DNS lookup for `agents.internal`. The request still passes through the Agent Worker's HTTP authentication and validation. For a multi-tenant application, replace `bearerTenant` with an authenticator that derives the tenant from verified credentials.
 
 ## Run a turn and read its result
 
@@ -52,10 +43,7 @@ Inside your Worker handler, create an idle session, then subscribe and submit in
 ```ts
 const client = agentClient(env);
 const session = await client.beta.agents.sessions.create(
-  {
-    agent: { model: "coding" },
-    environment: { type: "openai_hosted" },
-  },
+  { agent: { model: "coding" }, environment: { type: "openai_hosted" } },
   { headers: { "Idempotency-Key": "session-for-task-123" } },
 );
 
@@ -66,27 +54,22 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 })) {
   if (event.type === "agent.session.turn.output_text.delta") answer += event.delta;
   if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id)
-    throw new Error("Turn failed");
+    throw new Error(`${event.turn.error?.code}: ${event.turn.error?.message}`);
   if (event.type === "agent.session.turn.cancelled" && !event.turn.subagent_id)
     throw new Error("Turn cancelled");
 }
 return Response.json({ session_id: session.id, answer });
 ```
 
-Keep the session ID for subsequent turns.
-Call `sessions.stream` again with a new input and idempotency key after the session returns to idle.
-Streaming does not extend the lifetime of an unrelated Worker request: forward the stream to your client or wait for the result within your handler.
-For detached jobs, submit input, return the session ID, and retrieve results in a later request.
+Keep the session ID for later turns. Call `sessions.stream` again with new input and a new idempotency key after the session returns to `idle`. A failed turn also returns the session to `idle` (with `session.error` set) unless the outcome was indeterminate; then the session is `failed` and you fork it. Streaming does not extend the lifetime of an unrelated Worker request: forward the stream to your client or wait for the result inside your handler. For detached jobs, submit input, return the session ID, and retrieve results in a later request.
 
-The polling example returns the first 100 items and most recent 100 turns with pagination information.
-For complete history, iterate `client.beta.agents.sessions.items.list(session.id)`; the SDK fetches subsequent pages.
-A dropped stream does not cancel the task. Retrieve the session/items/turns before deciding whether to submit anything again.
-The `/cf/v1` event replay extension is described in [compatibility](compatibility.md).
+Input sent while a turn is running steers it: the message is added to the live turn on every harness. If the runtime has already finished, the message runs as the next turn instead.
+
+For complete history, iterate `client.beta.agents.sessions.items.list(session.id)`; the SDK follows pages. A dropped stream never cancels the task. Retrieve the session, items and turns before deciding whether to submit anything again. The `/cf/v1` event replay extension is described in the [HTTP guide](http-api.md#use-raw-http).
 
 ## Function tools
 
-Provide application tools in `agent.tools` when creating the session.
-The SDK stream helper can execute named handlers and submit their results:
+Provide application tools in `agent.tools` when creating the session. The SDK stream helper can execute named handlers and submit their results:
 
 ```ts
 const clockSession = await client.beta.agents.sessions.create({
@@ -112,8 +95,7 @@ for await (const event of client.beta.agents.sessions.stream(clockSession.id, {
 }
 ```
 
-Without a handler, inspect `session.required_actions` when status becomes `requires_action`.
-For each function call, send its exact `call_id` and `turn_id`:
+Without a handler, inspect `session.required_actions` when the status becomes `requires_action`. For each function call, send its exact `call_id` and `turn_id`:
 
 ```ts
 await client.beta.agents.sessions.events.create(
@@ -133,11 +115,9 @@ await client.beta.agents.sessions.events.create(
 );
 ```
 
-Authenticate and authorize application tool operations in your own code.
-See [tool definitions](extending.md#tools-and-assets) and the [compatibility matrix](compatibility.md).
+Authenticate and authorize application tool operations in your own code. See [tool definitions](extending.md#tools-and-assets) and the [compatibility profile](compatibility.md).
 
-For environment files, artifacts, MCP credentials and subagent configuration, see
-[environments, tools, subagents and forks](environments-and-tools.md).
+For environment files, artifacts, MCP credentials, subagents and forks, see [environments and tools](environments-and-tools.md).
 
 ## Cancel and delete
 
@@ -145,9 +125,8 @@ For environment files, artifacts, MCP credentials and subagent configuration, se
 await client.beta.agents.sessions.events.create(session.id, {
   events: [{ type: "agent.session.input.cancel" }],
 });
-// Retrieve until the native turn has stopped, then:
+// Retrieve until the turn has stopped, then:
 await client.beta.agents.sessions.delete(session.id);
 ```
 
-Deletion requires an inactive session.
-Download needed artifacts before deleting; see [retention](deployment.md#checkpoint-operations).
+Deletion requires an inactive session. Download needed artifacts before deleting; see [retention](deployment.md#checkpoint-operations).

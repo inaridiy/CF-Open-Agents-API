@@ -1,35 +1,27 @@
 # cf-open-agents-api
 
-**An open-source implementation of the OpenAI Agents API, with configurable runtimes and models.**
-Keep the official OpenAI client; host your API and session state on Cloudflare.
-Choose Codex, Claude Code, or OpenCode and connect deployment-owned model presets.
-Every runtime supports environments, files, skills, MCP, programmatic tool calling,
-image input, reasoning/command streaming and usage; Codex adds configured web search
-through a supporting native Responses connection. Presets can delegate subagents to
-other runtimes, and sessions can be forked onto another preset.
+**An unofficial, independent implementation of the OpenAI Agents API for Cloudflare Workers, running Codex, Claude Code or OpenCode against models you configure.**
 
-Alpha, targeting `agents=v1` in `openai@7.15.0`.
-Check the [compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/compatibility.md) for current guarantees.
-This is an independent implementation, unaffiliated with OpenAI or Cloudflare.
+Keep the official OpenAI client. Your Worker owns the API, the session state, the sandboxes and the model credentials. The runtimes run in Cloudflare Containers; Durable Objects hold the sessions; R2 holds checkpoints, workspaces and files. This package is not affiliated with OpenAI, Anthropic, the OpenCode project or Cloudflare; product names are used only to describe compatibility.
 
-The recommended connection is another Worker supplying its Service Binding as the OpenAI client's custom `fetch`.
-Start with the [Service Binding guide](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/service-binding.md).
-[Direct RPC](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/rpc.md) and
-[hosted HTTP](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/http-api.md) are also supported connection paths.
+Targets `agents=v1` in `openai@7.15.0`. Pre-release: nothing has been published to npm yet. Read the [compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/compatibility.md) before integrating.
 
-| Import                          | Purpose                                                                  |
-| ------------------------------- | ------------------------------------------------------------------------ |
-| `cf-open-agents-api`            | Wire schemas, types, errors and runtime driver contracts                 |
-| `cf-open-agents-api/cloudflare` | Worker/DO factory, typed RPC, Container and environment drivers          |
-| `cf-open-agents-api/models`     | AI SDK models, OpenAI-compatible connections and native protocol presets |
-| `cf-open-agents-api/tools`      | Function tools, search presets and immutable skill bundles               |
+Every runtime supports hosted environments, files, skills, templates, MCP with Vault credentials, deferred tools, programmatic tool calling, images, steering, native subagents, reasoning and command streaming, usage and native checkpoint restore. Presets can delegate subagents to other runtimes, and sessions can be forked onto another preset. Hosted web search is available on Codex and Claude Code through a native model connection.
 
-See the [library API](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/library-api.md)
-for factory options, RPC methods, peers and installation from a source checkout/local tarball.
-The workspace examples run without publishing this package to npm.
-Development pins Effect 3.22.2, OpenAI SDK 7.15.0 and AI SDK 7.0.97.
-Container support pins `@cloudflare/sandbox@0.13.0-next.751.1` with its matching image.
+Running any harness needs the Docker images in the repository's `docker/` directory; see [deployment](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md).
+
+The recommended connection is another Worker handing its Service Binding to the OpenAI client as a custom `fetch`: [Service Binding guide](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/service-binding.md). [Direct RPC](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/rpc.md) and [hosted HTTP](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/http-api.md) are the other paths.
+
+| Import                          | Purpose                                                                                       |
+| ------------------------------- | --------------------------------------------------------------------------------------------- |
+| `cf-open-agents-api`            | Wire schemas, types, `ApiError`, `remoteApiError`, runtime driver contracts, Effect helpers   |
+| `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentRPC`, `bearerTenant`, DO and Container classes, container drivers |
+| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `createModelGateway`                    |
+| `cf-open-agents-api/tools`      | `defineTool`, search presets and immutable skill helpers                                      |
+
+See the [library API](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/library-api.md) for factory options, RPC methods, peers and installation from a source checkout. The workspace examples run without an npm publication. Peers: `effect@3.22.2`, `openai@7.15.0`, and `ai@7.0.97` for the model entrypoint. Container support pins `@cloudflare/sandbox@0.13.0-next.751.1` with its matching image.
 
 Apache-2.0. [Deployment](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md) ·
 [Security](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/SECURITY.md) ·
+[Changelog](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/CHANGELOG.md) ·
 [Releases](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/releasing.md)

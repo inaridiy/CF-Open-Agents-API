@@ -1,181 +1,151 @@
 # Extending the service
 
-A deployment selects a native harness and model separately. Session requests name
-agent presets; model instances and credentials stay inside the private Worker gateway.
-The session pins the harness revision and model-registry name. Changing a registry
-entry changes that name's upstream connection; version registry names when old
-sessions must keep their original model configuration.
+A deployment chooses the native harness and the model separately. Clients name presets; model instances and credentials stay inside the private gateway. A session pins the harness revision and the gateway model name at creation. Changing a preset changes new sessions; version preset names when old sessions must keep their original mapping.
 
-## Native harnesses and AI SDK models
+## Presets, harnesses and the model gateway
+
+This is the composition in [examples/worker/src/index.ts](../examples/worker/src/index.ts):
 
 ```ts
 import { createOpenAI } from "@ai-sdk/openai";
-import { containerHarnesses, createAgentService } from "cf-open-agents-api/cloudflare";
-import { aiSDKModel, createModelGateway } from "cf-open-agents-api/models";
+import {
+  bearerTenant,
+  containerEnvironments,
+  containerHarnesses,
+  createAgentService,
+} from "cf-open-agents-api/cloudflare";
+import { aiSDKModel, createModelGateway, nativeModel } from "cf-open-agents-api/models";
+import { createWorkersAI } from "workers-ai-provider";
 
 const service = createAgentService<Bindings>({
   agents: {
-    coding: { harness: "codex", model: "primary", delegates: ["claude"] },
+    coding: {
+      harness: "codex",
+      model: "codex",
+      delegates: ["claude", "opencode"],
+      webSearch: true,
+    },
     claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
-    opencode: { harness: "opencode", model: "primary" },
+    opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
+    workers: { harness: "codex", model: "workers" },
   },
   harnesses: containerHarnesses,
-  authenticate: yourAuthenticator,
+  objects: (env) => env.CHECKPOINTS,
+  environments: containerEnvironments,
+  authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
 });
-const gateway = createModelGateway<Bindings>((env) => {
-  const openai = createOpenAI({ apiKey: env.OPENAI_API_KEY });
-  return { primary: aiSDKModel(openai("gpt-6-astra")) };
-});
-// A private WorkerEntrypoint delegates fetch(request) to gateway.fetch(request, this.env).
+const gateway = createModelGateway<Bindings>((env) => ({
+  codex: nativeModel({
+    protocol: "responses",
+    baseURL: "https://api.openai.com/v1",
+    apiKey: env.OPENAI_API_KEY,
+    model: "gpt-6-astra",
+  }),
+  primary: aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+  workers: aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+}));
+// A private WorkerEntrypoint named Models delegates fetch(request) to gateway.fetch(request, this.env).
 ```
 
-The AI SDK call performs one inference. It has no tool implementations and starts
-no second agent loop. Codex app-server, Claude Agent SDK, or OpenCode owns tool
-selection, continuation, and native conversation history. Switching `harness` changes
-new sessions; it does not convert an existing native checkpoint. Use the
-[fork extension](environments-and-tools.md#fork-a-session) to continue an existing
-session on another preset.
+Each preset (`AgentRegistration`) has:
 
-`delegates` names the presets a session on that alias may start subagents on
-when the client enables `multi_agent`. Children run on the delegate's harness and
-model inside the parent's sandbox, so list only presets whose model connection
-you are willing to spend on that parent's behalf. Every listed alias must exist
-and its harness must be registered; session creation checks this and reports
-`delegate_unavailable` otherwise. Presets without `delegates` keep native Codex
-subagents only.
+| Field       | Meaning                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `harness`   | `codex`, `claude-code`, `opencode`, or the name of a custom driver in `harnesses`.                                                                                                                                                                                                                                                                                         |
+| `model`     | The gateway registry name the harness sends as `model`. The gateway swaps it for the real upstream model.                                                                                                                                                                                                                                                                  |
+| `delegates` | Presets a session on this alias may start subagents on when the client enables `multi_agent`. Every listed alias must exist and its harness must be registered, or creation fails with `503 delegate_unavailable`. Children run on the delegate's harness and model inside the parent's sandbox, so list only presets whose model spend you accept on the parent's behalf. |
+| `webSearch` | Declares that this alias's model connection provides hosted web search. `web_search` tools are accepted only when both the harness (`codex` or `claude-code`) and the alias support it. A `nativeModel` Responses or Anthropic connection qualifies; the portable adapter does not.                                                                                        |
 
-Workers AI uses the same model adapter:
+The gateway performs one inference per request. It has no tool implementations and starts no second agent loop; the runtime owns tool selection, continuation and native history. Switching `harness` changes new sessions and does not convert an existing checkpoint; use a [fork](environments-and-tools.md#fork-a-session) to move a session.
 
-```ts
-import { createWorkersAI } from "workers-ai-provider";
-const model = aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash"));
-```
-
-Both example IDs are listed in the providers' official catalogs:
-[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and
-[GLM-4.7-Flash](https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/)
-(checked September 13, 2026). Availability to a particular account and inference
-quality are separate from the scripted integration tests.
-
-The deployment supplies its AI SDK provider package. See the runnable
-[Worker composition](../examples/worker/src/index.ts) and Cloudflare's
-[AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
+Both example model IDs are in the providers' catalogs, [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and [GLM-4.7-Flash](https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/), checked September 13, 2026. Availability to your account and inference quality are separate from the scripted tests. The deployment supplies its AI SDK provider package; see Cloudflare's [AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
 
 ## Model protocols
 
-`aiSDKModel(instance, options)` exposes Responses, Anthropic Messages, and Chat
-Completions to native harnesses. `openAICompatibleModel({ baseURL, apiKey, model })`
-uses the same translation with an OpenAI-compatible Chat Completions upstream.
-Options bound output tokens and request time and forward deployment-owned AI SDK
-`providerOptions`. Model credentials are never sent to the harness or Sandbox.
+Each harness speaks one protocol to the gateway: Codex `/v1/responses`, Claude Code `/v1/messages`, OpenCode `/v1/chat/completions`. A gateway entry must be able to answer the protocol of every harness whose presets reference it.
 
-This portable profile carries text and function calls, including Codex namespaces
-and custom text tools wrapped as an `input` string. It **does not replay provider
-reasoning blocks or signatures**; reasoning can occur within an inference, but only
-text and function calls return to the harness. Media, encrypted input reasoning,
-server-side response references, hosted tools and structured response formats are
-rejected. Provider-specific sampling/effort/cache options are not a portable contract;
-set supported upstream options in the deployment. Tool use quality and context limits
-still depend on the selected model. Output truncation or model failure fails the turn.
-
-Use `nativeModel` when native reasoning, signatures, caching or other extensions
-must survive unchanged:
+### `nativeModel`
 
 ```ts
 import { nativeModel } from "cf-open-agents-api/models";
 const model = nativeModel({
-  protocol: "anthropic", // "responses" or "chat-completions" also available
+  protocol: "anthropic", // "responses" or "chat-completions"
   baseURL: "https://api.anthropic.com/v1",
   apiKey: env.ANTHROPIC_API_KEY,
   model: env.CLAUDE_MODEL,
 });
 ```
 
-Native presets enforce the harness's protocol and replace the registry alias with
-the actual upstream model. They preserve the payload and stream instead of applying
-AI SDK translation. Base URLs and credentials belong to deployment code.
+`nativeModel` forwards the harness request body unchanged except for the `model` field, and streams the provider response back. It is the only way to keep provider reasoning signatures, encrypted content, caching hints and hosted tools such as web search. It enforces the protocol: a Codex preset pointing at an `anthropic` entry fails with `model_protocol_mismatch`. Redirects are never followed, and provider error bodies are sanitized and bounded before they reach the harness.
 
-Claude Code is designed for Claude models. Anthropic does not officially support
-routing it to other model families; our protocol tests establish transport/tool
-behavior with scripted models, not quality or provider approval for every model.
-See [Claude Code LLM gateways](https://code.claude.com/docs/en/llm-gateway).
+Claude Code is designed for Claude models. Anthropic does not officially support routing it to other model families; the protocol tests here establish transport and tool behavior with scripted models, not provider approval. See [Claude Code LLM gateways](https://code.claude.com/docs/en/llm-gateway).
+
+### `aiSDKModel` and `openAICompatibleModel`
+
+`aiSDKModel(model, options)` accepts any instantiated AI SDK `LanguageModel`, including Workers AI, and answers all three protocols by translating the request and re-encoding the stream. `openAICompatibleModel(options)` wraps an OpenAI-compatible Chat Completions endpoint with the same translation.
+
+```ts
+import { aiSDKModel, openAICompatibleModel } from "cf-open-agents-api/models";
+
+const portable = aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra"), {
+  maxOutputTokens: 8192, // upper bound; the harness may ask for less
+  timeoutMs: 120_000,
+  // Static options, or a function of the settings decoded from the harness request.
+  providerOptions: ({ reasoningEffort, outputSchema }) =>
+    reasoningEffort ? { openai: { reasoningSummary: "auto" } } : undefined,
+});
+const compatible = openAICompatibleModel({
+  baseURL: "https://inference.example.com/v1",
+  apiKey: env.INFERENCE_KEY,
+  model: "your-model",
+  headers: { "x-tenant": "agents" },
+  supportsStructuredOutputs: true, // default; false sends json_object instead of json_schema
+});
+```
+
+What the portable profile carries:
+
+- Text, images and function calls in both directions, including Codex tool namespaces and custom text tools wrapped as an `input` string.
+- Reasoning effort from every protocol (`reasoning.effort`, `reasoning_effort`, `output_config.effort` or a thinking budget) into the AI SDK's `reasoning` setting; `max` becomes `xhigh`.
+- `json_schema` structured output from every protocol into a typed `output`.
+- Reasoning text the provider streams, projected as a summary.
+
+What it does not carry: provider reasoning blocks and signatures across requests, encrypted reasoning, server-side response references, hosted tools (web search), and provider-specific sampling or caching options. Set those through `providerOptions` if the upstream accepts them. Output truncation or a provider error fails the turn. Provider error bodies are sanitized before they reach the harness.
+
+`modelAdapter(effect)` adapts an Effect-valued implementation to the gateway contract when neither helper fits.
 
 ## Sandbox replacement
 
-| Harness                  | Actual integration                                                                          | Native state                        |
-| ------------------------ | ------------------------------------------------------------------------------------------- | ----------------------------------- |
-| Codex 0.154.0            | Native remote `exec-server` in Sandbox Container                                            | Isolated CODEX_HOME                 |
-| Claude Agent SDK 0.3.268 | `toolAliases` redirect Bash/Read/Write/Edit to SDK MCP tools that call the assigned Sandbox | Isolated CLAUDE_CONFIG_DIR          |
-| OpenCode 1.18.30         | Same-name plugin tools replace bash/read/write/edit and call the assigned Sandbox           | Isolated XDG data/state directories |
+| Harness                  | Integration                                                                                       | Native state                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Codex 0.154.0            | Native remote `exec-server` in the sandbox container                                              | Isolated `CODEX_HOME`                   |
+| Claude Agent SDK 0.3.268 | `toolAliases` redirect Bash, Read, Write and Edit to SDK MCP tools that call the assigned sandbox | Isolated `CLAUDE_CONFIG_DIR`            |
+| OpenCode 1.18.30         | Same-name plugin tools replace `bash`, `read`, `write` and `edit` and call the assigned sandbox   | Isolated XDG data and state directories |
 
-Claude's `sandbox` option configures local OS isolation; it is not a generic remote
-Sandbox provider. `spawnClaudeCodeProcess` replaces the whole subprocess launcher.
-The included adapter uses `toolAliases` plus an SDK-connected MCP server and disables
-native local tools. Its server comes from the installed MCP SDK so current Zod
-optional/default fields are parsed by a compatible version. This was verified against the installed SDK and its actual CLI.
+Claude's `sandbox` option configures local OS isolation, not a remote sandbox. The adapter uses `toolAliases` plus an SDK-connected MCP server and disallows every native local tool; `canUseTool` allows only the workspace server, hosted `WebSearch` when the agent has a `web_search` tool, and `Task` when subagents are enabled. Its MCP server comes from the installed MCP SDK so current Zod fields parse with a compatible version.
 
-OpenCode explicitly supports [overriding built-in tool names](https://opencode.ai/docs/custom-tools/#name-collisions-with-built-in-tools).
-Our bundled plugin replaces four native tools. Other builtins, project config,
-default plugins, subagents, model discovery and automatic updates are disabled.
-The fixed config directory is read-only while OpenCode runs so its background
-plugin dependency installer does not require network access. Provider SDKs are
-already bundled in the pinned native CLI; caches are excluded from checkpoints.
+OpenCode supports [overriding built-in tool names](https://opencode.ai/docs/custom-tools/#name-collisions-with-built-in-tools). The bundled plugin replaces four native tools. Other builtins, project config, default plugins, model discovery and automatic updates are disabled. The config directory is read-only while OpenCode runs so its background plugin installer never needs the network. Provider SDKs are bundled in the pinned CLI; caches are excluded from checkpoints.
 
-Both adapters route external function tools to the session's required-action
-boundary. The client submits their results through the Agents API. Builtin web
-search is disabled; expose deployment-owned search as an ordinary function tool.
-Codex enables provider web search when configured in `agent.tools`. All three
-harnesses project reasoning summaries, usage and command deltas, accept image
-input and image function results, connect configured MCP servers, discover
-deferred functions through `cf_tool_search`, read environment skills and plugins,
-and run `cf_execute` code and delegated subagents. Native search requires a
-supporting Responses passthrough connection. Codex supports active steering; Claude
-Code and OpenCode reject it. All support cancellation, external tools, and native
-checkpoint/restore.
-
-Claude Code and OpenCode reach configured MCP servers through the supervisor's
-tool bridge: service-origin HTTP servers are proxied by the Worker with Vault
-credentials, and environment-origin servers run inside the Sandbox behind a
-private bridge process. Their tool names are prefixed by the bridge
-(`mcp__workspace__` for Claude Code, `workspace_` for OpenCode).
+All three adapters route client function tools to the session's required-action boundary, accept steering during a turn, run native subagents and delegated children, connect configured MCP servers, discover deferred functions through `cf_tool_search`, read environment skills and plugins, run `cf_execute` code, project reasoning summaries, command output and usage, accept images, and checkpoint and restore native history. Claude Code and OpenCode reach MCP servers through the supervisor's tool bridge; their tool names are prefixed (`mcp__workspace__` for Claude Code, `workspace_` for OpenCode).
 
 ## Additional harnesses
 
-Implement `RuntimeDriver` and register its name in `harnesses`. Start, poll, control,
-checkpoint, and stop return `Effect<A, ServiceError>` and compose without starting
-a Promise. `fromPromiseDriver` adapts existing Promise implementations. Runtime
-schemas are Effect schemas; decode with `decodeEffect(schema, value)` inside a
-program or `decode(schema, value)` at a synchronous boundary.
-Drivers must deduplicate operation IDs, fence
-old attempts, preserve native history, and contain old executors before replacing
-them. A missing acknowledged job is a failure, not permission to start again.
-A DeepSeek model can use the model gateway; a DeepSeek harness needs its own driver.
+Implement `RuntimeDriver` and register its name in `harnesses`. `start`, `poll`, `control`, `checkpoint` and `stop` return `Effect<A, ServiceError>`; `fromPromiseDriver` adapts a Promise implementation. Runtime schemas are Effect schemas: decode with `decodeEffect(schema, value)` inside a program or `decode(schema, value)` at a synchronous boundary.
 
-Declare only the [capability flags](compatibility.md#capability-flags) the driver
-implements; session creation rejects configurations the flags do not cover. An
-execution carries `delegates` and `maxConcurrentSubagents` when the session may
-delegate, and `parent` when the driver is asked to run a delegated child. A driver
-that ignores those fields simply never spawns children. A custom
-`EnvironmentDriver` must honor `EnvironmentSpec.inherited` in `prepare` or reject
-it, so a fork never silently loses the source workspace.
+A driver must deduplicate operation IDs, fence old attempts by generation, preserve native history, and contain old executors before replacing them. A missing acknowledged job is a failure, never permission to start again. `control` must fail with `409 command_rejected` when a command can never apply (the Worker then drops it, or re-queues a steer as the next turn) and with a plain I/O error when the outcome is unknown (the Worker retries). Fail a job with one of the SDK's `SessionTurnError` codes; other strings surface as `internal_error`.
 
-See [Effect architecture](effect.md) for ownership, errors and migration details.
+Declare only the [capability flags](compatibility.md#capability-flags) the driver implements; session creation rejects configurations the flags do not cover. An execution carries `delegates` and `maxConcurrentSubagents` when the session may delegate, and `parent` when the driver runs a delegated child. A driver that ignores those fields never spawns children. A custom `EnvironmentDriver` must honor `EnvironmentSpec.inherited` in `prepare` or reject it, so a fork never silently loses the source workspace.
+
+A model provider that speaks one of the three protocols needs no driver, only a gateway entry. A different agent runtime needs a driver and, for the container drivers, a supervisor adapter.
 
 ## Tools and assets
 
-`defineTool` validates arguments and results with Effect Schema and accepts an
-Effect-valued `execute`. Use its `effect` method for composition and its `call`
-Promise adapter in SDK tool handlers. It records the tool's
-effects and retry policy for application orchestration. `webSearch` and
-`knowledgeSearch` accept provider functions and return source URLs; a corpus search
-is not presented as a public-web search provider.
+`defineTool` validates arguments and results with Effect Schema and takes an Effect-valued `execute`. Use its `effect` method for composition and its `call` Promise adapter in SDK tool handlers. `webSearch` and `knowledgeSearch` wrap provider functions and return source URLs; a corpus search is not presented as a public-web search.
 
 ```ts
 import { webSearch } from "cf-open-agents-api/tools";
 
-const search = webSearch(async (query, signal) => {
-  return yourSearchProvider(query, { signal });
-});
+const search = webSearch(async (query, signal) => yourSearchProvider(query, { signal }));
 const session = await client.beta.agents.sessions.create({
   agent: { model: "coding", tools: [search.spec] },
   environment: { type: "none" },
@@ -196,40 +166,23 @@ const stream = client.beta.agents.sessions.stream(session.id, {
 for await (const event of stream) console.log(event.type);
 ```
 
-Client functions deliberately wait for API input. Installing a helper does not
-silently grant the server permission to execute it. Applications can bind their
-own tool Worker and apply authentication, budgets, retries, and side-effect policy
-there. MCP is an adapter to this boundary, not an additional source of authority.
+Client functions wait for API input. Installing a helper does not grant the server permission to execute it; your application applies authentication, budgets, retries and side-effect policy. MCP is an adapter to that boundary, not another source of authority.
 
-`publishSkill(bucket, bundle)` stores immutable SHA-256-addressed UTF-8 bundles.
-It requires `SKILL.md`, rejects traversal/absolute paths, and caps bundle size.
-`loadSkill` verifies integrity. `skillReader(bucket, allowedReferences)` exposes a
-portable `read_skill` function restricted to a deployment-owned allowlist.
+`publishSkill(bucket, bundle)` stores immutable SHA-256-addressed bundles, requires `SKILL.md`, rejects traversal and absolute paths, and caps bundle size. `loadSkill` verifies integrity. `skillReader(bucket, allowedReferences)` exposes a portable `read_skill` function restricted to a deployment-owned allowlist. These helpers predate the Skills API and remain for deployments that manage skills in code.
 
-Provision files before native execution with the shared harness factory:
+Provision files before native execution with the harness factory:
 
 ```ts
 import { createHarness } from "cf-open-agents-api/cloudflare";
 import { installSkill } from "cf-open-agents-api/tools";
 
 const Harness = createHarness<Bindings>(async (sandbox, execution, env) => {
-  // Resolve a deployment-owned immutable reference, never an arbitrary client URL.
   const reference = await yourSkillCatalog(env, execution.agent.model);
   await installSkill(env.CHECKPOINTS, reference, sandbox);
 });
 export { Harness as HarnessDO };
 ```
 
-The hook runs on a fresh workspace, before exec-server and model execution. It can
-also initialize a repository. Restored workspaces retain their committed assets and
-skip provisioning. `installSkill` writes `/workspace/.agents/skills/<name>`; scripts
-execute only when the sandbox runs them. Use `read_skill` when explicit progressive
-loading is preferable to harness-specific discovery.
+The hook runs once per fresh workspace, before `exec-server` and the first model call. A reused or restored sandbox skips it. Export the returned class directly: outbound handlers are registered by concrete class name through the Container SDK's static setter, and an unregistered subclass does not inherit them.
 
-Export the returned harness class directly as shown. Outbound handlers are registered
-by concrete class name using the Container SDK's static setter. An unregistered
-subclass does not inherit the SDK's handler registration.
-
-Knowledge indexing remains application-owned. `knowledgeSearch` accepts an AI Search,
-Vectorize, or other retrieval provider that returns the common result shape. Preserve
-immutable source assets separately from derived indexes and conversational memory.
+Knowledge indexing stays application-owned. `knowledgeSearch` accepts AI Search, Vectorize or any retrieval provider that returns the common result shape.
