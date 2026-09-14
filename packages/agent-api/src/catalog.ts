@@ -189,6 +189,8 @@ export class CatalogObject extends DurableObject {
         }
         const reservation = { id: record.session.id, record, ready: false, fingerprint };
         this.db.put("reservation", key, reservation);
+        // Deletion finds the reservation by session, so the key's record can be removed.
+        this.db.put("reservation_session", record.session.id, { key });
         return reservation;
       });
       return JSON.stringify({ ok: true, value });
@@ -218,7 +220,13 @@ export class CatalogObject extends DurableObject {
     );
   }
   deleteSession(id: string): void {
-    this.db.remove("session", id);
+    this.db.transaction(() => {
+      this.db.remove("session", id);
+      const index = this.db.get<{ key: string }>("reservation_session", id);
+      if (!index) return;
+      this.db.remove("reservation", index.key);
+      this.db.remove("reservation_session", id);
+    });
   }
   agent(id: string): Agent {
     return this.db.require<Agent>("agent", id);
@@ -246,12 +254,19 @@ export class CatalogObject extends DurableObject {
       }
       this.db.put("agent", agent.id, agent);
       this.db.put("agent_key", key, { fingerprint, id: agent.id });
+      this.db.put("agent_key_index", agent.id, { key });
       return agent;
     });
   }
   deleteAgent(id: string) {
-    this.agent(id);
-    this.db.remove("agent", id);
+    this.db.transaction(() => {
+      this.agent(id);
+      this.db.remove("agent", id);
+      const index = this.db.get<{ key: string }>("agent_key_index", id);
+      if (!index) return;
+      this.db.remove("agent_key", index.key);
+      this.db.remove("agent_key_index", id);
+    });
     return { id, object: "agent.deleted" as const, deleted: true };
   }
   updateAgent(id: string, input: Partial<z.infer<typeof savedAgentSchema>>): Agent {

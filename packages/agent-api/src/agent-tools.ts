@@ -106,6 +106,11 @@ export function publicTool(tool: AgentToolConfig) {
           },
   };
 }
+/**
+ * The session's agent view. The SDK's `AgentSession.agent.tools` union (`AgentTool`)
+ * has no `tool_search` member, unlike the persisted `Agent` resource, so that entry
+ * is omitted here and inline MCP secrets never leave the Worker.
+ */
 export function sessionTools(tools: AgentToolConfig[]) {
   return tools
     .map(publicTool)

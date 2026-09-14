@@ -14,6 +14,9 @@ import { ApiError } from "./protocol.js";
 
 // Leave space for SQLite's row metadata below the platform's 2 MB row limit.
 const MAX_ROW_BYTES = 1_900_000;
+// A page stops growing past this many serialized characters, so a response stays
+// far below the isolate's memory limit even when every record is at the row limit.
+const MAX_PAGE_CHARS = 4 * 1024 * 1024;
 function encodeRow(value: unknown, ...keys: string[]): string {
   const serialized = JSON.stringify(value);
   const encoder = new TextEncoder();
@@ -78,7 +81,7 @@ export class SqlStore {
         .addColumn("value", "text", (c) => c.notNull()),
     );
   }
-  private execute<Row>(query: Compilable<Row>): Row[] {
+  private cursor<Row>(query: Compilable<Row>): Iterable<Row> {
     const compiled = query.compile();
     const parameters = compiled.parameters.map((value) => {
       if (
@@ -91,7 +94,10 @@ export class SqlStore {
       throw new TypeError("Unsupported SQLite parameter");
     });
     // The compiler owns the selected row shape; this bridge only executes it.
-    return this.storage.sql.exec(compiled.sql, ...parameters).toArray() as Row[];
+    return this.storage.sql.exec(compiled.sql, ...parameters) as Iterable<Row>;
+  }
+  private execute<Row>(query: Compilable<Row>): Row[] {
+    return [...this.cursor(query)];
   }
   get<T>(kind: string, id: string): T | undefined {
     const row = this.execute(
@@ -194,17 +200,30 @@ export class SqlStore {
         ]),
       );
     }
-    const rows = this.execute(
+    // Rows are consumed lazily, so a page never holds more than its byte budget.
+    const visible: { id: string; value: string }[] = [];
+    let size = 0;
+    let has_more = false;
+    for (const row of this.cursor(
       selection
         .orderBy("seq", query.order)
         .orderBy("id", query.order)
         .limit(query.limit + 1),
-    );
-    const visible = rows.slice(0, query.limit);
+    )) {
+      if (
+        visible.length >= query.limit ||
+        (visible.length > 0 && size + row.value.length > MAX_PAGE_CHARS)
+      ) {
+        has_more = true;
+        break;
+      }
+      visible.push(row);
+      size += row.value.length;
+    }
     return {
       object: "list",
       data: visible.map((row) => JSON.parse(row.value) as T),
-      has_more: rows.length > query.limit,
+      has_more,
       first_id: visible[0]?.id ?? null,
       last_id: visible.at(-1)?.id ?? null,
     };
@@ -228,6 +247,11 @@ export class SqlStore {
         .orderBy("seq", "asc")
         .limit(limit),
     ).map((row) => ({ seq: row.seq, event: JSON.parse(row.value) as T }));
+  }
+  /** Remove every record and event. The schema stays, so the object remains usable. */
+  purge(): void {
+    this.execute(this.queries.deleteFrom("records"));
+    this.execute(this.queries.deleteFrom("events"));
   }
   lastEvent(): number {
     return (
