@@ -17,3 +17,6 @@ packages/agent-api/CHANGELOG.md
 
 # Local work notes are not release documentation.
 .agents/execplans/
+
+# Agent lane worktrees (multi-agent-worktree-hygiene)
+.claude/worktrees/

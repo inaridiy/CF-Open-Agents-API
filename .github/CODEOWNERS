@@ -1,0 +1,10 @@
+# Default owner for everything in the repository.
+* @inaridiy
+
+# Wire protocol, persistence and native harness changes need the maintainer's review.
+/packages/agent-api/src/protocol.ts @inaridiy
+/packages/agent-api/src/session.ts @inaridiy
+/packages/agent-api/src/storage.ts @inaridiy
+/packages/supervisor/ @inaridiy
+/docker/ @inaridiy
+/.github/workflows/ @inaridiy
