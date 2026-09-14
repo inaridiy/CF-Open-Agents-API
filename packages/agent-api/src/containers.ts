@@ -1197,7 +1197,9 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
       images: true,
       reasoningSummaries: true,
       usage: true,
-      webSearch: harness === "codex",
+      // Codex searches through its Responses connection; Claude Code through Anthropic's
+      // hosted WebSearch tool. Both need an alias whose model connection supports it.
+      webSearch: harness === "codex" || harness === "claude-code",
       commandOutputDeltas: true,
       programmaticToolCalling: !!env.CODE_LOADER,
       mcp: true,
