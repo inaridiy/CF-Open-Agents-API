@@ -17,6 +17,8 @@ function open(label, config) {
     for (const pending of state.pending.values()) pending.reject(new Error('MCP process closed'));
     state.pending.clear();
     child.kill('SIGKILL');
+    // A later initialize starts a fresh process; requests with the old session id get 404.
+    if (sessions.get(label) === state) sessions.delete(label);
   };
   child.on('error', fail);
   child.on('exit', fail);
@@ -66,7 +68,11 @@ const server = createServer(async (request, response) => {
         method: request.method, headers, body: request.method === 'POST' ? body : undefined,
         redirect: 'error', signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120000)]),
       });
-      response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+      // fetch already decoded and re-chunked the body: forward only end-to-end headers.
+      const forwarded = {};
+      for (const [key, value] of upstream.headers)
+        if (!['content-encoding','content-length','transfer-encoding','connection','keep-alive','upgrade','proxy-authenticate','proxy-authorization','te','trailer'].includes(key)) forwarded[key] = value;
+      response.writeHead(upstream.status, forwarded);
       if (upstream.body) for await (const chunk of upstream.body) response.write(chunk);
       response.end(); return;
     }

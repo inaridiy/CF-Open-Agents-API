@@ -105,6 +105,25 @@ export interface OpenAICompatibleOptions extends AIModelOptions {
   fetch?: typeof globalThis.fetch;
 }
 
+/** A fetch that never follows redirects, so configured credentials stay with the configured host. */
+export function fetchWithoutRedirect(
+  send: typeof globalThis.fetch = fetch,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const response = await send(input, { ...init, redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
+      return Response.json(
+        {
+          error: { type: "upstream_redirect", message: "Configured upstream returned a redirect" },
+        },
+        { status: 503 },
+      );
+    }
+    return response;
+  };
+}
+
 /** Chat Completions upstream; the gateway translates the harness's wire protocol. */
 export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectModelAdapter {
   const provider = createOpenAICompatible({
@@ -112,9 +131,63 @@ export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectM
     baseURL: options.baseURL,
     apiKey: options.apiKey,
     headers: options.headers,
-    fetch: options.fetch,
+    fetch: fetchWithoutRedirect(options.fetch),
   });
   return aiSDKModel(provider(options.model), options);
+}
+
+const PROVIDER_ERROR_LIMIT = 64 * 1024;
+const SECRET_PATTERN = /\b[A-Za-z]{1,8}-[A-Za-z0-9_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,}/g;
+async function readBounded(response: Response, limit: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (text.length < limit) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return text.slice(0, limit);
+}
+/**
+ * Provider error bodies can echo request headers, including masked keys. Keep the
+ * status, the structured error fields and Retry-After; drop everything else.
+ */
+export async function sanitizeProviderError(response: Response): Promise<Response> {
+  const text = await readBounded(response, PROVIDER_ERROR_LIMIT);
+  let error: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      const inner = (parsed as { error?: unknown }).error;
+      error =
+        inner && typeof inner === "object"
+          ? (inner as Record<string, unknown>)
+          : (parsed as Record<string, unknown>);
+    }
+  } catch {
+    error = {};
+  }
+  const mask = (value: unknown) =>
+    typeof value === "string" ? value.replace(SECRET_PATTERN, "[redacted]").slice(0, 2_000) : null;
+  const headers = new Headers({ "content-type": "application/json" });
+  const retry = response.headers.get("retry-after");
+  if (retry) headers.set("retry-after", retry);
+  return Response.json(
+    {
+      error: {
+        type: mask(error.type) ?? "upstream_error",
+        code: mask(error.code),
+        message: mask(error.message) ?? `Upstream model request failed (${response.status})`,
+      },
+    },
+    { status: response.status, headers },
+  );
 }
 
 /** Preserve provider-native reasoning, custom tools and other protocol extensions. */
@@ -152,7 +225,7 @@ export function nativeModel(options: {
         const beta = request.headers.get("anthropic-beta");
         if (beta) headers.set("anthropic-beta", beta);
       } else headers.set("authorization", `Bearer ${options.apiKey}`);
-      return yield* requestWithoutRedirect(
+      const response = yield* requestWithoutRedirect(
         "model.fetch",
         new Request(new URL(path.slice(1), base), {
           method: "POST",
@@ -162,6 +235,8 @@ export function nativeModel(options: {
         }),
         options.fetch,
       );
+      if (response.ok) return response;
+      return yield* io("model.error", () => sanitizeProviderError(response));
     }),
   );
 }

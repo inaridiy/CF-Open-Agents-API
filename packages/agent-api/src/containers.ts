@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { McpToolConfig } from "./agent-tools.js";
 import type { CatalogObject } from "./catalog.js";
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
-import { decode, io, runPromise } from "./effect.js";
+import { attempt, decode, io, runPromise } from "./effect.js";
 import type { HostedConfiguration } from "./environment-config.js";
 import { environmentMcpScript } from "./environment-mcp.js";
 import type { EnvironmentDriver } from "./environments.js";
@@ -28,6 +28,7 @@ import type {
 } from "./runtime.js";
 import { batchSchema, commandSchema, fromPromiseDriver } from "./runtime.js";
 import { executeWorkspaceTool } from "./sandbox-tools.js";
+import { SqlStore } from "./storage.js";
 import { workspaceTools } from "./workspace.js";
 
 export interface ContainerBindings {
@@ -55,8 +56,10 @@ interface Assignment {
   tenant?: string;
   vaultIds?: readonly string[];
   mcp?: McpToolConfig[];
+  /** Worker-authoritative code tool names; MCP tools are admitted by configured server label. */
   programmatic?: { tools: string[]; deadline: number };
-  imageURLs?: string[];
+  /** SHA-256 digests of image URLs this execution may fetch; the URLs themselves stay in SQLite items. */
+  imageDigests?: string[];
   /** Present when this turn may delegate: the parent configuration children inherit. */
   delegation?: {
     delegates: NonNullable<Execution["delegates"]>;
@@ -74,17 +77,44 @@ interface ChildRecord {
   execution: Execution;
   terminal?: RuntimeBatch;
 }
+/**
+ * What the live Sandbox filesystem holds. A turn reuses the running sandbox when this
+ * matches the workspace it must start from; otherwise it destroys and restores. The same
+ * identity is written inside the container so a replaced container cannot be mistaken
+ * for the one that was provisioned.
+ */
+interface SandboxState {
+  /** Backup id restored into or committed from the live filesystem; "" for a fresh workspace. */
+  workspaceId: string;
+  /** The deployment provisioning hook already ran for this workspace. */
+  provisioned: boolean;
+}
+const SANDBOX_MARKER = "/tmp/cf-open-agents-sandbox.json";
+const IMAGE_DIGEST_LIMIT = 256;
 const spawnRequestSchema = z.object({
   alias: z.string().min(1),
   prompt: z.string().min(1).max(128_000),
   name: z.string().max(256).nullable().optional(),
 });
+const IMAGE_DATA_PREFIX = "data:";
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function remoteImageURLs(parts: readonly { type: string; image_url?: string }[]): string[] {
+  return parts.flatMap((part) =>
+    part.type === "input_image" && part.image_url && !part.image_url.startsWith(IMAGE_DATA_PREFIX)
+      ? [part.image_url]
+      : [],
+  );
+}
 
 export class SandboxContainer extends Sandbox<ContainerBindings> {
-  override enableInternet = false;
   override sleepAfter = "10m";
   constructor(ctx: ConstructorParameters<typeof Sandbox>[0], env: ContainerBindings) {
     super(ctx, env);
+    // Internet access is enabled unless the environment's network policy disabled it.
+    // The policy is stored before the Container starts (see configureNetwork).
     ctx.blockConcurrencyWhile(async () => {
       this.enableInternet = (await ctx.storage.get<boolean>("environment_internet")) ?? true;
     });
@@ -126,6 +156,8 @@ export class HarnessContainer<
   override enableInternet = false;
   private readonly lifecycle = Effect.unsafeMakeSemaphore(1);
   private readonly workspace = Effect.unsafeMakeSemaphore(1);
+  /** Assignment, child and checkpoint records carry agent configuration; SQLite rows, not KV values. */
+  private readonly db = new SqlStore(this.ctx.storage);
   private readonly environment = new EnvironmentWorkspace(
     this.ctx.storage,
     this.env,
@@ -144,10 +176,30 @@ export class HarnessContainer<
       url.pathname !== "/image" ||
       assignment.revoked ||
       !source ||
-      !assignment.imageURLs?.includes(source)
+      !assignment.imageDigests?.includes(await sha256Hex(source))
     )
       return new Response("Image is not assigned to this execution", { status: 403 });
     return fetchAssignedImage(source, request.signal);
+  }
+  /** The bounded set of remote image URLs a turn may fetch, as digests; excess is an explicit error. */
+  private imageDigests(urls: readonly string[], existing: readonly string[]) {
+    return Effect.gen(function* () {
+      const digests = yield* io("assignment.images", () => Promise.all(urls.map(sha256Hex)));
+      const merged = [...new Set([...existing, ...digests])];
+      if (merged.length > IMAGE_DIGEST_LIMIT)
+        return yield* new ApiError(
+          413,
+          "image_limit",
+          `A turn may reference at most ${IMAGE_DIGEST_LIMIT} remote images`,
+        );
+      return merged;
+    });
+  }
+  /** Code may call client functions, workspace tools and tools of configured MCP servers only. */
+  private permittedCodeTool(assignment: Assignment, name: string): boolean {
+    if (!assignment.programmatic) return false;
+    if (assignment.programmatic.tools.includes(name)) return true;
+    return (assignment.mcp ?? []).some((tool) => name.startsWith(`mcp__${tool.server_label}__`));
   }
   async programmaticRequest(request: Request): Promise<Response> {
     const assignment = await runPromise(this.assignment());
@@ -168,10 +220,12 @@ export class HarnessContainer<
         `http://harness/jobs/${assignment.turnId}/code-tools?invocation=${invocation}`,
       );
       if (!catalog.ok) throw new Error("Code tool catalog is unavailable");
+      // The container proposes names; the Worker's assignment decides what code may call.
       const tools = z
         .array(z.string().min(1).max(256))
         .max(2000)
-        .parse(await catalog.json());
+        .parse(await catalog.json())
+        .filter((name) => this.permittedCodeTool(assignment, name));
       const value = await runProgrammatic(this.env.CODE_LOADER, {
         input,
         tools,
@@ -185,6 +239,7 @@ export class HarnessContainer<
             current.generation !== assignment.generation
           )
             throw new Error("Execution was superseded");
+          if (!this.permittedCodeTool(current, name)) throw new Error("Tool is not allowed");
           const result = await this.containerFetch(
             new Request(`http://harness/jobs/${assignment.turnId}/code-tool`, {
               method: "POST",
@@ -207,10 +262,12 @@ export class HarnessContainer<
       if (terminal) {
         const current = await runPromise(this.assignment());
         if (current.turnId === assignment.turnId && current.generation === assignment.generation) {
-          await this.ctx.storage.put("assignment", { ...current, revoked: true });
+          this.db.put("assignment", "current", { ...current, revoked: true } satisfies Assignment);
           // A child reports the uncertain outcome; its parent's failure destroys the shared sandbox.
-          if (assignment.sandbox && !assignment.parent)
+          if (assignment.sandbox && !assignment.parent) {
+            this.forgetSandbox();
             await getSandbox(this.env.SANDBOX, assignment.sessionId).destroy();
+          }
         }
       }
       return Response.json({
@@ -229,7 +286,67 @@ export class HarnessContainer<
     }
   }
   prepareEnvironment(...args: Parameters<EnvironmentDriver["prepare"]>) {
-    return runPromise(this.workspace.withPermits(1)(this.environment.prepare(...args)));
+    const [spec] = args;
+    return runPromise(
+      this.workspace.withPermits(1)(
+        this.environment.prepare(...args).pipe(
+          // Setup left the live sandbox holding exactly the committed base (plus whatever
+          // setup commands wrote outside /workspace); the first turn can continue in it.
+          Effect.zipRight(
+            Effect.suspend(() =>
+              this.sandboxState() || !this.environment.base()
+                ? Effect.void
+                : this.rememberSandbox(getSandbox(this.env.SANDBOX, spec.sessionId), {
+                    workspaceId: this.environment.base()?.id ?? "",
+                    provisioned: this.environment.inherited(),
+                  }),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  private sandboxState(): SandboxState | undefined {
+    return this.db.get<SandboxState>("sandbox", "current");
+  }
+  private forgetSandbox(): void {
+    this.db.remove("sandbox", "current");
+  }
+  /** Record the workspace the live filesystem holds, inside the container and durably. */
+  private rememberSandbox(sandbox: ISandbox, state: SandboxState) {
+    return Effect.gen(this, function* () {
+      const written = yield* io("sandbox.marker", () =>
+        sandbox.writeFile(SANDBOX_MARKER, JSON.stringify({ workspaceId: state.workspaceId })),
+      );
+      if (!written.success) return yield* Effect.fail(new Error("Sandbox marker write failed"));
+      yield* attempt("sandbox.remember", () => this.db.put("sandbox", "current", state));
+    });
+  }
+  /** True when the running sandbox provably holds `workspaceId`; any doubt means restore. */
+  private sandboxHolds(sandbox: ISandbox, sessionId: string, workspaceId: string) {
+    return Effect.gen(this, function* () {
+      const state = this.sandboxState();
+      if (!state || state.workspaceId !== workspaceId) return false;
+      const runtime = yield* io(
+        "sandbox.status",
+        async () => await this.env.SANDBOX.getByName(sessionId).getState(),
+      ).pipe(Effect.option);
+      const status = runtime._tag === "Some" ? runtime.value.status : undefined;
+      if (status !== "running" && status !== "healthy") return false;
+      const marker = yield* io("sandbox.marker.read", () => sandbox.readFile(SANDBOX_MARKER)).pipe(
+        Effect.option,
+      );
+      if (marker._tag === "None" || !marker.value.success) return false;
+      return yield* attempt("sandbox.marker.decode", () => {
+        const parsed: unknown = JSON.parse(marker.value.content);
+        return (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          "workspaceId" in parsed &&
+          parsed.workspaceId === workspaceId
+        );
+      }).pipe(Effect.orElseSucceed(() => false));
+    });
   }
   environmentStatus(...args: Parameters<EnvironmentDriver["status"]>) {
     return runPromise(this.environment.status(...args));
@@ -245,14 +362,10 @@ export class HarnessContainer<
   }
   protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
   private assignment() {
-    return Effect.gen(this, function* () {
-      const assignment = yield* io("assignment", () =>
-        this.ctx.storage.get<Assignment>("assignment"),
-      );
+    return attempt("assignment", () => {
+      const assignment = this.db.get<Assignment>("assignment", "current");
       if (!assignment)
-        return yield* Effect.fail(
-          new ApiError(409, "unassigned_container", "Container has no session assignment"),
-        );
+        throw new ApiError(409, "unassigned_container", "Container has no session assignment");
       return assignment;
     });
   }
@@ -314,7 +427,7 @@ export class HarnessContainer<
     if (request.method === "POST" && target === "spawn" && !action)
       return this.spawnChild(assignment, delegation, await request.json());
     if (!target) return new Response(null, { status: 404 });
-    const child = await this.ctx.storage.get<ChildRecord>(`child:${target}`);
+    const child = this.db.get<ChildRecord>("child", target);
     if (!child || child.execution.parent?.turnId !== turnId)
       return new Response("Unknown subagent", { status: 404 });
     if (request.method === "GET" && !action) {
@@ -330,7 +443,7 @@ export class HarnessContainer<
       );
       if (batch.status !== "running" && batch.status !== "waiting") {
         // Durable before the child Container disappears, so a lost response can be retried.
-        await this.ctx.storage.put(`child:${target}`, { ...child, terminal: batch });
+        this.db.put("child", target, { ...child, terminal: batch } satisfies ChildRecord);
         await this.child(target)
           .stopExecution(child.execution)
           .catch((error) => console.warn("Delegated child stop failed", { error: String(error) }));
@@ -358,9 +471,7 @@ export class HarnessContainer<
     const delegate = delegation.delegates.find((entry) => entry.alias === parsed.data.alias);
     if (!delegate) return new Response("Unknown delegate", { status: 404 });
     const children = assignment.children ?? [];
-    let active = 0;
-    for (const id of children)
-      if (!(await this.ctx.storage.get<ChildRecord>(`child:${id}`))?.terminal) active++;
+    const active = children.filter((id) => !this.db.get<ChildRecord>("child", id)?.terminal).length;
     if (active >= delegation.maxConcurrentSubagents)
       return new Response("Concurrent subagent limit reached", { status: 409 });
     const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -391,16 +502,18 @@ export class HarnessContainer<
       ...(assignment.vaultIds ? { vaultIds: [...assignment.vaultIds] } : {}),
       parent: { turnId: assignment.turnId, subagentId },
     };
-    await this.ctx.storage.put(`child:${subagentId}`, { execution } satisfies ChildRecord);
-    await this.ctx.storage.put("assignment", {
-      ...assignment,
-      children: [...children, subagentId],
-    } satisfies Assignment);
+    this.db.transaction(() => {
+      this.db.put("child", subagentId, { execution } satisfies ChildRecord);
+      this.db.put("assignment", "current", {
+        ...assignment,
+        children: [...children, subagentId],
+      } satisfies Assignment);
+    });
     try {
       await this.child(subagentId).startExecution(execution, `${turnId}:start`);
     } catch (error) {
       console.warn("Delegated child start failed", { subagentId, error: String(error) });
-      await this.ctx.storage.put(`child:${subagentId}`, {
+      this.db.put("child", subagentId, {
         execution,
         terminal: { status: "failed", events: [], cursor: 0, error: "subagent_start_failed" },
       } satisfies ChildRecord);
@@ -459,7 +572,12 @@ export class HarnessContainer<
                   () => send({ type: "error", message: "Workspace operation failed" }),
                 )
                 .finally(() => {
-                  if (!abort.signal.aborted) controller.close();
+                  // The consumer may already have closed the stream without cancelling it.
+                  try {
+                    if (!abort.signal.aborted) controller.close();
+                  } catch {
+                    abort.abort();
+                  }
                 });
             },
             cancel() {
@@ -532,8 +650,8 @@ export class HarnessContainer<
             "Checkpoint belongs to another harness version",
           ),
         );
-      const previous = yield* io("startAttempt", () =>
-        this.ctx.storage.get<Assignment>("assignment"),
+      const previous = yield* attempt("startAttempt", () =>
+        this.db.get<Assignment>("assignment", "current"),
       );
       if (
         previous &&
@@ -566,13 +684,10 @@ export class HarnessContainer<
         tenant: execution.tenant,
         vaultIds: execution.vaultIds,
         mcp: (execution.agent.tools ?? []).filter((tool) => tool.type === "mcp"),
-        imageURLs: execution.input
-          .flatMap((message) => message.content)
-          .flatMap((part) =>
-            part.type === "input_image" && !part.image_url.startsWith("data:")
-              ? [part.image_url]
-              : [],
-          ),
+        imageDigests: yield* this.imageDigests(
+          remoteImageURLs(execution.input.flatMap((message) => message.content)),
+          [],
+        ),
         ...(execution.agent.tools?.some(
           (tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false,
         )
@@ -602,7 +717,7 @@ export class HarnessContainer<
         ...(execution.parent ? { parent: execution.parent } : {}),
       };
       for (const controller of this.codeExecutions) controller.abort();
-      yield* io("startAttempt", () => this.ctx.storage.put("assignment", assignment));
+      yield* attempt("startAttempt", () => this.db.put("assignment", "current", assignment));
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const previousCheckpoint = execution.checkpoint;
       const previousWorkspace = previousCheckpoint?.workspace ?? this.environment.base();
@@ -617,25 +732,34 @@ export class HarnessContainer<
           return (await probe.output({ timeout: 10_000, encoding: "utf8" })).stdout.includes("up");
         });
       if (execution.sandbox && !execution.parent) {
-        // Every new attempt starts from the last committed filesystem checkpoint.
-        yield* io("startAttempt", () => sandbox.destroy());
-        if (previousWorkspace)
-          yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
-        else {
-          yield* io("startAttempt", () => sandbox.mkdir("/workspace", { recursive: true }));
+        const workspaceId = previousWorkspace?.id ?? "";
+        // A running sandbox that provably holds the committed workspace continues as is,
+        // including state outside /workspace. Anything else starts from the last committed
+        // filesystem checkpoint: destroy, restore, and configure the fresh container.
+        const reused = yield* this.sandboxHolds(sandbox, execution.sessionId, workspaceId);
+        if (!reused) {
+          yield* attempt("startAttempt.forget", () => this.forgetSandbox());
+          yield* io("startAttempt", () => sandbox.destroy());
+          if (previousWorkspace)
+            yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
+          else {
+            yield* io("startAttempt", () => sandbox.mkdir("/workspace", { recursive: true }));
+          }
+          const environmentSpec = this.environment.spec();
+          if (environmentSpec) yield* this.environment.configure(environmentSpec);
+          yield* this.rememberSandbox(sandbox, {
+            workspaceId,
+            provisioned: previousCheckpoint !== null || this.environment.inherited(),
+          });
         }
         // The deployment hook runs once per fresh workspace; an inherited workspace was provisioned.
-        if (!previousCheckpoint && !this.environment.inherited())
+        if (!this.sandboxState()?.provisioned) {
           yield* io("startAttempt", () => this.prepareSandbox(sandbox, execution));
-        const environmentSpec = this.environment.spec();
-        if (environmentSpec) yield* this.environment.configure(environmentSpec);
+          yield* this.rememberSandbox(sandbox, { workspaceId, provisioned: true });
+        }
         yield* this.environment.applyUploads(previousCheckpoint?.environmentFileVersion ?? 0);
       }
-      if (
-        execution.sandbox &&
-        harness === "codex" &&
-        !(execution.parent && (yield* listening(4500)))
-      ) {
+      if (execution.sandbox && harness === "codex" && !(yield* listening(4500))) {
         const executor = yield* io("startAttempt", () =>
           sandbox.exec(["codex", "exec-server", "--listen", "ws://0.0.0.0:4500"]),
         );
@@ -646,25 +770,25 @@ export class HarnessContainer<
         : this.environment.capabilityRoots();
       let portableInstructions = "";
       if (harness !== "codex" && execution.sandbox) {
+        const configured = assignment.mcp ?? [];
+        // Plugin-derived labels are sanitized and kept distinct from configured servers, so
+        // workspace content can add servers but never replace or break configured ones.
         const discovered = yield* io("capabilities.discover", () =>
-          discoverCapabilities(sandbox, capabilityRoots),
+          discoverCapabilities(sandbox, capabilityRoots, {
+            reservedLabels: configured.map((entry) => entry.server_label),
+            diagnostics: (line) =>
+              console.warn("Capability discovery skipped an entry", {
+                sessionId: execution.sessionId,
+                line,
+              }),
+          }),
         );
         portableInstructions = discovered.instructions;
-        const configured = assignment.mcp ?? [];
-        for (const tool of discovered.mcp) {
-          if (configured.some((entry) => entry.server_label === tool.server_label))
-            return yield* new ApiError(
-              422,
-              "duplicate_mcp_server",
-              "Plugin MCP server label conflicts with configuration",
-            );
-          configured.push(tool);
-        }
-        assignment.mcp = configured;
-        const environmentServers = configured.filter(
+        assignment.mcp = [...configured, ...discovered.mcp];
+        const environmentServers = assignment.mcp.filter(
           (tool) => tool.transport.type === "stdio" || tool.connection_origin === "environment",
         );
-        if (environmentServers.length && !(execution.parent && (yield* listening(4501)))) {
+        if (environmentServers.length && !(yield* listening(4501))) {
           yield* io("mcp.bridge.config", () =>
             sandbox.writeFile(
               "/tmp/cf-environment-mcp.json",
@@ -697,8 +821,8 @@ export class HarnessContainer<
       }
       yield* io("startAttempt", () => this.startAndWaitForPorts());
       // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job.
-      yield* io("startAttempt", () =>
-        this.ctx.storage.put("assignment", { ...assignment, dispatched: true }),
+      yield* attempt("startAttempt", () =>
+        this.db.put("assignment", "current", { ...assignment, dispatched: true }),
       );
       const result = yield* io("startAttempt", () =>
         this.containerFetch("http://harness/jobs", {
@@ -773,24 +897,22 @@ export class HarnessContainer<
           return yield* Effect.fail(
             new ApiError(409, "stale_generation", "Execution was superseded"),
           );
-        const imageURLs =
+        const parts =
           command.type === "steer"
             ? command.input.flatMap((message) => message.content)
             : command.type === "tool_result" && Array.isArray(command.output)
               ? command.output
               : [];
-        const allowedImages = imageURLs.flatMap((part) =>
-          part.type === "input_image" && !part.image_url.startsWith("data:")
-            ? [part.image_url]
-            : [],
-        );
-        if (allowedImages.length)
-          yield* io("controlExecution.images", () =>
-            this.ctx.storage.put("assignment", {
-              ...assignment,
-              imageURLs: [...new Set([...(assignment.imageURLs ?? []), ...allowedImages])],
-            }),
+        const allowedImages = remoteImageURLs(parts);
+        if (allowedImages.length) {
+          const imageDigests = yield* this.imageDigests(
+            allowedImages,
+            assignment.imageDigests ?? [],
           );
+          yield* attempt("controlExecution.images", () =>
+            this.db.put("assignment", "current", { ...assignment, imageDigests }),
+          );
+        }
         const result = yield* io("controlExecution", () =>
           this.containerFetch(`http://harness/jobs/${execution.turnId}/control`, {
             method: "POST",
@@ -800,8 +922,25 @@ export class HarnessContainer<
         );
         if (command.type === "cancel")
           for (const controller of this.codeExecutions) controller.abort();
-        if (!result.ok)
-          return yield* Effect.fail(new Error(`Harness rejected control (${result.status})`));
+        if (!result.ok) {
+          // A definite rejection is an API error the session can act on; anything else is retried.
+          const body = yield* io(
+            "controlExecution.body",
+            (): Promise<{ code?: unknown; message?: unknown; error?: unknown }> =>
+              result
+                .json<{ code?: unknown; message?: unknown; error?: unknown }>()
+                .catch(() => ({})),
+          );
+          const message =
+            typeof body.message === "string"
+              ? body.message
+              : typeof body.error === "string"
+                ? body.error
+                : `Harness rejected control (${result.status})`;
+          if (result.status === 409) return yield* new ApiError(409, "command_rejected", message);
+          if (result.status === 404) return yield* new ApiError(404, "execution_missing", message);
+          return yield* Effect.fail(new Error(message));
+        }
       }),
     );
   }
@@ -822,8 +961,8 @@ export class HarnessContainer<
           new ApiError(409, "invalid_checkpoint", "Delegated children are not checkpointed"),
         );
       const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
-      const committed = yield* io("snapshot", () =>
-        this.ctx.storage.get<Checkpoint>(`checkpoint:${execution.generation}`),
+      const committed = yield* attempt("snapshot", () =>
+        this.db.get<Checkpoint>("checkpoint", String(execution.generation)),
       );
       if (committed) return committed;
       const response = yield* io("snapshot", () =>
@@ -834,15 +973,21 @@ export class HarnessContainer<
       // containerFetch may return a chunked stream; R2 requires a known length.
       const bytes = yield* io("snapshot", () => response.arrayBuffer());
       yield* io("snapshot", () => this.env.CHECKPOINTS.put(key, bytes));
+      const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const workspace = execution.sandbox
         ? yield* io("snapshot", () =>
-            getSandbox(this.env.SANDBOX, execution.sessionId).createBackup({
+            sandbox.createBackup({
               dir: "/workspace",
               localBucket: this.env.LOCAL_BACKUPS === "true",
               ttl: 30 * 24 * 60 * 60,
             }),
           )
         : undefined;
+      // The live filesystem now equals the committed workspace; the next turn may continue in it.
+      if (workspace)
+        yield* this.rememberSandbox(sandbox, { workspaceId: workspace.id, provisioned: true }).pipe(
+          Effect.catchAll(() => attempt("snapshot.forget", () => this.forgetSandbox())),
+        );
       const artifacts =
         execution.sandbox && execution.environmentId ? yield* this.publishArtifacts(execution) : [];
       const checkpoint: Checkpoint = {
@@ -854,8 +999,8 @@ export class HarnessContainer<
         artifacts,
         environmentFileVersion: this.environment.fileVersion(),
       };
-      yield* io("snapshot", () =>
-        this.ctx.storage.put(`checkpoint:${execution.generation}`, checkpoint),
+      yield* attempt("snapshot", () =>
+        this.db.put("checkpoint", String(execution.generation), checkpoint),
       );
       return checkpoint;
     });
@@ -865,9 +1010,9 @@ export class HarnessContainer<
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       if (!(yield* io("artifact.exists", () => sandbox.exists("/workspace/outputs"))).exists)
         return [];
-      const manifestKey = `artifacts:${execution.generation}`;
-      let manifest = yield* io("artifact.manifest.get", () =>
-        this.ctx.storage.get<NonNullable<Checkpoint["artifacts"]>>(manifestKey),
+      const manifestKey = String(execution.generation);
+      let manifest = yield* attempt("artifact.manifest.get", () =>
+        this.db.get<NonNullable<Checkpoint["artifacts"]>>("artifacts", manifestKey),
       );
       if (!manifest) {
         const listing = yield* io("artifact.list", () =>
@@ -906,7 +1051,9 @@ export class HarnessContainer<
             };
           }),
         );
-        yield* io("artifact.manifest.commit", () => this.ctx.storage.put(manifestKey, manifest));
+        yield* attempt("artifact.manifest.commit", () =>
+          this.db.put("artifacts", manifestKey, manifest),
+        );
       }
       yield* Effect.forEach(
         manifest,
@@ -938,8 +1085,8 @@ export class HarnessContainer<
       if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
         return;
       for (const controller of this.codeExecutions) controller.abort();
-      yield* io("stopAttempt.revoke", () =>
-        this.ctx.storage.put("assignment", { ...assignment, revoked: true }),
+      yield* attempt("stopAttempt.revoke", () =>
+        this.db.put("assignment", "current", { ...assignment, revoked: true }),
       );
       // Native stderr is lost with the Container; keep a bounded tail in Worker logs.
       if (assignment.dispatched)
@@ -958,17 +1105,18 @@ export class HarnessContainer<
         }).pipe(Effect.ignore);
       // Children stop before the parent releases the sandbox they share.
       for (const subagentId of assignment.children ?? []) {
-        const child = yield* io("stopAttempt.child", () =>
-          this.ctx.storage.get<ChildRecord>(`child:${subagentId}`),
-        );
+        const child = this.db.get<ChildRecord>("child", subagentId);
         if (child && !child.terminal)
           yield* io("stopAttempt.child", () =>
             this.child(subagentId).stopExecution(child.execution),
           ).pipe(Effect.ignore);
       }
       yield* io("stopAttempt", () => this.destroy());
-      if (assignment.sandbox && !assignment.parent)
+      if (assignment.sandbox && !assignment.parent) {
+        // Uncommitted workspace state is discarded; the next turn restores the last checkpoint.
+        yield* attempt("stopAttempt.forget", () => this.forgetSandbox());
         yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
+      }
     });
   }
 }

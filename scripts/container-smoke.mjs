@@ -140,7 +140,14 @@ try {
         type: "openai_hosted",
         env: { EXAMPLE_SETTING: "configured" },
         files: [{ type: "file_id", path: "/workspace/input.txt", file_id: sourceFile.id }],
-        setup_commands: [{ command: "cp /workspace/input.txt /workspace/setup.txt" }],
+        // The second command writes outside /workspace: the first turn must see it (the
+        // provisioned sandbox is reused), and a restore after recovery must not.
+        setup_commands: [
+          {
+            command:
+              "cp /workspace/input.txt /workspace/setup.txt && printf HOME_SETUP > /tmp/cf-smoke-home.txt",
+          },
+        ],
         network: { access: "disabled" },
         skills: [{ type: "skill_reference", skill_id: savedSkill.id }],
         plugins: [
@@ -331,6 +338,27 @@ try {
     await sessions.events.create(sessionId, { events: [{ type: "agent.session.input.cancel" }] });
     await complete(false);
     assert.equal((await sessions.turns.list(sessionId)).data[0].status, "cancelled");
+    // A cancelled turn discards the live sandbox: the next turn restores the committed
+    // /workspace and nothing written outside it (the T2 marker) survives.
+    await sessions.events.create(sessionId, {
+      events: [
+        {
+          type: "agent.session.input.message",
+          input: [{ role: "user", content: [{ type: "input_text", text: "verify-home-reset" }] }],
+        },
+      ],
+    });
+    await complete();
+    assert(
+      (await sessions.items.list(sessionId, { limit: 100 })).data.some(
+        (item) =>
+          item.type === "command_execution" && item.exit_code === 0 && item.output === "HOME_RESET",
+      ),
+      "Expected the sandbox to be restored from the checkpoint after cancellation",
+    );
+    console.log(
+      `PASS: ${harnessName} reuses the provisioned/committed sandbox across completed turns and restores it after cancellation.`,
+    );
     await sessions.events.create(sessionId, {
       events: [
         {

@@ -34,10 +34,17 @@ export const environmentFileSchema = z.discriminatedUnion("type", [
     file_id: z.string().min(1),
   }),
 ]);
+/** Inline and pinned skill/plugin archives an environment installs, in total, per environment. */
+export const CAPABILITY_BYTES_LIMIT = 64 * 1024 * 1024;
+/** One inline archive; pinned skill bundles are bounded by the Skills API's 16 MiB. */
+export const INLINE_CAPABILITY_LIMIT = 16 * 1024 * 1024;
 const source = z.strictObject({
   type: z.literal("base64"),
   media_type: z.literal("application/zip"),
-  data: base64Schema,
+  data: base64Schema.refine(
+    (data) => base64Size(data) <= INLINE_CAPABILITY_LIMIT,
+    "Inline capability archive exceeds 16 MiB",
+  ),
 });
 const inlineCapability = z.strictObject({
   type: z.literal("inline"),
@@ -45,6 +52,16 @@ const inlineCapability = z.strictObject({
   description: z.string(),
   source,
 });
+function inlineCapabilityBytes(configuration: {
+  skills?: readonly ({ type: "inline"; source: { data: string } } | { type: string })[] | null;
+  plugins?: readonly { source: { data: string } }[] | null;
+}): number {
+  let total = 0;
+  for (const skill of configuration.skills ?? [])
+    if (skill.type === "inline" && "source" in skill) total += base64Size(skill.source.data);
+  for (const plugin of configuration.plugins ?? []) total += base64Size(plugin.source.data);
+  return total;
+}
 export const networkSchema = z.strictObject({
   access: z.enum(["enabled", "disabled", "restricted"]),
   allowed_domains: z
@@ -58,7 +75,7 @@ export const networkSchema = z.strictObject({
     .nullable()
     .optional(),
 });
-export const hostedConfigurationSchema = z.strictObject({
+const hostedConfigurationShape = z.strictObject({
   capability_directories: z.array(z.string().min(1).max(4096)).nullable().optional(),
   env: z
     .record(z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/), z.string())
@@ -106,9 +123,16 @@ export const hostedConfigurationSchema = z.strictObject({
     .nullable()
     .optional(),
 });
-export const templateSchema = hostedConfigurationSchema.extend({
-  name: z.string().max(256).nullable().optional(),
-});
+const capabilityBudget = (configuration: z.infer<typeof hostedConfigurationShape>) =>
+  inlineCapabilityBytes(configuration) <= CAPABILITY_BYTES_LIMIT;
+const CAPABILITY_BUDGET_MESSAGE = "Inline skills and plugins exceed 64 MiB in total";
+export const hostedConfigurationSchema = hostedConfigurationShape.refine(
+  capabilityBudget,
+  CAPABILITY_BUDGET_MESSAGE,
+);
+export const templateSchema = hostedConfigurationShape
+  .extend({ name: z.string().max(256).nullable().optional() })
+  .refine(capabilityBudget, CAPABILITY_BUDGET_MESSAGE);
 export type HostedConfiguration = z.infer<typeof hostedConfigurationSchema>;
 export type TemplateConfiguration = z.infer<typeof templateSchema>;
 export type EnvironmentFileInput = z.infer<typeof environmentFileSchema>;

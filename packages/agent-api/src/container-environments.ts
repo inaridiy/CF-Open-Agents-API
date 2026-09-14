@@ -7,6 +7,7 @@ import type { ContainerBindings } from "./containers.js";
 import { attempt, io, type ServiceError } from "./effect.js";
 import {
   base64Size,
+  CAPABILITY_BYTES_LIMIT,
   type EnvironmentFileInput,
   hostedConfigurationSchema,
 } from "./environment-config.js";
@@ -20,6 +21,14 @@ import type { Checkpoint } from "./runtime.js";
 import { SqlStore } from "./storage.js";
 
 type Upload = { id: string; key: string; path: string; size: number; version: number };
+/** A skill or plugin archive to install; inline data or an immutable R2 object. */
+interface Capability {
+  kind: "skill" | "plugin";
+  name: string;
+  description: string;
+  source: { type: "base64"; data: string } | { type: "object"; key: string };
+  size: number;
+}
 type State = {
   version: 1;
   spec: EnvironmentSpec;
@@ -146,6 +155,9 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       // already ran in the source session; only their committed results are adopted.
       yield* this.configure(spec);
       const base = inherited.workspace ?? source.base;
+      // The fresh sandbox now holds the inherited workspace, so the first turn continues in it.
+      if (base)
+        yield* io("environment.adopt.restore", () => this.sandbox(spec).restoreBackup(base));
       yield* attempt("environment.adopt", () =>
         this.db.put("environment_state", "current", {
           version: 1,
@@ -167,38 +179,71 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       yield* Effect.forEach(config.files ?? [], (file) => this.write(sandbox, spec, file), {
         discard: true,
       });
-      const capabilities = [
+      // Archives are written one at a time and pinned bundles stream from R2, so the
+      // Worker never holds more than one inline archive in memory.
+      const capabilities: Capability[] = [
         ...(config.skills ?? []).flatMap((skill) =>
-          skill.type === "inline" ? [{ ...skill, kind: "skill" }] : [],
+          skill.type === "inline"
+            ? [
+                {
+                  kind: "skill" as const,
+                  name: skill.name,
+                  description: skill.description,
+                  source: { type: "base64" as const, data: skill.source.data },
+                  size: base64Size(skill.source.data),
+                },
+              ]
+            : [],
         ),
-        ...(config.plugins ?? []).map((plugin) => ({ ...plugin, kind: "plugin" })),
+        ...(config.plugins ?? []).map((plugin) => ({
+          kind: "plugin" as const,
+          name: plugin.name,
+          description: plugin.description,
+          source: { type: "base64" as const, data: plugin.source.data },
+          size: base64Size(plugin.source.data),
+        })),
       ];
       for (const skill of spec.skills ?? []) {
-        const object = yield* io("environment.skill.get", () =>
-          this.env.CHECKPOINTS.get(skill.key),
+        const head = yield* io("environment.skill.head", () =>
+          this.env.CHECKPOINTS.head(skill.key),
         );
-        if (!object) return yield* new ApiError(404, "not_found", "Pinned skill bundle not found");
-        const bytes = new Uint8Array(
-          yield* io("environment.skill.read", () => object.arrayBuffer()),
-        );
-        let binary = "";
-        for (let offset = 0; offset < bytes.length; offset += 8192)
-          binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+        if (!head) return yield* new ApiError(404, "not_found", "Pinned skill bundle not found");
         capabilities.push({
-          type: "inline",
           kind: "skill",
           name: skill.name,
           description: skill.description,
-          source: { type: "base64", media_type: "application/zip", data: btoa(binary) },
+          source: { type: "object", key: skill.key },
+          size: head.size,
         });
       }
+      if (
+        capabilities.reduce((sum, capability) => sum + capability.size, 0) > CAPABILITY_BYTES_LIMIT
+      )
+        return yield* new ApiError(
+          413,
+          "capability_limit",
+          "Skills and plugins exceed 64 MiB per environment",
+        );
       const installed = yield* Effect.forEach(capabilities, (capability, index) =>
         Effect.gen(this, function* () {
           const archive = `/tmp/cf-capability-${index}.zip`;
           return yield* Effect.acquireUseRelease(
-            io("environment.capability.write", () =>
-              sandbox.writeFile(archive, capability.source.data, { encoding: "base64" }),
-            ),
+            Effect.gen(this, function* () {
+              const source = capability.source;
+              if (source.type === "base64")
+                return yield* io("environment.capability.write", () =>
+                  sandbox.writeFile(archive, source.data, { encoding: "base64" }),
+                );
+              const key = source.key;
+              const object = yield* io("environment.skill.get", () =>
+                this.env.CHECKPOINTS.get(key),
+              );
+              if (!object)
+                return yield* new ApiError(404, "not_found", "Pinned skill bundle not found");
+              return yield* io("environment.capability.stream", () =>
+                sandbox.writeFile(archive, object.body),
+              );
+            }),
             () =>
               this.command(sandbox, [
                 "python3",

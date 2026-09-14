@@ -105,9 +105,14 @@ export async function runProgrammatic(
       globalOutbound: null,
       limits: { cpuMs: 1000, subRequests: 100 },
     });
+    // WorkerLoader stubs have no dispose API in @cloudflare/workers-types 5.20260911.1:
+    // an isolate abandoned by timeout stays resident until the platform collects it. Its
+    // CPU budget is 1000 ms and it has no bindings, so only the settled promise must be
+    // observed here to keep the rejection from surfacing as unhandled.
     const pending = worker
       .getEntrypoint<ProgramWorker>()
       .run(bridge, options.tools, JSON.stringify(input.arguments ?? null));
+    pending.catch(() => {});
     const result = await Promise.race([
       pending,
       new Promise<never>((_resolve, reject) => {
