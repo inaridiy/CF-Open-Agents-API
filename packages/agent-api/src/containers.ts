@@ -1193,7 +1193,7 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
       steer: HARNESSES[harness].steer,
       functions: true,
       sandbox: true,
-      subagents: harness === "codex",
+      subagents: harness === "codex" || harness === "claude-code",
       images: true,
       reasoningSummaries: true,
       usage: true,
