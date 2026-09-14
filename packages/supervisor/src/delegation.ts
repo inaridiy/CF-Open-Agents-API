@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
+  ApiError,
   batchSchema,
   decode,
   type Execution,
@@ -43,6 +44,15 @@ export interface DelegationOptions {
   timeouts?: { requestMs?: number; cancelMs?: number; settleMs?: number };
 }
 const DEFAULT_TIMEOUTS = { requestMs: 30_000, cancelMs: 10_000, settleMs: 5_000 };
+/** A HarnessDO delegate route answered with an error status. */
+export class DelegateRouteError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(`Delegation request failed (${status}): ${body}`);
+  }
+}
 /** Resolve when `promise` settles or after `ms`; the timer never outlives the race. */
 async function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
   const timer = new AbortController();
@@ -155,8 +165,7 @@ export class Delegations {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.any([this.options.signal, AbortSignal.timeout(timeoutMs)]),
     });
-    if (!response.ok)
-      throw new Error(`Delegation request failed (${response.status}): ${await response.text()}`);
+    if (!response.ok) throw new DelegateRouteError(response.status, await response.text());
     return response;
   }
   private collaboration(
@@ -394,16 +403,32 @@ export class Delegations {
     }
     await within(child.settled, this.timeouts.requestMs);
   }
-  /** Route a client function result to the child that raised the call. */
+  /**
+   * Route a client function result to the child that raised the call. A 409 from
+   * the HarnessDO means the child already closed (the relay has not observed it
+   * yet): the result can never apply, so the Worker must drop it, not retry.
+   */
   async routeToolResult(
     child: Child,
     operationId: string,
     command: Extract<RuntimeCommand, { type: "tool_result" }>,
   ): Promise<void> {
-    await this.request(`${this.execution.turnId}/${child.subagentId}/control`, {
-      operationId,
-      command,
-    });
+    try {
+      await this.request(`${this.execution.turnId}/${child.subagentId}/control`, {
+        operationId,
+        command,
+      });
+    } catch (error) {
+      if (error instanceof DelegateRouteError && error.status === 409) {
+        child.pending.delete(command.callId);
+        throw new ApiError(
+          409,
+          "command_rejected",
+          `Delegated subagent ${child.subagentId} no longer accepts tool results`,
+        );
+      }
+      throw error;
+    }
     child.pending.delete(command.callId);
   }
   /** Parent completion waits for children, as native Codex children do. */

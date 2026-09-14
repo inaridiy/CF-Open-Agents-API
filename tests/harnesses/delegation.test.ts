@@ -15,8 +15,11 @@ import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/mod
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
 
-/** Scripted HarnessDO delegate route: one child that raises a client function call, then answers. */
-function scriptedChildren() {
+/**
+ * Scripted HarnessDO delegate route: one child that raises a client function call, then
+ * answers. `rejectToolResults` answers every tool result with the 409 a closed child gets.
+ */
+function scriptedChildren(options: { rejectToolResults?: boolean } = {}) {
   const children = new Map<
     string,
     { events: { seq: number; event: RuntimeEvent }[]; status: RuntimeBatch["status"] }
@@ -55,6 +58,11 @@ function scriptedChildren() {
       const body = (await request.json()) as { command: RuntimeCommand };
       controls.push({ subagentId: target ?? "", command: body.command });
       if (body.command.type === "tool_result") {
+        if (options.rejectToolResults)
+          return Response.json(
+            { error: "command_rejected", code: "command_rejected", message: "Subagent is closed" },
+            { status: 409 },
+          );
         child.events.push({
           seq: child.events.length + 1,
           event: {
@@ -361,3 +369,58 @@ it.each(harnesses)(
     }
   },
 );
+
+it("rejects a tool result for a delegated child the HarnessDO already closed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cf-delegation-stale-"));
+  const diagnostics: string[] = [];
+  const scripted = scriptedChildren({ rejectToolResults: true });
+  const delegate = await scripted.server;
+  const gateway = scriptedGateway("wait");
+  const model = await serveFetch((request) => gateway.fetch(request, {}));
+  let supervisor: ReturnType<typeof createSupervisor>;
+  const server = await serveFetch(async (request) => supervisor.app.fetch(request));
+  supervisor = createSupervisor({
+    binary: "codex",
+    opencodeBinary: resolve("node_modules/.bin/opencode"),
+    directory,
+    modelBaseUrl: `${model.url}/v1`,
+    sandboxUrl: "http://unused.invalid",
+    supervisorUrl: server.url,
+    delegateUrl: delegate.url,
+    diagnostics: (line) => diagnostics.push(line),
+  });
+  const execution = parentExecution("claude-code");
+  try {
+    const response = await post(server.url, "/jobs", { execution, operationId: "start" });
+    expect(response.ok, await response.text()).toBe(true);
+    let call: Extract<RuntimeEvent, { type: "function_call" }> | undefined;
+    for (let attempt = 0; attempt < 600 && !call; attempt++) {
+      const batch = (await (
+        await fetch(`${server.url}/jobs/${execution.turnId}`)
+      ).json()) as RuntimeBatch;
+      if (batch.status === "failed") throw new Error(`${batch.error}\n${diagnostics.join("\n")}`);
+      call = batch.events
+        .map(({ event }) => event)
+        .find(
+          (event): event is Extract<RuntimeEvent, { type: "function_call" }> =>
+            event.type === "function_call" && event.subagentId === "subagent_1",
+        );
+      if (!call) await delay(50);
+    }
+    expect(call, diagnostics.join("\n")).toBeDefined();
+    // The route answers 409: the Worker drops the stale result instead of retrying a 500.
+    const control = await post(server.url, `/jobs/${execution.turnId}/control`, {
+      operationId: "stale",
+      command: { type: "tool_result", callId: call?.callId, success: true, output: "LATE" },
+    });
+    expect(control.status).toBe(409);
+    expect(await control.text()).toContain("command_rejected");
+    expect(scripted.controls.map((entry) => entry.command.type)).toEqual(["tool_result"]);
+  } finally {
+    await supervisor.stop();
+    await server.close();
+    await model.close();
+    await delegate.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

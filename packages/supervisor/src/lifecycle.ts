@@ -75,6 +75,10 @@ export class JobLifecycle {
   get closing() {
     return runSync(Ref.get(this.state)).closing;
   }
+  /** Cancellation was requested; the log still accepts the runtime's final events. */
+  get cancelling() {
+    return runSync(Ref.get(this.state)).cancelling;
+  }
   setStatus(status: "running" | "waiting" | "completed" | "cancelled"): void {
     runSync(
       Ref.update(this.state, (state) => {
