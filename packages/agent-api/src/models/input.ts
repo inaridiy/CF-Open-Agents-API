@@ -20,7 +20,18 @@ export interface ModelInput {
   maxOutputTokens?: number;
   temperature?: number;
   topP?: number;
+  /** Reasoning effort requested by the harness, in the OpenAI Agents API vocabulary. */
+  reasoningEffort?: ReasoningEffort;
+  /** Structured output requested by the harness; a missing schema means "any JSON object". */
+  outputSchema?: OutputSchema;
 }
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export interface OutputSchema {
+  schema?: Record<string, unknown>;
+  name?: string;
+  description?: string;
+}
+const effortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 const object = z.record(z.string(), z.unknown());
 const list = z.array(object);
@@ -90,6 +101,69 @@ function toolOutput(content: unknown, failed: boolean): ToolResultPart["output"]
   };
 }
 
+const optionalString = (value: unknown) =>
+  z.string().optional().nullable().parse(value) ?? undefined;
+/**
+ * Responses carries `reasoning.effort`, Chat Completions `reasoning_effort`, and the
+ * Messages API either `output_config.effort` or a `thinking` budget. A budget is
+ * folded into the nearest named level; `adaptive` leaves the provider default.
+ */
+function decodeReasoningEffort(
+  protocol: ModelInput["protocol"],
+  body: Record<string, unknown>,
+): ReasoningEffort | undefined {
+  const effort = effortSchema.optional().nullable();
+  if (protocol === "responses")
+    return body.reasoning
+      ? (effort.parse(object.parse(body.reasoning).effort) ?? undefined)
+      : undefined;
+  if (protocol === "chat-completions") return effort.parse(body.reasoning_effort) ?? undefined;
+  const configured = body.output_config
+    ? effort.parse(object.parse(body.output_config).effort)
+    : undefined;
+  if (configured) return configured;
+  if (!body.thinking) return undefined;
+  const thinking = object.parse(body.thinking);
+  if (thinking.type === "disabled") return "none";
+  if (thinking.type === "enabled") {
+    const budget = z.number().nonnegative().parse(thinking.budget_tokens);
+    return budget >= 32_000 ? "high" : budget >= 8_000 ? "medium" : "low";
+  }
+  return undefined;
+}
+/**
+ * Responses `text.format`, Chat `response_format` and Messages `output_config.format`
+ * all describe the same request: a JSON object, optionally constrained by a schema.
+ */
+function decodeOutputSchema(
+  protocol: ModelInput["protocol"],
+  body: Record<string, unknown>,
+): OutputSchema | undefined {
+  const raw =
+    protocol === "responses"
+      ? ((body.text ? object.parse(body.text).format : undefined) ??
+        (body.output_config ? object.parse(body.output_config).format : undefined))
+      : protocol === "chat-completions"
+        ? body.response_format
+        : ((body.output_config ? object.parse(body.output_config).format : undefined) ??
+          body.output_format);
+  if (raw === undefined || raw === null) return undefined;
+  const format = object.parse(raw);
+  if (format.type === "text") return undefined;
+  if (format.type === "json_object") return {};
+  if (format.type !== "json_schema") throw unsupported();
+  // Chat Completions nests the schema under `json_schema`; the others keep it flat.
+  const definition = format.json_schema ? object.parse(format.json_schema) : format;
+  const schema = definition.schema === undefined ? undefined : object.parse(definition.schema);
+  const name = optionalString(definition.name);
+  const description = optionalString(definition.description);
+  return {
+    ...(schema ? { schema } : {}),
+    ...(name ? { name } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
 export async function decodeModelRequest(request: Request): Promise<ModelInput> {
   const path = new URL(request.url).pathname;
   const protocol =
@@ -102,14 +176,9 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
           : null;
   if (!protocol) throw unsupported();
   const body = object.parse(await request.json());
-  if (
-    body.previous_response_id ||
-    body.background ||
-    body.store === true ||
-    (body.output_config && object.parse(body.output_config).format) ||
-    body.response_format
-  )
-    throw unsupported();
+  if (body.previous_response_id || body.background || body.store === true) throw unsupported();
+  const reasoningEffort = decodeReasoningEffort(protocol, body);
+  const outputSchema = decodeOutputSchema(protocol, body);
   const output: ModelInput = {
     protocol,
     model: string(body.model),
@@ -124,6 +193,8 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
       .parse(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens),
     temperature: z.number().optional().parse(body.temperature),
     topP: z.number().optional().parse(body.top_p),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(outputSchema ? { outputSchema } : {}),
   };
   const historyTools =
     protocol === "responses" && Array.isArray(body.input)

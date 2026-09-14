@@ -327,3 +327,244 @@ it("cancelling a gateway stream aborts the in-flight AI SDK model call", async (
   await reader.cancel();
   expect(signal?.aborted).toBe(true);
 });
+
+const answerSchema = {
+  type: "object" as const,
+  properties: { answer: { type: "number" } },
+  required: ["answer"],
+  additionalProperties: false,
+};
+const png =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+it.each(["responses", "anthropic", "chat-completions"] as const)(
+  "%s forwards reasoning effort and structured output to the AI SDK model",
+  async (protocol) => {
+    const calls: { reasoning: unknown; responseFormat: unknown }[] = [];
+    const gateway = createModelGateway(() => ({
+      primary: aiSDKModel(
+        new MockLanguageModelV4({
+          doStream: async (options) => {
+            calls.push({ reasoning: options.reasoning, responseFormat: options.responseFormat });
+            return {
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "stream-start", warnings: [] },
+                  { type: "text-start", id: "msg_answer" },
+                  { type: "text-delta", id: "msg_answer", delta: '{"answer":42}' },
+                  { type: "text-end", id: "msg_answer" },
+                  { type: "finish", finishReason: { unified: "stop", raw: undefined }, usage },
+                ],
+              }),
+            };
+          },
+        }),
+      ),
+    }));
+    const server = await serveFetch((request) => gateway.fetch(request, {}));
+    const client = new OpenAI({ apiKey: "fixture", baseURL: `${server.url}/v1`, maxRetries: 0 });
+    try {
+      let text: string | undefined;
+      if (protocol === "responses") {
+        const response = await client.responses.create({
+          model: "primary",
+          input: "Answer with JSON",
+          reasoning: { effort: "high" },
+          text: {
+            format: { type: "json_schema", name: "answer", schema: answerSchema, strict: true },
+          },
+          store: false,
+        });
+        const message = response.output.find((item) => item.type === "message");
+        const part = message?.content[0];
+        text = part?.type === "output_text" ? part.text : undefined;
+      } else if (protocol === "anthropic") {
+        const anthropic = new Anthropic({ apiKey: "fixture", baseURL: server.url, maxRetries: 0 });
+        const response = await anthropic.messages.create({
+          model: "primary",
+          max_tokens: 100,
+          messages: [{ role: "user", content: "Answer with JSON" }],
+          thinking: { type: "enabled", budget_tokens: 40_000 },
+          output_config: { format: { type: "json_schema", schema: answerSchema } },
+        });
+        const part = response.content[0];
+        text = part?.type === "text" ? part.text : undefined;
+        // An explicit output_config.effort takes precedence over a thinking budget.
+        await anthropic.messages.create({
+          model: "primary",
+          max_tokens: 100,
+          messages: [{ role: "user", content: "Again" }],
+          thinking: { type: "enabled", budget_tokens: 40_000 },
+          output_config: { effort: "low" },
+        });
+        expect(calls[1]?.reasoning).toBe("low");
+        expect(calls[1]?.responseFormat).toBeUndefined();
+      } else {
+        const response = await client.chat.completions.create({
+          model: "primary",
+          messages: [{ role: "user", content: "Answer with JSON" }],
+          reasoning_effort: "high",
+          response_format: {
+            type: "json_schema",
+            json_schema: { name: "answer", schema: answerSchema },
+          },
+        });
+        text = response.choices[0]?.message.content ?? undefined;
+      }
+      expect(text).toBe('{"answer":42}');
+      expect(calls[0]?.reasoning).toBe("high");
+      expect(calls[0]?.responseFormat).toMatchObject({ type: "json", schema: answerSchema });
+    } finally {
+      await server.close();
+    }
+  },
+);
+
+it("OpenAI-compatible preset sends reasoning_effort and a json_schema response format", async () => {
+  const preset = openAICompatibleModel({
+    baseURL: "https://provider.test/v1",
+    apiKey: "provider-secret",
+    model: "provider-model",
+    fetch: async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.reasoning_effort).toBe("medium");
+      expect(body.response_format).toMatchObject({
+        type: "json_schema",
+        json_schema: { name: "answer", schema: answerSchema },
+      });
+      return new Response(
+        'data: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{"content":"{\\"answer\\":42}"},"finish_reason":null}]}\n\ndata: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  const response = await preset.fetch(
+    new Request("https://gateway.test/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "primary",
+        messages: [{ role: "user", content: "Answer with JSON" }],
+        reasoning_effort: "medium",
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "answer", schema: answerSchema },
+        },
+      }),
+    }),
+  );
+  const body = (await response.json()) as { choices: { message: { content: string } }[] };
+  expect(body.choices[0]?.message.content).toBe('{"answer":42}');
+});
+
+it.each(["responses", "anthropic"] as const)(
+  "%s image input reaches the AI SDK model as a file part",
+  async (protocol) => {
+    const prompts: string[] = [];
+    const gateway = createModelGateway(() => ({
+      primary: aiSDKModel(
+        new MockLanguageModelV4({
+          doStream: async ({ prompt }) => {
+            prompts.push(JSON.stringify(prompt));
+            return {
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "stream-start", warnings: [] },
+                  { type: "text-start", id: "msg_answer" },
+                  { type: "text-delta", id: "msg_answer", delta: "A pixel." },
+                  { type: "text-end", id: "msg_answer" },
+                  { type: "finish", finishReason: { unified: "stop", raw: undefined }, usage },
+                ],
+              }),
+            };
+          },
+        }),
+      ),
+    }));
+    const body =
+      protocol === "responses"
+        ? {
+            model: "primary",
+            input: [
+              {
+                role: "user",
+                content: [
+                  { type: "input_text", text: "Describe" },
+                  {
+                    type: "input_image",
+                    image_url: `data:image/png;base64,${png}`,
+                    detail: "auto",
+                  },
+                ],
+              },
+            ],
+          }
+        : {
+            model: "primary",
+            max_tokens: 100,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: "Describe" },
+                  { type: "image", source: { type: "base64", media_type: "image/png", data: png } },
+                ],
+              },
+            ],
+          };
+    const response = await gateway.fetch(
+      new Request(
+        `https://gateway.test/v1/${protocol === "responses" ? "responses" : "messages"}`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        },
+      ),
+      {},
+    );
+    expect(response.status).toBe(200);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('"type":"file"');
+    expect(prompts[0]).toContain(png);
+  },
+);
+
+it("native Anthropic passthrough streams server tool blocks unchanged", async () => {
+  const upstream =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"provider-model","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n' +
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}\n\n' +
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":\\"fixture\\"}"}}\n\n' +
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+    'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.test","title":"Fixture","encrypted_content":"opaque","page_age":null}]}}\n\n' +
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n' +
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n' +
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const preset = nativeModel({
+    protocol: "anthropic",
+    baseURL: "https://provider.test/v1",
+    apiKey: "provider-secret",
+    model: "provider-model",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.headers.get("anthropic-beta")).toBe("web-search-fixture");
+      const body = await request.json<{ tools?: { type?: string }[] }>();
+      expect(body.tools?.[0]?.type).toBe("web_search_20250305");
+      return new Response(upstream, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const gateway = createModelGateway(() => ({ primary: preset }));
+  const response = await gateway.fetch(
+    new Request("https://gateway.test/v1/messages", {
+      method: "POST",
+      headers: { "anthropic-beta": "web-search-fixture" },
+      body: JSON.stringify({
+        model: "primary",
+        stream: true,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{ role: "user", content: "Search" }],
+      }),
+    }),
+    {},
+  );
+  expect(response.headers.get("content-type")).toContain("text/event-stream");
+  expect(await response.text()).toBe(upstream);
+});

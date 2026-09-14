@@ -1,10 +1,22 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { jsonSchema, type LanguageModel, type LanguageModelUsage, streamText, tool } from "ai";
+import {
+  jsonSchema,
+  type LanguageModel,
+  type LanguageModelUsage,
+  Output,
+  streamText,
+  tool,
+} from "ai";
 import { Context, Effect, Layer } from "effect";
 import { attempt, io, runPromise, type ServiceError } from "./effect.js";
 import { requestWithoutRedirect } from "./http.js";
 import { readModelBodyEffect } from "./models/body.js";
-import { decodeModelRequest } from "./models/input.js";
+import {
+  decodeModelRequest,
+  type ModelInput,
+  type OutputSchema,
+  type ReasoningEffort,
+} from "./models/input.js";
 import { encodeModelResponse, type ModelChunk } from "./models/output.js";
 import { ApiError } from "./protocol.js";
 
@@ -21,11 +33,37 @@ export const modelAdapter = (effect: EffectModelAdapter["effect"]): EffectModelA
   fetch: (request) => runPromise(effect(request)),
 });
 
+type ProviderOptions = NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>;
+/** Settings decoded from the harness request that a deployment may map to provider options. */
+export interface ModelSettings {
+  reasoningEffort?: ReasoningEffort;
+  outputSchema?: OutputSchema;
+}
 export interface AIModelOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
-  providerOptions?: Parameters<typeof streamText>[0]["providerOptions"];
+  /** Static provider options, or a mapping from the decoded request settings. */
+  providerOptions?: ProviderOptions | ((settings: ModelSettings) => ProviderOptions | undefined);
 }
+/** The AI SDK's provider-neutral reasoning levels stop at `xhigh`; `max` rounds down. */
+const standardReasoning = (
+  effort: ReasoningEffort | undefined,
+): Parameters<typeof streamText>[0]["reasoning"] =>
+  effort === undefined ? undefined : effort === "max" ? "xhigh" : effort;
+const structuredOutput = (schema: OutputSchema | undefined) =>
+  schema === undefined
+    ? undefined
+    : schema.schema
+      ? Output.object({
+          schema: jsonSchema(schema.schema),
+          ...(schema.name ? { name: schema.name } : {}),
+          ...(schema.description ? { description: schema.description } : {}),
+        })
+      : Output.json({ ...(schema.name ? { name: schema.name } : {}) });
+const settingsOf = (input: ModelInput): ModelSettings => ({
+  ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+  ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
+});
 
 /** Accepts an already instantiated AI SDK model, including Workers AI providers. */
 export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): EffectModelAdapter {
@@ -54,7 +92,14 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
         temperature: input.temperature,
         topP: input.topP,
         maxOutputTokens: Math.min(input.maxOutputTokens ?? 8192, options.maxOutputTokens ?? 8192),
-        providerOptions: options.providerOptions,
+        reasoning: standardReasoning(input.reasoningEffort),
+        // With a structured output the model's text is the JSON document; the
+        // harness validates it, so the stream is forwarded without a second parse.
+        output: structuredOutput(input.outputSchema),
+        providerOptions:
+          typeof options.providerOptions === "function"
+            ? options.providerOptions(settingsOf(input))
+            : options.providerOptions,
         maxRetries: 0,
         onError: () => {}, // Return a sanitized protocol error; never log provider request bodies.
         abortSignal: AbortSignal.any([
@@ -103,6 +148,8 @@ export interface OpenAICompatibleOptions extends AIModelOptions {
   model: string;
   headers?: Record<string, string>;
   fetch?: typeof globalThis.fetch;
+  /** Send `response_format: json_schema` for structured output (default); `false` falls back to `json_object`. */
+  supportsStructuredOutputs?: boolean;
 }
 
 /** A fetch that never follows redirects, so configured credentials stay with the configured host. */
@@ -132,6 +179,7 @@ export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectM
     apiKey: options.apiKey,
     headers: options.headers,
     fetch: fetchWithoutRedirect(options.fetch),
+    supportsStructuredOutputs: options.supportsStructuredOutputs ?? true,
   });
   return aiSDKModel(provider(options.model), options);
 }
