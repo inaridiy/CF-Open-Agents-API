@@ -18,6 +18,8 @@ import { serveFetch } from "./http.js";
 it.each<HarnessName>(["codex", "claude-code", "opencode"])(
   "%s uses an AI SDK model, external tools, and native checkpoints",
   async (harness) => {
+    // This name remains an ordinary client function when code mode is disabled.
+    const functionName = harness === "codex" ? "cf_execute" : "lookup";
     const root = await mkdtemp(join(tmpdir(), "cf-native-"));
     const directory = join(root, "harness");
     await mkdir(directory);
@@ -34,7 +36,7 @@ it.each<HarnessName>(["codex", "claude-code", "opencode"])(
         const definition = tools?.find(
           (tool) =>
             tool.type === "function" &&
-            (tool.name === "lookup" || tool.name.endsWith("function_0")),
+            (tool.name === functionName || tool.name.endsWith("function_0")),
         );
         if (!definition)
           throw new Error(`Native external tool is missing: ${JSON.stringify(tools)}`);
@@ -116,7 +118,7 @@ it.each<HarnessName>(["codex", "claude-code", "opencode"])(
         tools: [
           {
             type: "function",
-            name: "lookup",
+            name: functionName,
             description: "Look up a value",
             parameters: {
               type: "object",
@@ -147,7 +149,7 @@ it.each<HarnessName>(["codex", "claude-code", "opencode"])(
         if (batch.status === "waiting") {
           const call = batch.events.find((entry) => entry.event.type === "function_call")?.event;
           if (call?.type !== "function_call") throw new Error("Missing pending tool");
-          expect(call.name).toBe("lookup");
+          expect(call.name).toBe(functionName);
           await post(`/jobs/${turnId}/control`, {
             operationId: `${turnId}:result`,
             command: {

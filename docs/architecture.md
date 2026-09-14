@@ -12,7 +12,7 @@ their agent loops; the AI SDK adapts a single model inference at a time.
 | AgentWorker | Authentication, wire validation, tenant routing and HTTP/RPC responses |
 | TenantCatalogDO | Tenant-scoped agents, session discovery and idempotent creation reservations |
 | SessionDO | Input log, turns, required actions, output items, execution identity and events |
-| HarnessDO | Container assignment, model egress, execution transport and checkpoint coordination |
+| HarnessDO | Container assignment, model egress, execution transport, delegated children and checkpoint coordination |
 | Harness Container | Node supervisor and the selected native runtime |
 | SandboxDO / Sandbox Container | Separate workspace, shell and file execution environment |
 | Private model gateway | Deployment-owned model registry, provider credentials and protocol translation |
@@ -64,6 +64,13 @@ initializes SessionDO and commits discovery. Retries recover the original reserv
 before resolving mutable saved agents or model configuration. Deletion can be retried
 between its SessionDO and catalog operations without resurrecting discovery.
 
+A fork follows the same reservation flow from a committed source. On the same
+harness revision it copies the checkpoint references; otherwise it adopts the
+source environment's committed workspace and capability roots into a new
+HarnessDO, applies the network policy to the new sandbox before anything starts
+it, and stores a bounded transcript that the first turn prepends to its input.
+Immutable checkpoint objects are shared, never copied or deleted by the fork.
+
 ## Models, tools and isolation
 
 The private gateway maps assigned model names to AI SDK instances or native protocol
@@ -91,5 +98,16 @@ internal state and may repeat client fields, so SQL writes enforce a conservativ
 UTF-8 row budget before execution. Oversized input returns a structured 413 and its
 transaction rolls back. Detailed limits are in [compatibility](compatibility.md#durability-and-limits).
 
-Subagents, cross-harness forks, hosted artifact APIs and managed knowledge indexing
-are outside the current alpha. Extension points do not imply support for those APIs.
+Subagents have separate items and turns; their completion is committed with the
+root checkpoint. Codex spawns native children inside its own process. Delegated
+children run in a child HarnessDO and Container named after the parent's
+subagent ID, share the parent's sandbox without resetting it, and are never
+checkpointed. The parent supervisor relays child runtime events into its own
+ordered stream under the child's subagent and turn identifiers, routes client
+function results back to the child, and finishes only after its children stop.
+The parent HarnessDO records each child's terminal batch durably before stopping
+the child Container, and stops every child before releasing the shared sandbox.
+Images and rich function results pass through the native runtime. Reasoning
+summaries, command deltas and token usage become durable API events/state.
+Artifacts publish immutable workspace outputs after checkpointing. Managed
+knowledge indexing remains outside this profile.

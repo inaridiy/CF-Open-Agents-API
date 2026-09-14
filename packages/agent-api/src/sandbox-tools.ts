@@ -4,6 +4,7 @@ import { workspacePath, workspaceRequestSchema, workspaceTools } from "./workspa
 export async function executeWorkspaceTool(
   sandbox: ISandbox,
   request: unknown,
+  options?: { onOutput(text: string): void; signal: AbortSignal },
 ): Promise<{ text: string; exitCode: number | null }> {
   const input = workspaceRequestSchema.parse(request);
   if (input.tool === "bash") {
@@ -12,6 +13,40 @@ export async function executeWorkspaceTool(
       cwd: args.workdir,
       timeout: args.timeout,
     });
+    if (options) {
+      let exited = false;
+      let text = "";
+      const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
+      let bytes = 0;
+      const signal = AbortSignal.any([options.signal, AbortSignal.timeout(args.timeout + 1000)]);
+      try {
+        const logs = await process.logs({ follow: true, replay: true, signal });
+        const reader = logs.getReader();
+        try {
+          for (;;) {
+            const event = await reader.read();
+            if (event.done) throw new Error("Command log ended before terminal outcome");
+            const value = event.value;
+            if (value.type === "stdout" || value.type === "stderr") {
+              bytes += value.data.byteLength;
+              if (bytes > 1_000_000) throw new Error("Sandbox command output exceeds 1 MB");
+              const delta = decoders[value.type].decode(value.data, { stream: true });
+              text += delta;
+              if (delta) options.onOutput(delta);
+            } else if (value.type === "terminal" && value.state === "exited") {
+              exited = true;
+              const tail = decoders.stdout.decode() + decoders.stderr.decode();
+              if (tail) options.onOutput(tail);
+              return { text: text + tail, exitCode: value.exit.code };
+            } else throw new Error("Sandbox command log failed or was truncated");
+          }
+        } finally {
+          await reader.cancel();
+        }
+      } finally {
+        if (!exited) await process.kill(9);
+      }
+    }
     const result = await process.output({
       encoding: "utf8",
       maxBytes: 1_000_000,

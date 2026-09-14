@@ -4,6 +4,7 @@
   "main": "worker.ts",
   "compatibility_date": "2026-09-12",
   "compatibility_flags": ["nodejs_compat"],
+  "worker_loaders": [{ "binding": "CODE_LOADER" }],
   "observability": {
     "enabled": true,
     "traces": {
@@ -63,6 +64,11 @@
     }
   ],
   "services": [
+    {
+      "binding": "MCP",
+      "service": "cf-open-agents-api-container-test",
+      "entrypoint": "McpFixture"
+    },
     {
       "binding": "MODEL_GATEWAY",
       "service": "cf-open-agents-api-container-test",

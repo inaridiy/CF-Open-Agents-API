@@ -213,15 +213,17 @@ it("native passthrough preserves opaque content, enforces protocol, and replaces
     baseURL: "https://provider.test/v1",
     apiKey: "provider-secret",
     model: "provider-model",
-    fetch: async (url, init) => {
+    fetch: async (input, init) => {
       calls++;
-      expect(String(url)).toBe("https://provider.test/v1/messages");
-      const headers = new Headers(init?.headers);
+      const request = new Request(input, init);
+      expect(request.url).toBe("https://provider.test/v1/messages");
+      expect(request.redirect).toBe("manual");
+      const headers = request.headers;
       expect(headers.get("x-api-key")).toBe("provider-secret");
       expect(headers.get("authorization")).toBeNull();
       expect(headers.get("cookie")).toBeNull();
       expect(headers.get("anthropic-beta")).toBe("fixture-beta");
-      expect(JSON.parse(String(init?.body))).toEqual({
+      expect(await request.json()).toEqual({
         model: "provider-model",
         opaque_extension: { signed: "payload" },
       });

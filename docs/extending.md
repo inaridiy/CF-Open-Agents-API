@@ -15,8 +15,8 @@ import { aiSDKModel, createModelGateway } from "cf-open-agents-api/models";
 
 const service = createAgentService<Bindings>({
   agents: {
-    coding: { harness: "codex", model: "primary" },
-    claude: { harness: "claude-code", model: "primary" },
+    coding: { harness: "codex", model: "primary", delegates: ["claude"] },
+    claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
     opencode: { harness: "opencode", model: "primary" },
   },
   harnesses: containerHarnesses,
@@ -32,7 +32,17 @@ const gateway = createModelGateway<Bindings>((env) => {
 The AI SDK call performs one inference. It has no tool implementations and starts
 no second agent loop. Codex app-server, Claude Agent SDK, or OpenCode owns tool
 selection, continuation, and native conversation history. Switching `harness` changes
-new sessions; it does not convert an existing native checkpoint.
+new sessions; it does not convert an existing native checkpoint. Use the
+[fork extension](environments-and-tools.md#fork-a-session) to continue an existing
+session on another preset.
+
+`delegates` names the presets a session on that alias may start subagents on
+when the client enables `multi_agent`. Children run on the delegate's harness and
+model inside the parent's sandbox, so list only presets whose model connection
+you are willing to spend on that parent's behalf. Every listed alias must exist
+and its harness must be registered; session creation checks this and reports
+`delegate_unavailable` otherwise. Presets without `delegates` keep native Codex
+subagents only.
 
 Workers AI uses the same model adapter:
 
@@ -114,8 +124,20 @@ already bundled in the pinned native CLI; caches are excluded from checkpoints.
 Both adapters route external function tools to the session's required-action
 boundary. The client submits their results through the Agents API. Builtin web
 search is disabled; expose deployment-owned search as an ordinary function tool.
-Codex supports active steering; Claude Code and OpenCode reject it. All support
-cancellation, external tools, and native checkpoint/restore.
+Codex enables provider web search when configured in `agent.tools`. All three
+harnesses project reasoning summaries, usage and command deltas, accept image
+input and image function results, connect configured MCP servers, discover
+deferred functions through `cf_tool_search`, read environment skills and plugins,
+and run `cf_execute` code and delegated subagents. Native search requires a
+supporting Responses passthrough connection. Codex supports active steering; Claude
+Code and OpenCode reject it. All support cancellation, external tools, and native
+checkpoint/restore.
+
+Claude Code and OpenCode reach configured MCP servers through the supervisor's
+tool bridge: service-origin HTTP servers are proxied by the Worker with Vault
+credentials, and environment-origin servers run inside the Sandbox behind a
+private bridge process. Their tool names are prefixed by the bridge
+(`mcp__workspace__` for Claude Code, `workspace_` for OpenCode).
 
 ## Additional harnesses
 
@@ -128,6 +150,14 @@ Drivers must deduplicate operation IDs, fence
 old attempts, preserve native history, and contain old executors before replacing
 them. A missing acknowledged job is a failure, not permission to start again.
 A DeepSeek model can use the model gateway; a DeepSeek harness needs its own driver.
+
+Declare only the [capability flags](compatibility.md#capability-flags) the driver
+implements; session creation rejects configurations the flags do not cover. An
+execution carries `delegates` and `maxConcurrentSubagents` when the session may
+delegate, and `parent` when the driver is asked to run a delegated child. A driver
+that ignores those fields simply never spawns children. A custom
+`EnvironmentDriver` must honor `EnvironmentSpec.inherited` in `prepare` or reject
+it, so a fork never silently loses the source workspace.
 
 See [Effect architecture](effect.md) for ownership, errors and migration details.
 

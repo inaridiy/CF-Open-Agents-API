@@ -1,150 +1,141 @@
 # CF-Open-Agents-API
 
-An OSS Agents API built on Cloudflare Workers, SQLite Durable Objects, R2, and Containers.
-Use `cf-open-agents-api` over HTTP with the OpenAI SDK or a typed Worker Service Binding.
+**An open-source implementation of the OpenAI Agents API—with your choice of runtime and model.**
+Keep the OpenAI client. Run Codex, Claude Code, or OpenCode against models you configure.
+Host the API, session state, and execution environments in your own Cloudflare account.
 
-**Alpha.** Targets the `agents=v1` contract in `openai@7.15.0`. See the
-[compatibility profile](docs/compatibility.md) for supported fields and limitations.
-This is an independent implementation; it is not an OpenAI or Cloudflare product.
+**Alpha.** Targets `agents=v1` in `openai@7.15.0`; Codex compatibility is the first priority.
+Check the [compatibility profile](docs/compatibility.md) before integrating.
+This is an independent implementation, unaffiliated with OpenAI or Cloudflare.
 
-**Preview dependency:** `@cloudflare/sandbox@0.13.0-next.751.1` requires its matching Docker image.
-Preview upgrades can break APIs or restore behavior; validate all harnesses and backups.
-See [deployment](docs/deployment.md) and [security](SECURITY.md).
+## Use it from your Worker
 
-## How it works
-
-```mermaid
-flowchart LR
-  Client --> API[Agent Worker]
-  Caller[Caller Worker] -->|Service Binding| API
-  API --> Catalog[TenantCatalogDO]
-  API --> Session[SessionDO / SQLite + Kysely]
-  Session --> Harness[HarnessDO / Native harness Container]
-  Harness -->|exec-server or remote tools| Sandbox[SandboxDO / Sandbox Container]
-  Harness --> Gateway[Private Model Gateway / AI SDK or native API]
-  Gateway --> Model[OpenAI / Workers AI / other providers]
-  Harness --> R2[Checkpoints / R2]
-  Sandbox --> R2
-```
-
-SessionDO owns the durable input log, turns, events, required actions, and execution
-state. A Container is replaceable compute. Native harness state and workspace
-checkpoints are committed together before a completed turn becomes visible.
-Unknown execution outcomes fail explicitly instead of silently replaying side effects.
-Effect provides typed runtime contracts, dependency layers, immutable execution
-states and scoped concurrency. See the [Effect architecture and migration guide](docs/effect.md).
-
-## Develop
-
-Requires Node **24+** and **pnpm 11.1.2**. Docker is required for the Container example.
-The native harness tests require **Codex 0.154.0** on `PATH`; the pinned Claude Code
-and OpenCode runtimes are installed by pnpm.
-
-```sh
-pnpm install --frozen-lockfile
-pnpm check
-pnpm test:codex
-pnpm test:harnesses
-```
-
-`pnpm test` runs the production API/session implementation inside workerd with real
-SQLite and a scripted execution fixture. `pnpm test:codex` runs real Codex binaries
-against a local scripted Responses server. `pnpm test:harnesses` connects all three native harnesses to the same AI SDK model,
-including external tools and native history restoration. These tests use scripted inference.
-`pnpm test:containers` additionally builds and runs the actual Worker and both
-Containers, destroys the compute, and verifies R2 restore using a scripted model.
-
-## Run the Worker example
-
-```sh
-pnpm build
-cp examples/worker/.dev.vars.example examples/worker/.dev.vars
-# Set API_TOKEN and OPENAI_API_KEY in that file.
-pnpm dev
-```
-
-The example registers `coding`, `claude`, and `opencode` against one AI SDK model;
-`workers` uses Workers AI. See [the composition root](examples/worker/src/index.ts).
-Local sandbox backups use Wrangler's emulated R2 binding.
-All three harnesses support `none` or an assigned Sandbox. Workers AI calls use your
-Cloudflare account, including during local development. The portable model gateway
-carries text and function calls; see [model limitations](docs/extending.md#model-protocols)
-for reasoning, provider extensions, and Claude Code support boundaries.
-See [deployment](docs/deployment.md) for production R2 credentials and sizing.
+Bind an `AGENTS` service to your Agent Worker, then give its `fetch` to the official OpenAI client:
 
 ```ts
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: "http://localhost:8787/v1",
-  apiKey: process.env.AGENT_API_TOKEN,
+  baseURL: "https://agents.internal/v1",
+  apiKey: env.API_TOKEN,
+  fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
 });
 const session = await client.beta.agents.sessions.create({
   agent: { model: "coding" },
   environment: { type: "openai_hosted" },
-  input: "Create a small TypeScript project in /workspace.",
-});
-console.log(session.id);
+}, { headers: { "Idempotency-Key": "report-session-1" } });
+for await (const event of client.beta.agents.sessions.stream(session.id, {
+  input: "Create /workspace/outputs/report.txt explaining this project, then summarize it.",
+  idempotencyKey: "report-turn-1",
+})) {
+  if (event.type === "agent.session.turn.output_text.delta") console.log(event.delta);
+  if (event.type === "agent.session.turn.failed" && !event.turn.subagent_id) throw new Error("Agent turn failed");
+}
 ```
 
-`openai_hosted` is the compatibility protocol's spelling for managed compute;
-**this deployment provisions Cloudflare Containers**. `none` disables the execution
-environment. Unsupported environment provisioning fields are rejected.
+The hostname is a routing label: requests travel through the Service Binding.
+`API_TOKEN` authenticates your API; model credentials stay in its private gateway.
+The protocol spelling `openai_hosted` selects **Cloudflare compute** in this implementation.
+`coding` is a deployment-owned preset; change its runtime/model mapping to fit your application.
 
-Poll until `idle`, `requires_action`, or `failed`, then inspect items and turns.
-For one streamed turn, use `client.beta.agents.sessions.stream(session.id, { input: "Hello" })`
-on an idle session. It subscribes before submitting input and can run tool handlers.
-Disconnecting does not cancel execution.
+| Connection | Start here |
+| --- | --- |
+| **Another Worker → Service Binding → OpenAI client** | [Recommended guide](docs/service-binding.md) |
+| Another Worker → direct typed RPC | [RPC guide](docs/rpc.md) |
+| Node, Python, or another service → hosted HTTP API | [HTTP guide](docs/http-api.md) |
+| Embed/configure the library | [Library API](docs/library-api.md) |
 
-## Service Binding
+## Try the complete Worker example
 
-Bind the caller's `AGENTS` service to the deployed Worker. The caller authenticates
-its users and supplies tenant IDs; Service Bindings are a trusted boundary.
+Requires [Node 24+](https://nodejs.org/en/download), [pnpm 11.1.2](https://pnpm.io/installation),
+and a running [Docker engine](https://docs.docker.com/engine/install/) with room for both images.
+The Sandbox SDK and image are pinned together to `0.13.0-next.751.1`.
 
-```ts
-const session = await env.AGENTS.createSession("tenant-123", {
-  agent: { model: "coding" },
-  environment: { type: "none" },
-}, "creation-key");
-await env.AGENTS.submitEvents("tenant-123", session.id, [{
-  type: "agent.session.input.message",
-  input: [{ role: "user", content: [{ type: "input_text", text: "Hello" }] }],
-}], "message-key");
+```sh
+git clone https://github.com/inaridiy/CF-Open-Agents-API.git
+cd CF-Open-Agents-API
+pnpm install --frozen-lockfile
+pnpm build
+cp examples/worker/.dev.vars.example examples/worker/.dev.vars
+cp examples/caller/.dev.vars.example examples/caller/.dev.vars
+# Put the same unpredictable API_TOKEN (at least 32 characters) in both files.
+# Put OPENAI_API_KEY only in examples/worker/.dev.vars.
+pnpm dev:caller
 ```
 
-## Extend
+Repository access is required while this repository remains private.
+The caller runs at `http://localhost:8788`; Wrangler also starts its Agent Worker binding.
+This example calls real model providers. Workers AI also uses your Cloudflare account during local development.
 
-- [Harnesses and models](docs/extending.md): Codex, Claude Code, OpenCode, AI SDK models, Workers AI,
-  and the driver contract for additional harnesses.
-- [Tools and assets](docs/extending.md#tools-and-assets): typed tools, web/corpus search,
-  and immutable skill bundles.
-- [Architecture](docs/architecture.md): current service boundaries, persistence and recovery.
-- [Contributing](CONTRIBUTING.md): code layout, validation, and compatibility changes.
-- [Development agent guidance](docs/development-harness.md): selected Skills, task briefs,
-  instruction ownership and checks.
+1. Set `AGENT_API_TOKEN` in your shell to the example's `API_TOKEN`.
+2. Create a task and keep the returned session `id`:
 
-## Commands
+   ```sh
+   curl http://localhost:8788/sdk/sessions \
+     -H "Authorization: Bearer $AGENT_API_TOKEN" \
+     -H 'Content-Type: application/json' -H 'Idempotency-Key: first-report' \
+     -d '{"agent":{"model":"coding"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/report.txt with a short greeting, then read it and report the result."}'
+   ```
+
+3. `GET /sdk/sessions/<id>` with the same authorization header until `session.status` is `idle`, `requires_action`, or `failed`.
+   The response includes items and turns: a successful run has an assistant answer and a completed turn.
+   A function call pauses at `requires_action`; [submit its result](docs/service-binding.md#function-tools) to continue.
+4. `DELETE /sdk/sessions/<id>` after the turn stops to remove the session.
+
+The [caller source](examples/caller/src/index.ts) implements that journey through both `/sdk` and `/rpc`.
+Use a new idempotency key for a new task; retain a key when retrying the same request.
+
+See [environments, tools, subagents and forks](docs/environments-and-tools.md) for files,
+skills, artifacts, MCP, programmatic tool calling, cross-runtime delegation and forks.
+All three runtimes accept image input and rich function results and stream reasoning
+summaries, command output and usage; Codex adds configured Web search.
+See the [input and streaming examples](docs/environments-and-tools.md#images-web-search-and-streamed-progress).
+
+## What you control
+
+Register runtime/model presets, provide tools, and configure environments in your own deployment.
+Clients select those presets; they do not receive provider credentials or choose arbitrary binaries.
+A preset may list the presets it can delegate subagents to, so one session can
+combine runtimes in a shared workspace, and a session can be forked onto another preset.
+[Configure harnesses and models](docs/extending.md) for provider connections and their supported features.
+
+The Agent Worker routes to tenant catalogs and session Durable Objects.
+Native harness Containers run the agent loops; separate Sandbox Containers run workspace commands.
+SQLite stores turns and events. R2 stores conversation checkpoints, workspace backups, and published files.
+A completed turn commits its checkpoints before it becomes visible as complete.
+See [architecture](docs/architecture.md) for recovery and execution limits.
+
+## Develop
+
+`packages/agent-api` contains the library, `packages/supervisor` the native runtime adapters,
+`examples/worker` the API deployment, and `examples/caller` the consuming Worker.
+Native tests need **Codex 0.154.0** on `PATH`; pnpm installs the pinned Claude/OpenCode runtimes.
+Local test suites use scripted inference and need no production credentials.
 
 | Command | Purpose |
 | --- | --- |
-| `pnpm check` | Documentation/agent harness checks, typecheck, lint, tests and builds |
-| `pnpm check:docs` | Verify project names, entrypoints, commands, bindings and image pins |
-| `pnpm check:harness` | Check documentation links, agent entrypoints, skills and licenses |
-| `pnpm test:scripts` | Checker failure fixtures |
-| `pnpm test:package` | Packed library installation and consumer type checks |
-| `pnpm typecheck` | Check TypeScript without emitting files |
+| `pnpm dev:caller` | Run the caller and its Agent Worker Service Binding |
+| `pnpm dev` | Run the Agent Worker directly on localhost:8787 |
+| `pnpm check` | Documentation, harness, scripts, types, lint, Worker tests, build |
+| `pnpm check:docs` | Verify documented commands, exports, bindings and pins |
+| `pnpm check:harness` | Check documentation links and development instructions |
+| `pnpm test:scripts` | Check development scripts |
+| `pnpm test:package` | Install and typecheck the packed library |
+| `pnpm typecheck` | Check TypeScript |
 | `pnpm lint` | Check formatting and lint rules |
-| `pnpm test` | Worker, SQLite, streaming and asset tests |
-| `pnpm test:codex` | Native Codex protocol and checkpoint tests |
-| `pnpm test:harnesses` | Native Codex/Claude Code/OpenCode, model gateway, tools and checkpoint tests |
-| `pnpm test:containers` | All three harnesses: separate Sandbox execution, skills and R2 restore |
-| `pnpm build` | ESM JavaScript and declaration files |
-| `pnpm dev` | Local Worker and Containers |
-| `pnpm types` | Regenerate example binding/runtime types |
-| `pnpm deploy:check` | Build images and run Wrangler's deployment dry run |
-| `pnpm format` | Format code and organize imports |
+| `pnpm test` | Worker, SQLite, SDK, Service Binding and asset tests |
+| `pnpm test:codex` | Real Codex with a scripted model endpoint |
+| `pnpm test:harnesses` | All three native runtimes, model gateway and recovery |
+| `pnpm test:containers` | Real local Containers and R2 recovery with scripted inference |
+| `pnpm build` | Build ESM and declaration files |
+| `pnpm types` | Generate example Worker binding types |
+| `pnpm deploy:check` | Check deployment bundles and images without deploying |
+| `pnpm format` | Format code and imports |
+
+See [deployment](docs/deployment.md) for hosting, [contributing](CONTRIBUTING.md) for validation,
+and [library API](docs/library-api.md) for installing from a source checkout.
 
 ## License
 
-Apache-2.0; bundled development skills retain the licenses listed in [NOTICE](NOTICE).
-See [CHANGELOG.md](CHANGELOG.md), [contributing](CONTRIBUTING.md) and [release instructions](docs/releasing.md).
+Apache-2.0. Bundled development skills retain their licenses in [NOTICE](NOTICE).
+[Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Release instructions](docs/releasing.md)

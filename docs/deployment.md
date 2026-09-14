@@ -5,8 +5,8 @@ buckets, and a private loopback `Models` Service Binding. `HarnessDO` uses `basi
 (1 GiB) and `SandboxDO` uses `standard-1` (4 GiB); tune these after measurement.
 The Sandbox package and image both pin `0.13.0-next.751.1`.
 
-Run `pnpm deploy:check` to build both images and validate the Worker bundle without
-publishing it. Run `pnpm types` after changing Wrangler bindings. Deploying is a
+Run `pnpm deploy:check` to validate both the Agent Worker and caller bundles, and
+build the Container images without publishing them. Run `pnpm types` after changing Wrangler bindings. Deploying is a
 separate operator action; no remote deployment is part of the local tests.
 
 ## Production configuration
@@ -27,6 +27,23 @@ Replace the example's single-tenant authenticator for a multi-tenant deployment.
 Only trusted Workers should hold a Service Binding to this API. Set account-level
 rate limits and usage budgets appropriate to your deployment before public access.
 The library's turn deadline and instance cap do not constitute a billing budget.
+The example disables `workers.dev` and preview URLs; a Service Binding works without
+an Internet-facing route. Add a route deliberately when hosting the HTTP API.
+
+The `coding` preset uses Codex with native Responses passthrough so images, native
+reasoning, web search and structured-output settings reach the configured provider.
+The private gateway enforces the session's search mode: `disabled` removes the
+search tool, `cached` disables external web access, and `live` enables it. This
+also corrects Codex 0.154.0 promoting cached search under full-access execution.
+Other presets use
+the portable AI SDK adapter; see [model protocols](extending.md#model-protocols).
+
+The `environments: containerEnvironments` option enables configured environments.
+The checkpoints bucket also stores private environment configuration, input files
+and immutable artifacts. Vault secrets are stored in the tenant's Catalog DO;
+service-origin MCP requests obtain credentials through that private boundary.
+Model-provider credentials remain in the model gateway. Environment MCP commands
+and package/setup commands execute in the Sandbox with its configured network policy.
 
 ## Checkpoint operations
 
@@ -55,11 +72,24 @@ Run the complete local smoke with:
 pnpm test:containers
 ```
 
-It uses a fresh persistence directory and a scripted local model. It verifies native
-shell execution for all three harnesses, Claude/OpenCode write/edit/read replacements,
-skill provisioning, isolation from the harness filesystem, and a second turn after
-both Containers are destroyed. It cleans up the Containers it
-created. Logs and local R2/SQLite evidence remain in the printed temporary directory.
+It uses a fresh persistence directory and a scripted local model. For each of the
+three harnesses it verifies native shell execution, Claude/OpenCode
+write/edit/read replacements, a configured environment with a pinned saved skill,
+an inline plugin, a service-origin MCP server with a Vault credential, immutable
+artifacts, isolation from the harness filesystem, a second turn after both
+Containers are destroyed, programmatic tool calling with parallel client calls,
+explicit cancellation, an abandoned workspace call ending as
+`programmatic_execution_uncertain`, a same-harness fork that recovers the
+committed workspace, a delegated subagent on the next runtime sharing that
+workspace, and a cross-runtime fork continuing with the inherited workspace and
+transcript. The Codex fixture also exercises Files API uploads, environment file
+listings, image input, cached search configuration at model egress, reported
+usage and an `environment: none` session. It cleans up the Containers it created.
+Logs and local R2/SQLite evidence remain in the printed temporary directory.
+`CF_SMOKE_HARNESSES=opencode` narrows the run to one runtime while diagnosing.
+When a native execution stops, the Worker logs a bounded tail of the supervisor's
+native stderr as `Native harness diagnostics`; the same tail explains a
+`native_harness_failed` turn in production logs.
 No Cloudflare deployment, provider secret, or paid inference is involved.
 
 Cloudflare's local Container proxy needs a route back to workerd. Rootless Docker

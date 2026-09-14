@@ -2,6 +2,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { jsonSchema, type LanguageModel, type LanguageModelUsage, streamText, tool } from "ai";
 import { Context, Effect, Layer } from "effect";
 import { attempt, io, runPromise, type ServiceError } from "./effect.js";
+import { requestWithoutRedirect } from "./http.js";
 import { readModelBodyEffect } from "./models/body.js";
 import { decodeModelRequest } from "./models/input.js";
 import { encodeModelResponse, type ModelChunk } from "./models/output.js";
@@ -68,6 +69,9 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
             case "text-delta":
               yield { type: "text", id: part.id, text: part.text };
               break;
+            case "reasoning-delta":
+              yield { type: "reasoning", id: part.id, text: part.text };
+              break;
             case "tool-call":
               if (part.invalid) throw new Error("Model returned an invalid tool call");
               yield {
@@ -77,8 +81,7 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
                 input: part.input,
               };
               break;
-            // The portable contract carries text and function calls. Provider-private
-            // reasoning/signatures stay within this inference; use nativeModel to replay them.
+            // Provider-private signatures and encrypted content remain native-only.
             case "error":
               throw new Error("Upstream model request failed");
             case "finish":
@@ -149,14 +152,15 @@ export function nativeModel(options: {
         const beta = request.headers.get("anthropic-beta");
         if (beta) headers.set("anthropic-beta", beta);
       } else headers.set("authorization", `Bearer ${options.apiKey}`);
-      return yield* io("model.fetch", (signal) =>
-        (options.fetch ?? globalThis.fetch)(new URL(path.slice(1), base), {
+      return yield* requestWithoutRedirect(
+        "model.fetch",
+        new Request(new URL(path.slice(1), base), {
           method: "POST",
           headers,
           body: JSON.stringify({ ...body, model: options.model }),
-          signal: AbortSignal.any([request.signal, signal]),
-          redirect: "error",
+          signal: request.signal,
         }),
+        options.fetch,
       );
     }),
   );

@@ -33,6 +33,6 @@ checks authored Markdown links, entrypoint imports, skill aliases and provenance
 Run `pnpm test:scripts` when changing checker behavior. Neither command downloads
 skills or requires access to a private repository.
 
-`dist/` and `examples/worker/env.d.ts` are generated, ignored outputs. Build them
+`dist/`, `examples/worker/env.d.ts` and `examples/caller/env.d.ts` are generated, ignored outputs. Build them
 with `pnpm build` and `pnpm types`; edit their source rather than checking them in.
 Keep validation fixtures under `tests/` and out of production package exports.

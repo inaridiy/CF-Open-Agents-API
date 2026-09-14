@@ -48,6 +48,15 @@ interface Active {
 /** Private Container HTTP API. Its owning HarnessDO is the authorization boundary. */
 export function createSupervisor(options: Options, factory: JobFactory = createJob) {
   const active = Ref.unsafeMake<Active | undefined>(undefined);
+  // Bounded native stderr tail so the Worker can log why an execution failed.
+  const recent: string[] = [];
+  const forward = options.diagnostics;
+  const diagnostics = (line: string) => {
+    forward(line);
+    recent.push(line.length > 4096 ? `${line.slice(0, 4096)}…` : line);
+    if (recent.length > 200) recent.shift();
+  };
+  options = { ...options, diagnostics };
   // Serialize ownership changes and snapshots, while callbacks remain available during startup.
   const lifecycle = Effect.unsafeMakeSemaphore(1);
   const layer = Layer.succeed(NativeRuntime, { create: factory, options });
@@ -75,6 +84,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
     ),
   );
   app.get("/health", () => Response.json({ harnesses: HARNESSES, ready: true }));
+  app.get("/diagnostics", () => Response.json({ lines: recent }));
   app.post("/jobs", async (c) => {
     const body = decode(
       Schema.Struct({
@@ -205,6 +215,19 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
           : c.body(null, 404);
       }),
     );
+  });
+  app.get("/jobs/:turn/code-tools", async (c) => {
+    const invocation = z.string().uuid().parse(c.req.query("invocation"));
+    const job = await runPromise(lookup(c.req.param("turn")));
+    return job.codeTools ? Response.json(await job.codeTools(invocation)) : c.body(null, 404);
+  });
+  app.post("/jobs/:turn/code-tool", async (c) => {
+    const input = z
+      .object({ name: z.string(), arguments: z.json(), invocation: z.string().uuid() })
+      .parse(await c.req.json());
+    const job = await runPromise(lookup(c.req.param("turn")));
+    if (!job.codeTool) return c.body(null, 404);
+    return Response.json(await job.codeTool(input.name, input.arguments, input.invocation));
   });
   app.post("/stop", (c) => runPromise(stop.pipe(Effect.as(c.body(null, 204)))));
   return { app, stop: () => runPromise(stop) };

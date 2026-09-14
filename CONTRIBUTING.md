@@ -31,11 +31,15 @@ Match recurring diagnostics against [known issues](docs/known-issues.md). See [s
 - `runtime.ts`: Effect schemas and the common Effect execution driver contract.
 - `effect.ts`: typed I/O failures, decoding and platform boundary runners.
 - `docs/effect.md`: Effect state, concurrency and extension migration contracts.
-- `containers.ts`: Container lifecycle, model egress, and workspace snapshots.
+- `containers.ts`: Container lifecycle, model egress, delegated children and workspace snapshots.
+- `container-environments.ts`, `environment-config.ts`: hosted environment setup, uploads, inheritance.
+- `skills.ts`, `skill-zip.ts`, `files.ts`, `vaults.ts`: tenant-owned skills, input files and credentials.
+- `programmatic.ts`, `programmatic-contract.ts`: isolated code execution and its tool bridge.
 - `models.ts`, `models/`: single-inference model adapters and bounded wire translation.
 - `workspace.ts`, `sandbox-tools.ts`: shared remote tool contracts and Sandbox SDK execution.
 - `tools.ts`: tool contracts, provider-neutral presets, and immutable assets.
-- `packages/supervisor/src`: native Codex, Claude Code and OpenCode lifecycle adapters.
+- `packages/supervisor/src`: native Codex, Claude Code and OpenCode lifecycle adapters;
+  `delegation.ts` relays cross-runtime children, `remote-tools.ts` bridges MCP servers.
 - `examples/worker`: deployable composition; no test fixture enters this build.
 - `tests/workers`: real workerd/SQLite integration with a scripted harness.
 - `tests/codex`: real Codex app-server/exec-server with a scripted model endpoint.

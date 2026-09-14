@@ -4,9 +4,10 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
-import type { Config } from "@opencode-ai/sdk/v2/types";
+import type { AssistantMessage, Config, Part } from "@opencode-ai/sdk/v2/types";
 import type { Execution } from "cf-open-agents-api";
 import { type NativeOptions, ToolJob } from "./job.js";
+import { imageContent } from "./media.js";
 
 export class OpenCodeJob extends ToolJob {
   readonly home: string;
@@ -36,6 +37,8 @@ export class OpenCodeJob extends ToolJob {
       write: this.execution.sandbox,
       edit: this.execution.sandbox,
       "workspace_function_*": true,
+      "workspace_cf_*": true,
+      "workspace_remote_*": true,
     };
     const config: Config = {
       model: `gateway/${this.execution.model}`,
@@ -52,6 +55,8 @@ export class OpenCodeJob extends ToolJob {
         write: this.execution.sandbox ? "allow" : "deny",
         edit: this.execution.sandbox ? "allow" : "deny",
         "workspace_function_*": "allow",
+        "workspace_cf_*": "allow",
+        "workspace_remote_*": "allow",
       },
       tools,
       agent: { title: { disable: true }, summary: { disable: true }, build: { steps: 32 } },
@@ -76,6 +81,8 @@ export class OpenCodeJob extends ToolJob {
               name: this.execution.model,
               limit: { context: 128_000, output: 8192 },
               tool_call: true,
+              reasoning: true,
+              modalities: { input: ["text", "image"], output: ["text"] },
             },
           },
         },
@@ -142,17 +149,77 @@ export class OpenCodeJob extends ToolJob {
     this.sessionId = sessionId;
     if (previous) await client.session.get({ sessionID: previous });
     this.run(async () => {
+      const parts = new Map<string, Part["type"]>();
+      const usage = new Map<string, AssistantMessage>();
+      const started = Date.now();
+      const collectUsage = (info: AssistantMessage) => {
+        if (info.sessionID !== this.sessionId || info.time.created < started) return;
+        usage.set(info.id, info);
+        const messages = [...usage.values()];
+        const input = messages.reduce(
+          (sum, message) =>
+            sum + message.tokens.input + message.tokens.cache.read + message.tokens.cache.write,
+          0,
+        );
+        const output = messages.reduce(
+          (sum, message) => sum + message.tokens.output + message.tokens.reasoning,
+          0,
+        );
+        this.emit({
+          type: "usage",
+          id: `usage:${this.execution.turnId}`,
+          usage: {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            input_tokens_details: {
+              cached_tokens: messages.reduce((sum, message) => sum + message.tokens.cache.read, 0),
+            },
+            output_tokens_details: {
+              reasoning_tokens: messages.reduce(
+                (sum, message) => sum + message.tokens.reasoning,
+                0,
+              ),
+            },
+          },
+        });
+      };
+      const collectPart = (part: Part) => {
+        if (part.sessionID !== this.sessionId) return;
+        parts.set(part.id, part.type);
+        if (part.type === "reasoning")
+          this.emit({
+            type: "reasoning",
+            id: part.id,
+            summary: [part.text],
+            status: part.time.end ? "completed" : "in_progress",
+          });
+        if (part.type === "text" && part.time?.end)
+          this.emit({ type: "text", id: part.id, text: part.text, phase: "final_answer" });
+      };
       const updates = new AbortController();
       const events = await client.event.subscribe({}, { signal: updates.signal });
       let streamError: unknown;
       const consume = (async () => {
         for await (const event of events.stream) {
+          if (event.type === "message.updated" && event.properties.info.role === "assistant")
+            collectUsage(event.properties.info);
+          if (event.type === "message.part.updated") collectPart(event.properties.part);
           if (
             event.type === "message.part.delta" &&
             event.properties.sessionID === this.sessionId &&
             event.properties.field === "text"
           )
-            this.emit({ type: "delta", id: event.properties.partID, text: event.properties.delta });
+            this.emit(
+              parts.get(event.properties.partID) === "reasoning"
+                ? {
+                    type: "reasoning_delta",
+                    id: event.properties.partID,
+                    summaryIndex: 0,
+                    text: event.properties.delta,
+                  }
+                : { type: "delta", id: event.properties.partID, text: event.properties.delta },
+            );
         }
       })().catch((error) => {
         if (!updates.signal.aborted) {
@@ -161,28 +228,50 @@ export class OpenCodeJob extends ToolJob {
         }
       });
       try {
+        const inputParts = await Promise.all(
+          this.execution.input
+            .flatMap((message) => message.content)
+            .map(async (part) => {
+              if (part.type === "input_text") return { type: "text" as const, text: part.text };
+              const image = await imageContent(
+                part.image_url,
+                this.abort.signal,
+                this.options.mediaUrl,
+              );
+              return {
+                type: "file" as const,
+                mime: image.mimeType,
+                url: `data:${image.mimeType};base64,${image.data}`,
+              };
+            }),
+        );
         const result = await client.session.prompt(
           {
             sessionID: this.sessionId,
             model: { providerID: "gateway", modelID: this.execution.model },
-            parts: this.execution.input.flatMap((message) =>
-              message.content.map((part) => ({ type: "text" as const, text: part.text })),
-            ),
+            parts: inputParts,
             system: this.execution.agent.instructions ?? undefined,
             tools,
           },
           { signal: this.abort.signal },
         );
         if (streamError) throw streamError;
+        if (result.data) collectUsage(result.data.info);
         if (
           !result.data ||
           result.data.info.error ||
           !["stop", "end_turn"].includes(result.data.info.finish ?? "")
         )
-          throw new Error("OpenCode turn failed");
+          throw new Error(
+            `OpenCode turn failed: ${JSON.stringify({
+              finish: result.data?.info.finish ?? null,
+              error: result.data?.info.error ?? null,
+            })}`,
+          );
         for (const part of result.data.parts)
           if (part.type === "text")
             this.emit({ type: "text", id: part.id, text: part.text, phase: "final_answer" });
+          else collectPart(part);
       } finally {
         updates.abort();
         await consume;

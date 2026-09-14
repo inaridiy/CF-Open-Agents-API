@@ -1,9 +1,12 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "cf-open-agents-api",
+  "workers_dev": false,
+  "preview_urls": false,
   "main": "src/index.ts",
   "compatibility_date": "2026-09-12",
   "compatibility_flags": ["nodejs_compat"],
+  "worker_loaders": [{ "binding": "CODE_LOADER" }],
   "observability": {
     "enabled": true,
     "traces": {

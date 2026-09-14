@@ -1,6 +1,6 @@
-import type { ModelMessage } from "ai";
+import type { FilePart, ModelMessage, ToolResultPart, UserContent } from "ai";
 import { z } from "zod";
-import { ApiError } from "../protocol.js";
+import { ApiError, canonicalJSON } from "../protocol.js";
 
 export interface ModelInput {
   protocol: "responses" | "anthropic" | "chat-completions";
@@ -14,6 +14,7 @@ export interface ModelInput {
     description?: string;
     schema: Record<string, unknown>;
     custom: boolean;
+    search?: boolean;
   }[];
   toolChoice?: "auto" | "none" | "required" | { type: "tool"; toolName: string };
   maxOutputTokens?: number;
@@ -27,7 +28,7 @@ const unsupported = () =>
   new ApiError(
     400,
     "unsupported_model_input",
-    "The translated gateway supports text and function tools; use a native model preset for provider-specific content",
+    "Unsupported translated model input; use a native model preset for provider-specific content",
   );
 const string = (value: unknown) => z.string().parse(value);
 function text(content: unknown): string {
@@ -39,6 +40,54 @@ function text(content: unknown): string {
       return string(part.text);
     })
     .join("\n");
+}
+
+function image(part: Record<string, unknown>): FilePart {
+  const url = (value: unknown): FilePart => ({
+    type: "file",
+    mediaType: "image",
+    data: { type: "url", url: new URL(string(value)) },
+  });
+  if (part.type === "input_image") return url(part.image_url);
+  if (part.type === "image_url") return url(object.parse(part.image_url).url);
+  const source = object.parse(part.source);
+  if (source.type === "url") return url(source.url);
+  if (source.type === "base64")
+    return {
+      type: "file",
+      data: { type: "data", data: string(source.data) },
+      mediaType: string(source.media_type),
+    };
+  throw unsupported();
+}
+function userContent(content: unknown): UserContent {
+  if (typeof content === "string") return content;
+  return list.parse(content).map((part) => {
+    if (["text", "input_text", "output_text"].includes(string(part.type)))
+      return { type: "text" as const, text: string(part.text) };
+    if (["input_image", "image_url", "image"].includes(string(part.type))) return image(part);
+    throw unsupported();
+  });
+}
+function toolOutput(content: unknown, failed: boolean): ToolResultPart["output"] {
+  if (typeof content === "string") return { type: failed ? "error-text" : "text", value: content };
+  const parts = userContent(content);
+  if (typeof parts === "string") throw unsupported();
+  return {
+    type: "content",
+    value: parts.map((part) => {
+      if (part.type === "text") return { type: "text" as const, text: part.text };
+      if (
+        part.type !== "file" ||
+        typeof part.data !== "object" ||
+        part.data === null ||
+        !("type" in part.data) ||
+        (part.data.type !== "data" && part.data.type !== "url")
+      )
+        throw unsupported();
+      return { type: "file" as const, data: part.data, mediaType: part.mediaType };
+    }),
+  };
 }
 
 export async function decodeModelRequest(request: Request): Promise<ModelInput> {
@@ -76,22 +125,37 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
     temperature: z.number().optional().parse(body.temperature),
     topP: z.number().optional().parse(body.top_p),
   };
-  const definitions = list
-    .parse(body.tools ?? [])
-    .flatMap((raw) =>
-      raw.type === "namespace"
-        ? list.parse(raw.tools).map((tool) => ({ ...tool, namespace: string(raw.name) }))
-        : [raw],
-    );
-  for (const raw of definitions) {
+  const historyTools =
+    protocol === "responses" && Array.isArray(body.input)
+      ? list
+          .parse(body.input)
+          .filter((item) => item.type === "tool_search_output")
+          .flatMap((item) => list.parse(item.tools))
+      : [];
+  const definitions: { raw: Record<string, unknown>; discovered: boolean }[] = [
+    ...list.parse(body.tools ?? []).map((raw) => ({ raw, discovered: false })),
+    ...historyTools.map((raw) => ({ raw, discovered: true })),
+  ].flatMap(({ raw, discovered }) =>
+    (raw.type === "namespace"
+      ? list.parse(raw.tools).map((tool) => ({ ...tool, namespace: string(raw.name) }))
+      : [raw]
+    ).map((raw) => ({ raw, discovered })),
+  );
+  for (const { raw, discovered } of definitions) {
     const definition = protocol === "chat-completions" ? object.parse(raw.function) : raw;
     const custom = raw.type === "custom";
-    if (protocol !== "anthropic" && raw.type !== "function" && !custom) throw unsupported();
-    output.tools.push({
-      name: raw.namespace
+    const search =
+      protocol === "responses" && raw.type === "tool_search" && raw.execution === "client";
+    if (protocol !== "anthropic" && raw.type !== "function" && !custom && !search)
+      throw unsupported();
+    const name = search
+      ? "tool_search"
+      : raw.namespace
         ? `${string(raw.namespace)}__${string(definition.name)}`
-        : string(definition.name),
-      wireName: string(definition.name),
+        : string(definition.name);
+    const tool: ModelInput["tools"][number] = {
+      name,
+      wireName: search ? "tool_search" : string(definition.name),
       namespace: z.string().optional().parse(raw.namespace),
       description: z.string().optional().parse(definition.description),
       schema: custom
@@ -108,7 +172,14 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
           }
         : object.parse(definition.parameters ?? definition.input_schema),
       custom,
-    });
+      ...(search ? { search: true } : {}),
+    };
+    const previous = output.tools.find((entry) => entry.name === name);
+    if (previous) {
+      if (discovered && canonicalJSON(previous) === canonicalJSON(tool)) continue;
+      throw unsupported();
+    }
+    output.tools.push(tool);
   }
   if (new Set(output.tools.map((tool) => tool.name)).size !== output.tools.length)
     throw unsupported();
@@ -144,7 +215,7 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
           type: "tool-result",
           toolCallId: id,
           toolName: name,
-          output: { type: failed ? "error-text" : "text", value: text(value) },
+          output: toolOutput(value, failed),
         },
       ],
     });
@@ -157,7 +228,11 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
         ? [{ role: "user", content: body.input }]
         : list.parse(body.input);
     for (const item of items) {
-      if (item.type === "function_call" || item.type === "custom_tool_call")
+      if (item.type === "tool_search_call")
+        appendCall(string(item.call_id), "tool_search", item.arguments);
+      else if (item.type === "tool_search_output")
+        appendResult(string(item.call_id), JSON.stringify(item.tools));
+      else if (item.type === "function_call" || item.type === "custom_tool_call")
         appendCall(
           string(item.call_id),
           item.namespace ? `${string(item.namespace)}__${string(item.name)}` : string(item.name),
@@ -185,7 +260,8 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
           item.role === "developer"
             ? "system"
             : z.enum(["user", "assistant", "system"]).parse(item.role);
-        output.messages.push({ role, content: text(item.content) });
+        if (role === "user") output.messages.push({ role, content: userContent(item.content) });
+        else output.messages.push({ role, content: text(item.content) });
       }
     }
   } else {
@@ -207,9 +283,21 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
           else if (part.type === "tool_result")
             appendResult(string(part.tool_use_id), part.content, part.is_error === true);
           else if (part.type === "text") output.messages.push({ role, content: string(part.text) });
+          else if (role === "user" && ["image", "image_url"].includes(string(part.type)))
+            output.messages.push({ role, content: [image(part)] });
+          else if (role === "assistant" && part.type === "thinking")
+            output.messages.push({
+              role,
+              content: [{ type: "reasoning", text: string(part.thinking) }],
+            });
           else throw unsupported();
         }
       }
+      if (role === "assistant" && typeof message.reasoning_content === "string")
+        output.messages.push({
+          role,
+          content: [{ type: "reasoning", text: message.reasoning_content }],
+        });
       for (const call of list.parse(message.tool_calls ?? [])) {
         const fn = object.parse(call.function);
         appendCall(string(call.id), string(fn.name), JSON.parse(string(fn.arguments)));

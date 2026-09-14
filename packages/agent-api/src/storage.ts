@@ -7,6 +7,7 @@ import {
   SqliteAdapter,
   SqliteIntrospector,
   SqliteQueryCompiler,
+  sql,
 } from "kysely";
 import type { PageQuery } from "./protocol.js";
 import { ApiError } from "./protocol.js";
@@ -129,9 +130,23 @@ export class SqlStore {
   clear(kind: string): void {
     this.execute(this.queries.deleteFrom("records").where("kind", "=", kind));
   }
+  /** Resolve the native position key when a streamed public item is finalized. */
+  outputKey(itemId: string): string | undefined {
+    return this.execute(
+      this.queries
+        .selectFrom("records")
+        .select("id")
+        .where("kind", "=", "output")
+        .where(sql<string>`json_extract(value, '$.item.id')`, "=", itemId)
+        .limit(1),
+    )[0]?.id;
+  }
   list<T>(
     kind: string,
     query: PageQuery,
+    filter?:
+      | { field: "agent_id" | "environment_id" | "turn_id" | "item.turn_id"; value: string }
+      | { expiresAfter: number },
   ): {
     object: "list";
     data: T[];
@@ -143,14 +158,32 @@ export class SqlStore {
       .selectFrom("records")
       .select(["id", "value"])
       .where("kind", "=", kind);
+    if (filter && "field" in filter)
+      selection = selection.where(
+        sql<string>`json_extract(value, ${`$.${filter.field}`})`,
+        "=",
+        filter.value,
+      );
+    if (filter && "expiresAfter" in filter)
+      selection = selection.where((eb) =>
+        eb.or([
+          eb(sql<number>`json_extract(value, '$.resource.expires_at')`, "is", null),
+          eb(sql<number>`json_extract(value, '$.resource.expires_at')`, ">", filter.expiresAfter),
+        ]),
+      );
     if (query.after) {
-      const cursor = this.execute(
-        this.queries
-          .selectFrom("records")
-          .select(["seq", "id"])
-          .where("kind", "=", kind)
-          .where("id", "=", query.after),
-      )[0];
+      let cursorQuery = this.queries
+        .selectFrom("records")
+        .select(["seq", "id"])
+        .where("kind", "=", kind)
+        .where("id", "=", query.after);
+      if (filter && "field" in filter)
+        cursorQuery = cursorQuery.where(
+          sql<string>`json_extract(value, ${`$.${filter.field}`})`,
+          "=",
+          filter.value,
+        );
+      const cursor = this.execute(cursorQuery)[0];
       if (!cursor)
         throw new ApiError(400, "invalid_cursor", "Cursor does not belong to this collection");
       const comparison = query.order === "asc" ? ">" : "<";

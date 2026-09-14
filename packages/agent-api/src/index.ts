@@ -9,6 +9,7 @@ export {
   type ServiceError,
 } from "./effect.js";
 export { HARNESSES, type HarnessName } from "./harnesses.js";
+export { programmaticInputSchema, programmaticTool } from "./programmatic-contract.js";
 export * from "./protocol.js";
 export type * from "./runtime.js";
 export {

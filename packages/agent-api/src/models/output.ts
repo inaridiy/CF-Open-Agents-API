@@ -3,13 +3,13 @@ import { ApiError } from "../protocol.js";
 import type { ModelInput } from "./input.js";
 
 export type ModelChunk =
-  | { type: "text"; id: string; text: string }
+  | { type: "text" | "reasoning"; id: string; text: string }
   | { type: "call"; id: string; name: string; input: unknown }
   | { type: "finish"; reason: FinishReason; usage: LanguageModelUsage };
 
 interface Item {
   id: string;
-  type: "text" | "call";
+  type: "text" | "reasoning" | "call";
   text: string;
   name?: string;
   input?: unknown;
@@ -27,12 +27,41 @@ export async function encodeModelResponse(
   const responseId = id("resp");
   const created = Math.floor(Date.now() / 1000);
   const items: Item[] = [];
-  let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  let usage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: 0 },
+  };
+  let cacheWrite = 0;
+  const anthropicUsage = () => ({
+    input_tokens: Math.max(
+      0,
+      usage.input_tokens - usage.input_tokens_details.cached_tokens - cacheWrite,
+    ),
+    output_tokens: usage.output_tokens,
+    cache_read_input_tokens: usage.input_tokens_details.cached_tokens,
+    cache_creation_input_tokens: cacheWrite,
+  });
+  const chatUsage = () => ({
+    prompt_tokens: usage.input_tokens,
+    completion_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+    prompt_tokens_details: usage.input_tokens_details,
+    completion_tokens_details: usage.output_tokens_details,
+  });
   let finish: FinishReason | undefined;
   let sequence = 0;
   const responsesEvent = (type: string, data: object) =>
     event(type, { sequence_number: sequence++, ...data });
   const responsesItem = (item: Item): Record<string, unknown> => {
+    if (item.type === "reasoning")
+      return {
+        id: item.id,
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: item.text }],
+      };
     if (item.type === "text")
       return {
         id: item.id,
@@ -42,6 +71,15 @@ export async function encodeModelResponse(
         content: [{ type: "output_text", text: item.text, annotations: [] }],
       };
     const definition = input.tools.find((tool) => tool.name === item.name);
+    if (definition?.search)
+      return {
+        id: item.id,
+        call_id: item.id,
+        status: "completed",
+        type: "tool_search_call",
+        execution: "client",
+        arguments: item.input,
+      };
     const common = {
       status: "completed",
       id: item.id,
@@ -65,7 +103,9 @@ export async function encodeModelResponse(
   const anthropicItem = (item: Item) =>
     item.type === "call"
       ? { type: "tool_use", id: item.id, name: item.name, input: item.input }
-      : { type: "text", text: item.text };
+      : item.type === "reasoning"
+        ? { type: "thinking", thinking: item.text, signature: "" }
+        : { type: "text", text: item.text };
   const chatChunk = (delta: object, reason: string | null = null, includeUsage = false) =>
     `data: ${JSON.stringify({
       id: responseId,
@@ -75,11 +115,7 @@ export async function encodeModelResponse(
       choices: [{ index: 0, delta, finish_reason: reason }],
       ...(includeUsage
         ? {
-            usage: {
-              prompt_tokens: usage.input_tokens,
-              completion_tokens: usage.output_tokens,
-              total_tokens: usage.total_tokens,
-            },
+            usage: chatUsage(),
           }
         : {}),
     })}\n\n`;
@@ -98,7 +134,7 @@ export async function encodeModelResponse(
               content: [],
               stop_reason: null,
               stop_sequence: null,
-              usage,
+              usage: anthropicUsage(),
             },
           });
         else yield chatChunk({ role: "assistant", content: "" });
@@ -113,7 +149,14 @@ export async function encodeModelResponse(
             input_tokens: chunk.usage.inputTokens ?? 0,
             output_tokens: chunk.usage.outputTokens ?? 0,
             total_tokens: chunk.usage.totalTokens ?? 0,
+            input_tokens_details: {
+              cached_tokens: chunk.usage.inputTokenDetails.cacheReadTokens ?? 0,
+            },
+            output_tokens_details: {
+              reasoning_tokens: chunk.usage.outputTokenDetails.reasoningTokens ?? 0,
+            },
           };
+          cacheWrite = chunk.usage.inputTokenDetails.cacheWriteTokens ?? 0;
           continue;
         }
         let index = items.findIndex((item) => item.id === chunk.id && item.type === chunk.type);
@@ -142,6 +185,13 @@ export async function encodeModelResponse(
                 content_index: 0,
                 part: { type: "output_text", text: "", annotations: [] },
               });
+            else if (chunk.type === "reasoning")
+              yield responsesEvent("response.reasoning_summary_part.added", {
+                item_id: item.id,
+                output_index: index,
+                summary_index: 0,
+                part: { type: "summary_text", text: "" },
+              });
           } else if (input.protocol === "anthropic")
             yield event("content_block_start", {
               index,
@@ -161,11 +211,20 @@ export async function encodeModelResponse(
               content_index: 0,
               delta: chunk.text,
             });
+          else if (chunk.type === "reasoning")
+            yield responsesEvent("response.reasoning_summary_text.delta", {
+              item_id: item.id,
+              output_index: index,
+              summary_index: 0,
+              delta: chunk.text,
+            });
         } else if (input.protocol === "anthropic") {
           const delta =
             chunk.type === "call"
               ? { type: "input_json_delta", partial_json: JSON.stringify(chunk.input) }
-              : { type: "text_delta", text: chunk.text };
+              : chunk.type === "reasoning"
+                ? { type: "thinking_delta", thinking: chunk.text }
+                : { type: "text_delta", text: chunk.text };
           yield event("content_block_delta", { index, delta });
         } else {
           if (chunk.type === "call")
@@ -179,7 +238,12 @@ export async function encodeModelResponse(
                 },
               ],
             });
-          else yield chatChunk({ content: chunk.text });
+          else
+            yield chatChunk(
+              chunk.type === "reasoning"
+                ? { reasoning_content: chunk.text }
+                : { content: chunk.text },
+            );
         }
       }
       if (!finish || !["stop", "tool-calls"].includes(finish))
@@ -196,7 +260,7 @@ export async function encodeModelResponse(
             content: items.map(anthropicItem),
             stop_reason: hasCalls ? "tool_use" : "end_turn",
             stop_sequence: null,
-            usage,
+            usage: anthropicUsage(),
           });
         else
           yield JSON.stringify({
@@ -214,6 +278,11 @@ export async function encodeModelResponse(
                     .filter((item) => item.type === "text")
                     .map((item) => item.text)
                     .join(""),
+                  reasoning_content:
+                    items
+                      .filter((item) => item.type === "reasoning")
+                      .map((item) => item.text)
+                      .join("") || undefined,
                   ...(hasCalls
                     ? {
                         tool_calls: items
@@ -228,11 +297,7 @@ export async function encodeModelResponse(
                 },
               },
             ],
-            usage: {
-              prompt_tokens: usage.input_tokens,
-              completion_tokens: usage.output_tokens,
-              total_tokens: usage.total_tokens,
-            },
+            usage: chatUsage(),
           });
         return;
       }
@@ -252,6 +317,20 @@ export async function encodeModelResponse(
               part: { type: "output_text", text: item.text, annotations: [] },
             });
           }
+          if (item.type === "reasoning") {
+            yield responsesEvent("response.reasoning_summary_text.done", {
+              item_id: item.id,
+              output_index: index,
+              summary_index: 0,
+              text: item.text,
+            });
+            yield responsesEvent("response.reasoning_summary_part.done", {
+              item_id: item.id,
+              output_index: index,
+              summary_index: 0,
+              part: { type: "summary_text", text: item.text },
+            });
+          }
           yield responsesEvent("response.output_item.done", {
             output_index: index,
             item: responsesItem(item),
@@ -263,7 +342,7 @@ export async function encodeModelResponse(
       else if (input.protocol === "anthropic") {
         yield event("message_delta", {
           delta: { stop_reason: hasCalls ? "tool_use" : "end_turn", stop_sequence: null },
-          usage,
+          usage: anthropicUsage(),
         });
         yield event("message_stop", {});
       } else {
