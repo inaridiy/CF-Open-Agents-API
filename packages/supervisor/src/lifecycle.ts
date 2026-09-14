@@ -31,6 +31,31 @@ interface JobState {
   readonly bytes: number;
 }
 const terminal = (outcome: Outcome) => outcome.status !== "running" && outcome.status !== "waiting";
+/**
+ * Public turn error codes of the OpenAI Agents API (`SessionTurnError.code` in
+ * openai@7.15.0). Supervisors fail a job with one of these; other strings reach
+ * the client as `internal_error` with the string as the message.
+ */
+export const TURN_ERROR_CODES = [
+  "context_length_exceeded",
+  "session_budget_exceeded",
+  "usage_limit_exceeded",
+  "rate_limit_exceeded",
+  "server_overloaded",
+  "cyber_policy",
+  "connection_failed",
+  "server_error",
+  "authentication_error",
+  "invalid_request",
+  "resource_not_found",
+  "sandbox_error",
+  "executor_version_incompatible",
+  "active_turn_not_steerable",
+  "request_timeout",
+  "internal_error",
+] as const;
+export type TurnErrorCode = (typeof TURN_ERROR_CODES)[number];
+
 /** Retained native events per execution, including streamed deltas and completed items. */
 export const EVENT_LOG_LIMIT = 8_000_000;
 

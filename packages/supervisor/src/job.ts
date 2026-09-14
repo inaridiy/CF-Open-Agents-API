@@ -10,6 +10,7 @@ import {
 import {
   ApiError,
   type Execution,
+  type InputMessage,
   io,
   type JsonValue,
   OperationError,
@@ -149,6 +150,16 @@ export abstract class ToolJob implements NativeJob {
   }
   protected abstract open(bundle?: unknown): Promise<void>;
   protected abstract closeRuntime(): Promise<void>;
+  /**
+   * Deliver input to the running native turn. Runtimes that can queue or inject
+   * messages override this; the default rejects, which the HarnessDO reports as
+   * `command_rejected` so the Worker re-queues the message as the next turn.
+   */
+  protected steer(_input: InputMessage[]): Promise<void> {
+    return Promise.reject(
+      new ApiError(409, "command_rejected", "This harness cannot steer an active turn"),
+    );
+  }
   protected async prepare(bundle?: unknown): Promise<string | undefined> {
     await rm(this.home, { recursive: true, force: true });
     await mkdir(this.home, { recursive: true });
@@ -439,8 +450,17 @@ export abstract class ToolJob implements NativeJob {
   private apply(operationId: string, command: RuntimeCommand, content: ToolResult["content"]) {
     return Effect.gen(this, function* () {
       const rejected = (message: string) => new ApiError(409, "command_rejected", message);
-      if (command.type === "steer")
-        return yield* rejected("This harness cannot steer an active turn");
+      if (command.type === "steer") {
+        if (this.closing || !["running", "waiting"].includes(this.status))
+          return yield* rejected("Turn is no longer active");
+        return yield* io("native.steer", () => this.steer(command.input)).pipe(
+          Effect.mapError((error) =>
+            error instanceof OperationError && error.cause instanceof ApiError
+              ? error.cause
+              : error,
+          ),
+        );
+      }
       if (command.type === "cancel") {
         // Idempotent: closing marks the outcome cancelled unless it is already terminal.
         yield* this.stopped;
