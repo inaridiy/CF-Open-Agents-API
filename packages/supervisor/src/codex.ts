@@ -15,13 +15,105 @@ import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
 import { AppServer, type RpcMessage } from "./json-rpc.js";
-import { describeFailure, JobLifecycle, Operations, once } from "./lifecycle.js";
+import {
+  describeFailure,
+  JobLifecycle,
+  Operations,
+  once,
+  type TurnErrorCode,
+} from "./lifecycle.js";
 import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
 import { executeWorkspace } from "./workspace.js";
 
 const threadResponse = z.object({ thread: z.object({ id: z.string() }) });
 const turnResponse = z.object({ turn: z.object({ id: z.string() }) });
 const toolCall = z.object({ callId: z.string(), tool: z.string(), arguments: z.json() });
+/** EXPERIMENTAL `item/tool/requestUserInput` server request (ToolRequestUserInputParams). */
+const userInputRequest = z.object({
+  itemId: z.string(),
+  questions: z.array(
+    z.object({
+      id: z.string(),
+      header: z.string(),
+      question: z.string(),
+      options: z
+        .array(z.object({ label: z.string(), description: z.string() }))
+        .nullable()
+        .optional(),
+    }),
+  ),
+});
+/**
+ * Translate Codex's `TurnError.codexErrorInfo` (a camelCase enum string, or a
+ * single-key object such as `{ httpConnectionFailed: { httpStatusCode } }`) to the
+ * public `SessionTurnError.code` vocabulary. Unknown variants are `internal_error`.
+ */
+export function turnErrorCode(info: unknown, message = ""): TurnErrorCode {
+  const variant =
+    typeof info === "string"
+      ? info
+      : info && typeof info === "object"
+        ? Object.keys(info)[0]
+        : undefined;
+  const detail =
+    info && typeof info === "object" && variant
+      ? (info as Record<string, { httpStatusCode?: number | null } | undefined>)[variant]
+      : undefined;
+  switch (variant) {
+    case "contextWindowExceeded":
+      return "context_length_exceeded";
+    case "sessionBudgetExceeded":
+      return "session_budget_exceeded";
+    case "usageLimitExceeded":
+      return "usage_limit_exceeded";
+    case "rateLimitExceeded":
+      return "rate_limit_exceeded";
+    case "serverOverloaded":
+      return "server_overloaded";
+    case "cyberPolicy":
+    case "misalignmentPolicyViolation":
+      return "cyber_policy";
+    case "httpConnectionFailed":
+    case "responseStreamConnectionFailed":
+    case "responseStreamDisconnected":
+    case "responseTooManyFailedAttempts":
+      // Codex reports the upstream HTTP status it gave up on; that status is
+      // more informative than the transport wrapper (e.g. 429 after retries).
+      return httpStatusCode(detail?.httpStatusCode ?? undefined) ?? "connection_failed";
+    case "internalServerError":
+      return "server_error";
+    case "unauthorized":
+      return "authentication_error";
+    case "badRequest":
+      return "invalid_request";
+    case "sandboxError":
+      return "sandbox_error";
+    case "activeTurnNotSteerable":
+      return "active_turn_not_steerable";
+    default:
+      // Codex 0.154.0 classifies most provider HTTP failures as `other` and keeps
+      // the status and upstream body in the message; recover the public code from it.
+      return messageErrorCode(message) ?? "internal_error";
+  }
+}
+function httpStatusCode(status: number | undefined): TurnErrorCode | undefined {
+  if (status === undefined) return undefined;
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 404) return "resource_not_found";
+  if (status === 429) return "rate_limit_exceeded";
+  if (status === 503 || status === 529) return "server_overloaded";
+  if (status >= 500) return "server_error";
+  if (status === 400 || status === 422) return "invalid_request";
+  return undefined;
+}
+function messageErrorCode(message: string): TurnErrorCode | undefined {
+  if (/context_length_exceeded|context[ _]window|exceeds the context/i.test(message))
+    return "context_length_exceeded";
+  if (/insufficient_quota|usage_limit_reached|usage_not_included/i.test(message))
+    return "usage_limit_exceeded";
+  const status = /\bstatus:?\s*(\d{3})\b/i.exec(message)?.[1];
+  return status ? httpStatusCode(Number(status)) : undefined;
+}
 const tokenUsage = z.object({
   inputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
@@ -82,7 +174,24 @@ export interface CodexOptions {
   delegateUrl?: string;
   /** Bounds for delegate round trips; tests shorten them. */
   delegationTimeouts?: DelegationOptions["timeouts"];
+  /**
+   * Deployment-owned additions to the generated Codex config: extra `[features]`
+   * flags and `[model_providers.gateway]` keys such as retry counts. Values are
+   * written as TOML literals; they cannot change the provider URL or auth.
+   */
+  codexConfig?: {
+    features?: Record<string, boolean>;
+    provider?: Record<string, string | number | boolean>;
+  };
 }
+const RESERVED_PROVIDER_KEYS = new Set(["name", "base_url", "wire_api", "requires_openai_auth"]);
+const tomlLines = (
+  entries: Record<string, string | number | boolean> | undefined,
+  reserved = new Set<string>(),
+) =>
+  Object.entries(entries ?? {})
+    .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && !reserved.has(key))
+    .map(([key, value]) => `${key} = ${JSON.stringify(value)}`);
 
 /** One instance per attempt. Workspace I/O goes through the remote environment. */
 export class CodexJob {
@@ -217,6 +326,7 @@ export class CodexJob {
         )
           ? ["tool_search = true"]
           : []),
+        ...tomlLines(this.options.codexConfig?.features),
         "[agents]",
         `max_concurrent_threads_per_session = ${this.execution.agent.multi_agent?.max_concurrent_subagents ?? 6}`,
         "[model_providers.gateway]",
@@ -224,6 +334,7 @@ export class CodexJob {
         `base_url = ${JSON.stringify(this.options.modelBaseUrl)}`,
         'wire_api = "responses"',
         "requires_openai_auth = false",
+        ...tomlLines(this.options.codexConfig?.provider, RESERVED_PROVIDER_KEYS),
       ].join("\n"),
     );
     await writeFile(
@@ -755,7 +866,38 @@ export class CodexJob {
           name: parsed.data.tool,
           arguments: parsed.data.arguments,
         });
-      } else this.server?.reject(message.id);
+      } else if (message.method === "item/tool/requestUserInput") {
+        // EXPERIMENTAL Codex tool: no interactive client sits behind this API.
+        // Surface the questions as commentary and decline each one so the model
+        // continues with its own judgment instead of failing the turn.
+        const parsed = userInputRequest.safeParse(message.params);
+        if (!parsed.success) {
+          this.server?.reject(message.id);
+          return;
+        }
+        const { itemId, questions } = parsed.data;
+        this.push({
+          ...scope,
+          type: "text",
+          id: `user_input:${itemId}`,
+          phase: "commentary",
+          text: [
+            "The agent asked for user input; this API cannot collect it interactively, so every question was declined:",
+            ...questions.map((question) => {
+              const options = question.options?.length
+                ? ` Options: ${question.options.map((option) => option.label).join(", ")}.`
+                : "";
+              return `- ${question.header}: ${question.question}${options}`;
+            }),
+          ].join("\n"),
+        });
+        this.server?.respond(message.id, {
+          answers: Object.fromEntries(questions.map((question) => [question.id, { answers: [] }])),
+        });
+      } else {
+        this.options.diagnostics(`Rejected unsupported app-server request: ${message.method}`);
+        this.server?.reject(message.id);
+      }
       return;
     }
     if (message.method === "item/agentMessage/delta") {
@@ -816,7 +958,14 @@ export class CodexJob {
         .object({
           turn: z.object({
             status: z.string(),
-            error: z.object({ message: z.string() }).nullable().optional(),
+            error: z
+              .object({
+                message: z.string(),
+                codexErrorInfo: z.unknown().optional(),
+                additionalDetails: z.string().nullable().optional(),
+              })
+              .nullable()
+              .optional(),
           }),
         })
         .safeParse(message.params);
@@ -828,11 +977,15 @@ export class CodexJob {
         this.rootOutcome = this.cancelRequested ? "cancelled" : "completed";
       else if (result.data.turn.status === "interrupted") this.rootOutcome = "cancelled";
       else {
-        // The public error is a stable code; the native message goes to diagnostics.
+        // The public error is a stable Agents API code; the native detail goes to diagnostics.
+        const error = result.data.turn.error;
+        const code = turnErrorCode(error?.codexErrorInfo, error?.message ?? "");
         this.options.diagnostics(
-          `native_turn_failed: ${result.data.turn.error?.message ?? result.data.turn.status}`,
+          `native_turn_failed (${code}): ${error?.message ?? result.data.turn.status}${
+            error?.additionalDetails ? ` | ${error.additionalDetails}` : ""
+          } codexErrorInfo=${JSON.stringify(error?.codexErrorInfo ?? null)}`,
         );
-        this.lifecycle.fail("native_turn_failed");
+        this.lifecycle.fail(code);
       }
       this.finishIfReady();
     }
