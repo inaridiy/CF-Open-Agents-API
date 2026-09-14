@@ -8,7 +8,11 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, expect, it } from "vitest";
 
-import type { Execution, RuntimeEvent } from "../../packages/agent-api/src/index.js";
+import {
+  type Execution,
+  type RuntimeEvent,
+  runPromise,
+} from "../../packages/agent-api/src/index.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
 const cleanup: (() => Promise<unknown>)[] = [];
@@ -154,24 +158,26 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
     diagnostics: (line: string) => diagnostics.push(line),
   };
   const job = new CodexJob(execution, options);
-  cleanup.push(() => job.stop());
-  await job.start();
+  cleanup.push(() => runPromise(job.stop()));
+  await runPromise(job.start());
   let after = 0;
   const events: RuntimeEvent[] = [];
   for (let attempt = 0; attempt < 300; attempt++) {
-    const batch = job.poll(after);
+    const batch = await runPromise(job.poll(after));
     events.push(...batch.events.map((entry) => entry.event));
     after = batch.cursor;
     if (batch.status === "waiting") {
       const call = batch.events.find((entry) => entry.event.type === "function_call")?.event;
       if (call?.type !== "function_call") throw new Error("Missing native function call");
       expect(call.name).toBe("lookup");
-      await job.control("tool-result", {
-        type: "tool_result",
-        callId: call.callId,
-        success: true,
-        output: "external-tool-value",
-      });
+      await runPromise(
+        job.control("tool-result", {
+          type: "tool_result",
+          callId: call.callId,
+          success: true,
+          output: "external-tool-value",
+        }),
+      );
     } else if (batch.status !== "running") {
       expect(batch.status, diagnostics.join("\n")).toBe("completed");
       break;
@@ -185,7 +191,7 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
   expect(await readFile(join(sandbox, "proof.txt"), "utf8")).toBe("isolated");
   expect(requests.length).toBeGreaterThanOrEqual(3);
   expect(JSON.stringify(requests.at(-1)?.input)).toContain("external-tool-value");
-  const bundle = await job.checkpoint();
+  const bundle = await runPromise(job.checkpoint());
   expect(Object.keys(bundle.files).some((file) => file.includes("sessions/"))).toBe(true);
   await rm(job.home, { recursive: true, force: true });
   const resumed = new CodexJob(
@@ -197,10 +203,14 @@ it("runs native Codex shell calls in the separate exec-server workspace and rest
     },
     options,
   );
-  cleanup.push(() => resumed.stop());
-  await resumed.start(bundle);
-  for (let attempt = 0; attempt < 300 && resumed.poll(0).status === "running"; attempt++)
+  cleanup.push(() => runPromise(resumed.stop()));
+  await runPromise(resumed.start(bundle));
+  for (
+    let attempt = 0;
+    attempt < 300 && (await runPromise(resumed.poll(0))).status === "running";
+    attempt++
+  )
     await delay(100);
-  expect(resumed.poll(0).status, diagnostics.join("\n")).toBe("completed");
+  expect((await runPromise(resumed.poll(0))).status, diagnostics.join("\n")).toBe("completed");
   expect(JSON.stringify(requests.at(-1)?.input)).toContain("Run the command");
 });

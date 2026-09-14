@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -106,7 +106,6 @@ export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>)
 
 export class OpenCodeJob extends ToolJob {
   readonly home: string;
-  private child?: ChildProcess;
   private client?: Client;
   private format?: OutputFormat;
   private variant?: string;
@@ -272,7 +271,8 @@ export class OpenCodeJob extends ToolJob {
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
-    this.child = child;
+    // The job's resources own the server process: closing them terminates it (SIGTERM, 5 s, SIGKILL).
+    await this.own(child, "5 seconds");
     child.stderr?.on("data", (data) => this.options.diagnostics(String(data)));
     child.once("exit", () => {
       if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
@@ -763,17 +763,9 @@ export class OpenCodeJob extends ToolJob {
     const scope = this.toolScope.getStore();
     super.emit(scope && event.type === "function_call" ? { ...event, ...scope } : event);
   }
+  /** The server process itself is terminated by the resource Scope that owns it. */
   protected async closeRuntime(): Promise<void> {
     await chmod(join(this.home, "config", "opencode"), 0o755).catch(() => {});
-    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const exited = once(this.child, "exit");
-    this.child.kill("SIGTERM");
-    const force = setTimeout(() => this.child?.kill("SIGKILL"), 5000);
-    try {
-      await exited;
-    } finally {
-      clearTimeout(force);
-    }
   }
 }
 

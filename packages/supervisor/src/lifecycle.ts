@@ -1,20 +1,56 @@
 import {
   ApiError,
   canonicalJSON,
-  io,
   OperationError,
   type RuntimeBatch,
   type RuntimeEvent,
-  runSync,
   type ServiceError,
 } from "cf-open-agents-api";
-import { Cause, Chunk, Effect, Ref, SynchronizedRef } from "effect";
+import {
+  Cause,
+  Chunk,
+  Data,
+  Deferred,
+  Duration,
+  Effect,
+  FiberId,
+  MutableRef,
+  Ref,
+  SynchronizedRef,
+} from "effect";
 
 /** Native failure detail for diagnostics; the public batch error stays a stable code. */
 export function describeFailure(value: unknown): string {
   const squashed = Cause.isCause(value) ? Cause.squash(value) : value;
   const reason = squashed instanceof OperationError ? squashed.cause : squashed;
   return reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+}
+
+/** The event cursor does not address the retained log. */
+export class InvalidCursor extends Data.TaggedError("InvalidCursor")<{}> {
+  override get message(): string {
+    return "Invalid event cursor";
+  }
+}
+/** The job was stopped; pending calls and late starts are refused. */
+export class ExecutionStopped extends Data.TaggedError("ExecutionStopped")<{}> {
+  override get message(): string {
+    return "Execution stopped";
+  }
+}
+/** The turn was cancelled while a call was outstanding. */
+export class ExecutionCancelled extends Data.TaggedError("ExecutionCancelled")<{}> {
+  override get message(): string {
+    return "Execution cancelled";
+  }
+}
+/** A checkpoint was requested before the native turn completed. */
+export class CheckpointUnavailable extends Data.TaggedError("CheckpointUnavailable")<{
+  readonly reason: string;
+}> {
+  override get message(): string {
+    return this.reason;
+  }
 }
 
 type Outcome =
@@ -59,64 +95,89 @@ export type TurnErrorCode = (typeof TURN_ERROR_CODES)[number];
 /** Retained native events per execution, including streamed deltas and completed items. */
 export const EVENT_LOG_LIMIT = 8_000_000;
 
-/** All native callbacks share one atomic, immutable state. Terminal outcomes are absorbing. */
-export class JobLifecycle {
-  private readonly state = Ref.unsafeMake<JobState>({
+/**
+ * An edge trigger between callback land and fibers: `notify()` is synchronous (native
+ * SDK callbacks have no fiber), `wait()` suspends until the next notification.
+ * Capture `wait()` before reading the state it guards, so a change that lands after
+ * the read completes that exact deferred and no wake-up is lost.
+ */
+export class Wake {
+  private pending = Deferred.unsafeMake<void>(FiberId.none);
+  wait(): Effect.Effect<void> {
+    return Deferred.await(this.pending);
+  }
+  notify(): void {
+    const current = this.pending;
+    this.pending = Deferred.unsafeMake<void>(FiberId.none);
+    Deferred.unsafeDone(current, Effect.void);
+  }
+}
+
+/**
+ * The retained event log and outcome of one job. Native callbacks mutate it
+ * synchronously (they run outside any fiber); readers `poll` as an Effect that
+ * can wait for the next change. Terminal outcomes are absorbing.
+ */
+export class JobLog {
+  private readonly state = MutableRef.make<JobState>({
     outcome: { status: "running" },
     cancelling: false,
     closing: false,
     events: Chunk.empty(),
     bytes: 0,
   });
-  readonly transition = Effect.unsafeMakeSemaphore(1);
+  private readonly wake = new Wake();
   get status() {
-    return runSync(Ref.get(this.state)).outcome.status;
+    return MutableRef.get(this.state).outcome.status;
   }
   get closing() {
-    return runSync(Ref.get(this.state)).closing;
+    return MutableRef.get(this.state).closing;
   }
   /** Cancellation was requested; the log still accepts the runtime's final events. */
   get cancelling() {
-    return runSync(Ref.get(this.state)).cancelling;
+    return MutableRef.get(this.state).cancelling;
+  }
+  private update(f: (state: JobState) => JobState): void {
+    const before = MutableRef.get(this.state);
+    const after = f(before);
+    if (after === before) return;
+    MutableRef.set(this.state, after);
+    this.wake.notify();
   }
   setStatus(status: "running" | "waiting" | "completed" | "cancelled"): void {
-    runSync(
-      Ref.update(this.state, (state) => {
-        if (terminal(state.outcome) || state.closing) return state;
-        // Once cancellation is requested, a task that finishes because its children
-        // were cancelled reads as cancelled, and progress transitions are ignored.
-        if (state.cancelling)
-          return status === "completed" || status === "cancelled"
-            ? { ...state, outcome: { status: "cancelled" as const } }
-            : state;
-        return { ...state, outcome: { status } };
-      }),
-    );
+    this.update((state) => {
+      if (terminal(state.outcome) || state.closing) return state;
+      // Once cancellation is requested, a task that finishes because its children
+      // were cancelled reads as cancelled, and progress transitions are ignored.
+      if (state.cancelling)
+        return status === "completed" || status === "cancelled"
+          ? { ...state, outcome: { status: "cancelled" as const } }
+          : state;
+      return { ...state, outcome: { status } };
+    });
   }
   /** Completion can no longer seal the job; events are recorded until `close()`. */
   requestCancel(): void {
-    runSync(
-      Ref.update(this.state, (state) =>
-        terminal(state.outcome) || state.closing ? state : { ...state, cancelling: true },
-      ),
+    this.update((state) =>
+      terminal(state.outcome) || state.closing ? state : { ...state, cancelling: true },
     );
   }
   fail(error: string): void {
-    runSync(
-      Ref.update(this.state, (state) =>
-        terminal(state.outcome) || state.closing
-          ? state
-          : { ...state, outcome: { status: "failed" as const, error } },
-      ),
+    this.update((state) =>
+      terminal(state.outcome) || state.closing
+        ? state
+        : { ...state, outcome: { status: "failed" as const, error } },
     );
   }
   close(): void {
-    runSync(
-      Ref.update(this.state, (state) => ({
-        ...state,
-        closing: true,
-        outcome: terminal(state.outcome) ? state.outcome : { status: "cancelled" as const },
-      })),
+    this.update((state) =>
+      state.closing
+        ? state
+        : {
+            ...state,
+            closing: true,
+            outcome: terminal(state.outcome) ? state.outcome : { status: "cancelled" as const },
+          },
     );
   }
   /**
@@ -125,30 +186,22 @@ export class JobLifecycle {
    * limit fails the job with `native_output_limit`; callers stop the runtime.
    */
   emit(event: RuntimeEvent): boolean {
-    return runSync(
-      Ref.modify(this.state, (state) => {
-        if (terminal(state.outcome) || state.closing) return [false, state] as const;
-        const bytes = state.bytes + new TextEncoder().encode(JSON.stringify(event)).byteLength;
-        if (bytes > EVENT_LOG_LIMIT)
-          return [
-            false,
-            { ...state, outcome: { status: "failed" as const, error: "native_output_limit" } },
-          ] as const;
-        return [
-          true,
-          {
-            ...state,
-            bytes,
-            events: Chunk.append(state.events, { seq: state.events.length + 1, event }),
-          },
-        ] as const;
-      }),
-    );
+    let retained = false;
+    this.update((state) => {
+      if (terminal(state.outcome) || state.closing) return state;
+      const bytes = state.bytes + new TextEncoder().encode(JSON.stringify(event)).byteLength;
+      if (bytes > EVENT_LOG_LIMIT)
+        return { ...state, outcome: { status: "failed" as const, error: "native_output_limit" } };
+      retained = true;
+      return {
+        ...state,
+        bytes,
+        events: Chunk.append(state.events, { seq: state.events.length + 1, event }),
+      };
+    });
+    return retained;
   }
-  poll(after: number): RuntimeBatch {
-    const state = runSync(Ref.get(this.state));
-    if (!Number.isSafeInteger(after) || after < 0 || after > state.events.length)
-      throw new Error("Invalid event cursor");
+  private page(state: JobState, after: number): RuntimeBatch {
     const events = Chunk.toArray(Chunk.take(Chunk.drop(state.events, after), 128));
     const more = after + events.length < state.events.length;
     return {
@@ -157,6 +210,27 @@ export class JobLifecycle {
       status: more ? "running" : state.outcome.status,
       ...(state.outcome.status === "failed" ? { error: state.outcome.error } : {}),
     };
+  }
+  /**
+   * Events after `after`. Returns at once when there are any or the outcome is
+   * terminal; otherwise waits up to `wait` for the next change before answering.
+   */
+  poll(
+    after: number,
+    wait: Duration.DurationInput = 0,
+  ): Effect.Effect<RuntimeBatch, InvalidCursor> {
+    return Effect.gen(this, function* () {
+      const woken = this.wake.wait();
+      let state = MutableRef.get(this.state);
+      if (!Number.isSafeInteger(after) || after < 0 || after > state.events.length)
+        return yield* new InvalidCursor();
+      const news = state.events.length > after || terminal(state.outcome);
+      if (!news && Duration.toMillis(Duration.decode(wait)) > 0) {
+        yield* woken.pipe(Effect.timeoutOption(wait));
+        state = MutableRef.get(this.state);
+      }
+      return this.page(state, after);
+    });
   }
 }
 
@@ -186,12 +260,12 @@ export class Operations {
   }
 }
 
-/** Join concurrent reads/cleanup, cache success, allow retry after a failed attempt. */
-export function once<A>(operation: string, f: () => Promise<A>) {
+/** Join concurrent callers, cache success, allow retry after a failed attempt. */
+export function once<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
   const value = SynchronizedRef.unsafeMake<{ readonly value: A } | undefined>(undefined);
   return SynchronizedRef.modifyEffect(value, (saved) =>
     saved
       ? Effect.succeed([saved.value, saved] as const)
-      : io(operation, f).pipe(Effect.map((value) => [value, { value }] as const)),
+      : effect.pipe(Effect.map((value) => [value, { value }] as const)),
   );
 }

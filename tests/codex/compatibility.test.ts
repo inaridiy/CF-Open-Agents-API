@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { expect, it } from "vitest";
 
+import { runPromise } from "../../packages/agent-api/src/index.js";
 import { constrainCodexSearch } from "../../packages/agent-api/src/models/codex-search.js";
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
@@ -185,22 +186,28 @@ it.each(["configured", "defaults"] as const)(
     const job = new CodexJob(execution, options);
     let resumed: CodexJob | undefined;
     try {
-      await job.start().catch((error: unknown) => {
+      await runPromise(job.start()).catch((error: unknown) => {
         throw new Error(diagnostics.join("\n"), { cause: error });
       });
-      await expect.poll(() => job.poll(0).status).toBe("waiting");
-      await job.control("result", {
-        type: "tool_result",
-        callId: "lookup",
-        success: true,
-        output: [
-          { type: "input_text", text: "Image tool result" },
-          { type: "input_image", image_url: imageUrl },
-        ],
-      });
-      for (let i = 0; i < 300 && ["running", "waiting"].includes(job.poll(0).status); i++)
+      await expect.poll(async () => (await runPromise(job.poll(0))).status).toBe("waiting");
+      await runPromise(
+        job.control("result", {
+          type: "tool_result",
+          callId: "lookup",
+          success: true,
+          output: [
+            { type: "input_text", text: "Image tool result" },
+            { type: "input_image", image_url: imageUrl },
+          ],
+        }),
+      );
+      for (
+        let i = 0;
+        i < 300 && ["running", "waiting"].includes((await runPromise(job.poll(0))).status);
+        i++
+      )
         await delay(20);
-      const batch = job.poll(0);
+      const batch = await runPromise(job.poll(0));
       expect(batch.status, diagnostics.join("\n")).toBe("completed");
       const events = batch.events.map(({ event }) => event);
       expect(events.find((event) => event.type === "reasoning_delta")).toMatchObject({
@@ -239,7 +246,7 @@ it.each(["configured", "defaults"] as const)(
             }
           : {}),
       });
-      const bundle = await job.checkpoint();
+      const bundle = await runPromise(job.checkpoint());
       await rm(job.home, { recursive: true, force: true });
       resumed = new CodexJob(
         {
@@ -250,19 +257,19 @@ it.each(["configured", "defaults"] as const)(
         },
         options,
       );
-      await resumed.start(bundle);
-      for (let i = 0; i < 300 && resumed.poll(0).status === "running"; i++) await delay(20);
-      expect(resumed.poll(0).status, diagnostics.join("\n")).toBe("completed");
+      await runPromise(resumed.start(bundle));
+      for (let i = 0; i < 300 && (await runPromise(resumed.poll(0))).status === "running"; i++)
+        await delay(20);
+      expect((await runPromise(resumed.poll(0))).status, diagnostics.join("\n")).toBe("completed");
       expect(
-        resumed
-          .poll(0)
-          .events.filter(({ event }) => event.type === "usage")
+        (await runPromise(resumed.poll(0))).events
+          .filter(({ event }) => event.type === "usage")
           .at(-1)?.event,
       ).toMatchObject({ usage: { total_tokens: 15 } });
       expect(JSON.stringify(requests.at(-1)?.input)).toContain("Image tool result");
     } finally {
-      await resumed?.stop();
-      await job.stop();
+      if (resumed) await runPromise(resumed.stop());
+      await runPromise(job.stop());
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { recursive: true, force: true });

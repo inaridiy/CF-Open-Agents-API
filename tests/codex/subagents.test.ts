@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { expect, it } from "vitest";
 
+import { runPromise } from "../../packages/agent-api/src/index.js";
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
@@ -129,40 +130,40 @@ it.each(["complete", "cancel", "immediate"])(
     const job = new CodexJob(execution, options);
     let resumed: CodexJob | undefined;
     try {
-      await job.start();
+      await runPromise(job.start());
       for (
         let i = 0;
         i < 200 &&
-        !job
-          .poll(0)
-          .events.some(({ event }) => event.type === "text" && event.text === "root result");
+        !(await runPromise(job.poll(0))).events.some(
+          ({ event }) => event.type === "text" && event.text === "root result",
+        );
         i++
       )
         await delay(25);
       if (outcome !== "immediate")
-        expect(job.poll(0).status, diagnostics.join("\n")).toBe("running");
+        expect((await runPromise(job.poll(0))).status, diagnostics.join("\n")).toBe("running");
       // The child's turn notification and the root's final text are independent
       // app-server events; the child turn is asserted once it has been projected.
-      const childTurnSeen = () =>
-        job.poll(0).events.some(({ event }) => event.type === "subagent_turn");
-      for (let i = 0; i < 200 && !childTurnSeen(); i++) await delay(25);
-      expect(childTurnSeen(), diagnostics.join("\n")).toBe(true);
+      const childTurnSeen = async () =>
+        (await runPromise(job.poll(0))).events.some(({ event }) => event.type === "subagent_turn");
+      for (let i = 0; i < 200 && !(await childTurnSeen()); i++) await delay(25);
+      expect(await childTurnSeen(), diagnostics.join("\n")).toBe(true);
       if (outcome === "cancel") {
-        await job.control("cancel-after-root", { type: "cancel" });
-        for (let i = 0; i < 200 && job.poll(0).status === "running"; i++) await delay(25);
-        expect(job.poll(0).status, diagnostics.join("\n")).toBe("cancelled");
+        await runPromise(job.control("cancel-after-root", { type: "cancel" }));
+        for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
+          await delay(25);
+        expect((await runPromise(job.poll(0))).status, diagnostics.join("\n")).toBe("cancelled");
         expect(
-          job
-            .poll(0)
-            .events.some(
-              ({ event }) => event.type === "subagent_turn" && event.status === "cancelled",
-            ),
+          (await runPromise(job.poll(0))).events.some(
+            ({ event }) => event.type === "subagent_turn" && event.status === "cancelled",
+          ),
         ).toBe(true);
         return;
       }
       releaseChild?.();
-      for (let i = 0; i < 200 && job.poll(0).status === "running"; i++) await delay(25);
-      const batch = job.poll(0);
+      for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
+        await delay(25);
+      const batch = await runPromise(job.poll(0));
       expect(batch.status, diagnostics.join("\n")).toBe("completed");
       expect(
         batch.events.some(
@@ -182,7 +183,7 @@ it.each(["complete", "cancel", "immediate"])(
           ?.event,
       ).toMatchObject({ subagentId: child.id });
       expect(requests[0]?.reasoning).toMatchObject({ effort: "high" });
-      const bundle = await job.checkpoint();
+      const bundle = await runPromise(job.checkpoint());
       expect(bundle.files["cf-subagents.json"]).toBeDefined();
       await rm(job.home, { recursive: true, force: true });
       resumed = new CodexJob(
@@ -196,14 +197,15 @@ it.each(["complete", "cancel", "immediate"])(
         },
         options,
       );
-      await resumed.start(bundle);
-      for (let i = 0; i < 200 && resumed.poll(0).status === "running"; i++) await delay(25);
-      expect(resumed.poll(0).status, diagnostics.join("\n")).toBe("completed");
+      await runPromise(resumed.start(bundle));
+      for (let i = 0; i < 200 && (await runPromise(resumed.poll(0))).status === "running"; i++)
+        await delay(25);
+      expect((await runPromise(resumed.poll(0))).status, diagnostics.join("\n")).toBe("completed");
       expect(JSON.stringify(requests.at(-1)?.input)).toContain("spawn_agent");
     } finally {
       releaseChild?.();
-      await resumed?.stop();
-      await job.stop();
+      if (resumed) await runPromise(resumed.stop());
+      await runPromise(job.stop());
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { recursive: true, force: true });

@@ -1,27 +1,27 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { Execution, RuntimeBatch, RuntimeCommand, RuntimeEvent } from "cf-open-agents-api";
+import type { Execution, RuntimeCommand } from "cf-open-agents-api";
 import {
   ApiError,
+  attempt,
   io,
   type JsonValue,
+  OperationError,
   programmaticTool,
-  runPromise,
-  runSync,
   workspaceTools,
 } from "cf-open-agents-api";
-import { Deferred, Effect, Ref } from "effect";
+import { Deferred, Effect, type Scope, Stream } from "effect";
 import { z } from "zod";
 
-import { capture, type NativeBundle, restore } from "./checkpoint.js";
-import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
-import { AppServer, RpcError, type RpcMessage } from "./json-rpc.js";
+import { restore } from "./checkpoint.js";
+import { DELEGATION_TOOLS } from "./delegation.js";
+import { Job, type JobOptions, type ToolError, ToolUnavailable } from "./job.js";
+import { AppServer, type RpcFailure, type RpcMessage } from "./json-rpc.js";
 import {
   describeFailure,
-  JobLifecycle,
-  Operations,
-  once,
+  ExecutionCancelled,
+  ExecutionStopped,
   type TurnErrorCode,
 } from "./lifecycle.js";
 import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
@@ -166,16 +166,9 @@ type ChildState = z.infer<typeof childStateSchema>;
 const childId = (id: string) => `subagent_${id.replaceAll("-", "")}`;
 const childTurnId = (id: string) => `turn_${id.replaceAll("-", "")}`;
 
-export interface CodexOptions {
+export interface CodexOptions extends JobOptions {
   binary: string;
-  directory: string;
   modelBaseUrl: string;
-  sandboxUrl: string;
-  diagnostics: (line: string) => void;
-  programmaticUrl?: string;
-  delegateUrl?: string;
-  /** Bounds for delegate round trips; tests shorten them. */
-  delegationTimeouts?: DelegationOptions["timeouts"];
   /**
    * Deployment-owned additions to the generated Codex config: extra `[features]`
    * flags and `[model_providers.gateway]` keys such as retry counts. Values are
@@ -196,7 +189,7 @@ const tomlLines = (
     .map(([key, value]) => `${key} = ${JSON.stringify(value)}`);
 
 /** One instance per attempt. Workspace I/O goes through the remote environment. */
-export class CodexJob {
+export class CodexJob extends Job {
   private server?: AppServer;
   private threadId = "";
   private nativeTurnId = "";
@@ -207,14 +200,7 @@ export class CodexJob {
     string,
     { lastTotal: string; usage: z.infer<typeof tokenUsage> }
   >();
-  private readonly lifecycle = new JobLifecycle();
-  get status() {
-    return this.lifecycle.status;
-  }
-  private get closing() {
-    return this.lifecycle.closing;
-  }
-  private readonly pendingTools = Ref.unsafeMake(new Map<string, string | number>());
+  private readonly pendingTools = new Map<string, string | number>();
   private readonly codeInvocations = new Map<
     string,
     {
@@ -223,146 +209,84 @@ export class CodexJob {
       mcp: Map<string, { server: string; name: string; schema: Record<string, JsonValue> }>;
     }
   >();
-  private readonly pendingCode = new Map<string, Deferred.Deferred<JsonValue, Error>>();
-  private readonly codeAbort = new AbortController();
-  private readonly delegations: Delegations;
-  private readonly operations = new Operations();
-  private readonly saved = once("codex.checkpoint", async () => {
-    if (this.status !== "completed") throw new Error("Only completed turns can be checkpointed");
-    await this.stop();
-    await writeFile(
-      join(this.home, "cf-subagents.json"),
-      JSON.stringify({ version: 1, children: Object.fromEntries(this.children) }),
-    );
-    return capture(this.home, this.threadId);
-  });
-  private readonly stopped = once("codex.stop", async () => {
-    // Children are told first, while their terminal events are still recorded; a
-    // root that settles meanwhile reads as cancelled, never completed.
-    this.lifecycle.requestCancel();
-    await this.delegations.cancelAll();
-    this.lifecycle.close();
-    this.codeAbort.abort();
-    for (const pending of this.pendingCode.values())
-      runSync(Deferred.fail(pending, new Error("Execution stopped")));
-    this.pendingCode.clear();
-    await this.server?.stop();
-  });
+  private readonly pendingCode = new Map<
+    string,
+    Deferred.Deferred<JsonValue, ExecutionStopped | ExecutionCancelled>
+  >();
   readonly home: string;
   constructor(
-    readonly execution: Execution,
-    private readonly options: CodexOptions,
+    execution: Execution,
+    protected override readonly options: CodexOptions,
   ) {
+    super(execution, options);
     // Native SQLite stores absolute rollout paths. Keep CODEX_HOME stable across attempts.
     this.home = join(options.directory, "codex");
-    this.delegations = new Delegations(execution, {
-      endpoint: options.delegateUrl ?? "http://delegate.internal",
-      signal: this.codeAbort.signal,
-      emit: (event) => this.push(event),
-      fail: (error) => {
-        this.lifecycle.fail(error);
-        void this.stop().catch(options.diagnostics);
-      },
-      settled: () => this.finishIfReady(),
-      diagnostics: options.diagnostics,
-      ...(options.delegationTimeouts ? { timeouts: options.delegationTimeouts } : {}),
-    });
   }
-  start(bundle?: unknown): Promise<void> {
-    return runPromise(
-      this.lifecycle.transition.withPermits(1)(
-        io("codex.start", async () => {
-          if (this.closing) throw new Error("Execution has stopped");
-          await this.open(bundle);
-        }).pipe(
-          Effect.onError((cause) =>
-            Effect.sync(() => this.failStart(cause)).pipe(
-              Effect.zipRight(this.stopped.pipe(Effect.orDie)),
-            ),
-          ),
-        ),
+  protected get thread() {
+    return this.threadId || undefined;
+  }
+  protected override settled(): void {
+    this.finishIfReady();
+  }
+  /** Native subagent records ride along with the thread so a resumed turn can attribute them. */
+  protected override beforeCapture() {
+    return io("codex.subagents", () =>
+      writeFile(
+        join(this.home, "cf-subagents.json"),
+        JSON.stringify({ version: 1, children: Object.fromEntries(this.children) }),
       ),
     );
   }
-  private async open(bundle?: unknown): Promise<void> {
-    await rm(this.home, { recursive: true, force: true });
-    await mkdir(this.home, { recursive: true });
-    const previousThread = bundle ? await restore(this.home, bundle) : null;
-    if (previousThread) {
-      try {
-        const saved = z
-          .object({ version: z.literal(1), children: z.record(z.string(), childStateSchema) })
-          .parse(JSON.parse(await readFile(join(this.home, "cf-subagents.json"), "utf8")));
-        for (const [id, child] of Object.entries(saved.children))
-          this.children.set(id, { ...child, active: false });
-      } catch (error) {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      }
+  private async loadChildren(): Promise<void> {
+    try {
+      const saved = z
+        .object({ version: z.literal(1), children: z.record(z.string(), childStateSchema) })
+        .parse(JSON.parse(await readFile(join(this.home, "cf-subagents.json"), "utf8")));
+      for (const [id, child] of Object.entries(saved.children))
+        this.children.set(id, { ...child, active: false });
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
-    const searchTool = this.execution.agent.tools?.find((tool) => tool.type === "web_search");
-    const searchMode = searchTool ? (searchTool.mode ?? "live") : "disabled";
-    await writeFile(
-      join(this.home, "config.toml"),
-      [
-        'model_provider = "gateway"',
-        `model = ${JSON.stringify(this.execution.model)}`,
-        'approval_policy = "never"',
-        'sandbox_mode = "danger-full-access"',
-        `web_search = ${JSON.stringify(searchMode)}`,
-        ...(this.execution.agent.reasoning?.effort
-          ? [`model_reasoning_effort = ${JSON.stringify(this.execution.agent.reasoning.effort)}`]
-          : []),
-        ...(this.execution.agent.reasoning?.summary
-          ? [`model_reasoning_summary = ${JSON.stringify(this.execution.agent.reasoning.summary)}`]
-          : []),
-        ...(this.execution.agent.text?.verbosity
-          ? [`model_verbosity = ${JSON.stringify(this.execution.agent.text.verbosity)}`]
-          : []),
-        "[features]",
-        `multi_agent = ${this.execution.agent.multi_agent?.enabled ?? false}`,
-        `plugins = ${!!this.execution.capabilityRoots?.length}`,
-        `remote_plugin = ${!!this.execution.capabilityRoots?.length}`,
-        `executor_capability_discovery = ${!!this.execution.capabilityRoots?.length}`,
-        ...(this.execution.agent.tools?.some(
-          (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
-        )
-          ? ["tool_search = true"]
-          : []),
-        ...tomlLines(this.options.codexConfig?.features),
-        "[agents]",
-        `max_concurrent_threads_per_session = ${this.execution.agent.multi_agent?.max_concurrent_subagents ?? 6}`,
-        "[model_providers.gateway]",
-        'name = "Deployment model gateway"',
-        `base_url = ${JSON.stringify(this.options.modelBaseUrl)}`,
-        'wire_api = "responses"',
-        "requires_openai_auth = false",
-        ...tomlLines(this.options.codexConfig?.provider, RESERVED_PROVIDER_KEYS),
-      ].join("\n"),
-    );
-    await writeFile(
-      join(this.home, "environments.toml"),
-      this.execution.sandbox
-        ? `default = "sandbox"\ninclude_local = false\n[[environments]]\nid = "sandbox"\nurl = ${JSON.stringify(this.options.sandboxUrl)}\n`
-        : 'default = "none"\ninclude_local = false\n',
-    );
-    this.server = new AppServer({
-      binary: this.options.binary,
-      home: this.home,
-      directory: this.options.directory,
-      onMessage: (message) => this.receive(message),
-      onExit: () => {
-        if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status)) {
-          this.lifecycle.fail("native_harness_exited");
-        }
-      },
-      onDiagnostic: this.options.diagnostics,
-    });
-    await this.server.request("initialize", {
-      clientInfo: { name: "cf-open-agents-api", version: "0.1.0" },
-      capabilities: { experimentalApi: true },
-    });
-    this.server.notify("initialized");
-    const mcpServers = Object.fromEntries(
+  }
+  private config(searchMode: string): string {
+    return [
+      'model_provider = "gateway"',
+      `model = ${JSON.stringify(this.execution.model)}`,
+      'approval_policy = "never"',
+      'sandbox_mode = "danger-full-access"',
+      `web_search = ${JSON.stringify(searchMode)}`,
+      ...(this.execution.agent.reasoning?.effort
+        ? [`model_reasoning_effort = ${JSON.stringify(this.execution.agent.reasoning.effort)}`]
+        : []),
+      ...(this.execution.agent.reasoning?.summary
+        ? [`model_reasoning_summary = ${JSON.stringify(this.execution.agent.reasoning.summary)}`]
+        : []),
+      ...(this.execution.agent.text?.verbosity
+        ? [`model_verbosity = ${JSON.stringify(this.execution.agent.text.verbosity)}`]
+        : []),
+      "[features]",
+      `multi_agent = ${this.execution.agent.multi_agent?.enabled ?? false}`,
+      `plugins = ${!!this.execution.capabilityRoots?.length}`,
+      `remote_plugin = ${!!this.execution.capabilityRoots?.length}`,
+      `executor_capability_discovery = ${!!this.execution.capabilityRoots?.length}`,
+      ...(this.execution.agent.tools?.some(
+        (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
+      )
+        ? ["tool_search = true"]
+        : []),
+      ...tomlLines(this.options.codexConfig?.features),
+      "[agents]",
+      `max_concurrent_threads_per_session = ${this.execution.agent.multi_agent?.max_concurrent_subagents ?? 6}`,
+      "[model_providers.gateway]",
+      'name = "Deployment model gateway"',
+      `base_url = ${JSON.stringify(this.options.modelBaseUrl)}`,
+      'wire_api = "responses"',
+      "requires_openai_auth = false",
+      ...tomlLines(this.options.codexConfig?.provider, RESERVED_PROVIDER_KEYS),
+    ].join("\n");
+  }
+  private mcpServers() {
+    return Object.fromEntries(
       (this.execution.agent.tools ?? [])
         .filter((tool) => tool.type === "mcp")
         .map((tool) => {
@@ -395,78 +319,135 @@ export class CodexJob {
           ];
         }),
     );
-    const common = {
-      model: this.execution.model,
-      modelProvider: "gateway",
-      cwd: this.options.directory,
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-      developerInstructions: this.execution.agent.instructions ?? null,
-      serviceTier: this.execution.agent.service_tier ?? null,
-      config: {
-        mcp_servers: mcpServers,
-        web_search: searchMode,
-        ...(searchTool
-          ? {
-              tools: {
-                web_search: {
-                  context_size: searchTool.context_size ?? "medium",
-                  ...(searchTool.allowed_domains == null
-                    ? {}
-                    : { allowed_domains: searchTool.allowed_domains }),
-                  ...(searchTool.location == null ? {} : { location: searchTool.location }),
+  }
+  /** The app-server is acquired into the resource Scope; its release terminates the process. */
+  protected acquire(bundle?: unknown): Effect.Effect<void, unknown, Scope.Scope> {
+    return Effect.gen(this, function* () {
+      yield* io("codex.prepare", async () => {
+        await rm(this.home, { recursive: true, force: true });
+        await mkdir(this.home, { recursive: true });
+      });
+      const previousThread = bundle ? yield* restore(this.home, bundle) : null;
+      if (previousThread) yield* io("codex.subagents", () => this.loadChildren());
+      const searchTool = this.execution.agent.tools?.find((tool) => tool.type === "web_search");
+      const searchMode = searchTool ? (searchTool.mode ?? "live") : "disabled";
+      yield* io("codex.config", () =>
+        writeFile(join(this.home, "config.toml"), this.config(searchMode)),
+      );
+      yield* io("codex.environments", () =>
+        writeFile(
+          join(this.home, "environments.toml"),
+          this.execution.sandbox
+            ? `default = "sandbox"\ninclude_local = false\n[[environments]]\nid = "sandbox"\nurl = ${JSON.stringify(this.options.sandboxUrl)}\n`
+            : 'default = "none"\ninclude_local = false\n',
+        ),
+      );
+      const server = yield* AppServer.acquire({
+        binary: this.options.binary,
+        home: this.home,
+        directory: this.options.directory,
+        onDiagnostic: (line) => this.options.diagnostics(line),
+      });
+      this.server = server;
+      // Message translation stays a synchronous switch; one bad message is diagnosed, not fatal.
+      yield* Stream.runForEach(server.messages, (message) =>
+        Effect.sync(() => this.receive(message)).pipe(
+          Effect.catchAllCause((cause) =>
+            Effect.sync(() =>
+              this.options.diagnostics(`app-server message failed: ${describeFailure(cause)}`),
+            ),
+          ),
+        ),
+      ).pipe(Effect.forkScoped);
+      yield* server.exited.pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
+              this.lifecycle.fail("native_harness_exited");
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* server.request("initialize", {
+        clientInfo: { name: "cf-open-agents-api", version: "0.1.0" },
+        capabilities: { experimentalApi: true },
+      });
+      server.notify("initialized");
+      const common = {
+        model: this.execution.model,
+        modelProvider: "gateway",
+        cwd: this.options.directory,
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+        developerInstructions: this.execution.agent.instructions ?? null,
+        serviceTier: this.execution.agent.service_tier ?? null,
+        config: {
+          mcp_servers: this.mcpServers(),
+          web_search: searchMode,
+          ...(searchTool
+            ? {
+                tools: {
+                  web_search: {
+                    context_size: searchTool.context_size ?? "medium",
+                    ...(searchTool.allowed_domains == null
+                      ? {}
+                      : { allowed_domains: searchTool.allowed_domains }),
+                    ...(searchTool.location == null ? {} : { location: searchTool.location }),
+                  },
                 },
-              },
-            }
-          : {}),
-      },
-      selectedCapabilityRoots: (this.execution.capabilityRoots ?? []).map((path, index) => ({
-        id: `capability_${index}`,
-        location: { type: "environment", environmentId: "sandbox", path },
-      })),
-    };
-    const result = previousThread
-      ? await this.server.request("thread/resume", { ...common, threadId: previousThread })
-      : await this.server.request("thread/start", {
-          ...common,
-          dynamicTools: [
-            ...(this.execution.agent.tools ?? [])
-              .filter((tool) => tool.type === "function")
-              .map((tool) => ({
+              }
+            : {}),
+        },
+        selectedCapabilityRoots: (this.execution.capabilityRoots ?? []).map((path, index) => ({
+          id: `capability_${index}`,
+          location: { type: "environment", environmentId: "sandbox", path },
+        })),
+      };
+      const result = previousThread
+        ? yield* server.request("thread/resume", { ...common, threadId: previousThread })
+        : yield* server.request("thread/start", {
+            ...common,
+            dynamicTools: [
+              ...(this.execution.agent.tools ?? [])
+                .filter((tool) => tool.type === "function")
+                .map((tool) => ({
+                  type: "function",
+                  name: tool.name,
+                  description: tool.description,
+                  inputSchema: tool.parameters,
+                  deferLoading: tool.defer_loading ?? false,
+                })),
+              ...(codeEnabled(this.execution)
+                ? [{ type: "function", ...programmaticTool, deferLoading: false }]
+                : []),
+              ...this.delegations.definitions().map((tool) => ({
                 type: "function",
                 name: tool.name,
                 description: tool.description,
-                inputSchema: tool.parameters,
-                deferLoading: tool.defer_loading ?? false,
+                inputSchema: tool.inputSchema,
+                deferLoading: false,
               })),
-            ...(codeEnabled(this.execution)
-              ? [{ type: "function", ...programmaticTool, deferLoading: false }]
-              : []),
-            ...this.delegations.definitions().map((tool) => ({
-              type: "function",
-              name: tool.name,
-              description: tool.description,
-              inputSchema: tool.inputSchema,
-              deferLoading: false,
-            })),
-          ],
-          environments: this.execution.sandbox
-            ? [{ environmentId: "sandbox", cwd: "/workspace" }]
-            : [],
-        });
-    this.threadId = threadResponse.parse(result).thread.id;
-    const turn = await this.server.request("turn/start", {
-      threadId: this.threadId,
-      input: this.input(this.execution.input),
-      effort: this.execution.agent.reasoning?.effort ?? null,
-      summary: this.execution.agent.reasoning?.summary ?? null,
-      outputSchema:
-        this.execution.agent.text?.format?.type === "json_schema"
-          ? this.execution.agent.text.format.schema
-          : null,
-      environments: this.execution.sandbox ? [{ environmentId: "sandbox", cwd: "/workspace" }] : [],
+            ],
+            environments: this.execution.sandbox
+              ? [{ environmentId: "sandbox", cwd: "/workspace" }]
+              : [],
+          });
+      this.threadId = yield* attempt("codex.thread", () => threadResponse.parse(result).thread.id);
+      const turn = yield* server.request("turn/start", {
+        threadId: this.threadId,
+        input: this.input(this.execution.input),
+        effort: this.execution.agent.reasoning?.effort ?? null,
+        summary: this.execution.agent.reasoning?.summary ?? null,
+        outputSchema:
+          this.execution.agent.text?.format?.type === "json_schema"
+            ? this.execution.agent.text.format.schema
+            : null,
+        environments: this.execution.sandbox
+          ? [{ environmentId: "sandbox", cwd: "/workspace" }]
+          : [],
+      });
+      this.nativeTurnId = yield* attempt("codex.turn", () => turnResponse.parse(turn).turn.id);
     });
-    this.nativeTurnId = turnResponse.parse(turn).turn.id;
   }
   private input(messages: Execution["input"]) {
     return messages.flatMap((message) =>
@@ -476,13 +457,6 @@ export class CodexJob {
           : { type: "image", url: part.image_url },
       ),
     );
-  }
-  /** Exceeding the retained event budget fails the job; the app-server is then stopped. */
-  private push(event: RuntimeEvent): void {
-    if (!this.lifecycle.emit(event) && this.status === "failed" && !this.closing)
-      void this.stop().catch((error) =>
-        this.options.diagnostics(`Failed to stop after output limit: ${String(error)}`),
-      );
   }
   private receive(message: RpcMessage): void {
     if (this.closing || !["running", "waiting"].includes(this.status)) return;
@@ -510,7 +484,7 @@ export class CodexJob {
             active: true,
           };
           this.children.set(thread.id, state);
-          this.push({
+          this.emit({
             type: "subagent",
             id: childId(thread.id),
             parentId: parent === this.threadId ? null : childId(parent),
@@ -565,7 +539,7 @@ export class CodexJob {
         totalTokens: (previous?.usage.totalTokens ?? 0) + last.totalTokens,
       };
       this.usageByTurn.set(key, { lastTotal: total, usage });
-      this.push({
+      this.emit({
         ...scope,
         type: "usage",
         id: key,
@@ -591,7 +565,7 @@ export class CodexJob {
         })
         .safeParse(message.params);
       if (parsed.success)
-        this.push({
+        this.emit({
           ...scope,
           type:
             message.method === "item/reasoning/summaryTextDelta"
@@ -606,7 +580,7 @@ export class CodexJob {
     if (message.method === "item/commandExecution/outputDelta") {
       const parsed = z.object({ itemId: z.string(), delta: z.string() }).safeParse(message.params);
       if (parsed.success)
-        this.push({
+        this.emit({
           ...scope,
           type: "command_delta",
           id: parsed.data.itemId,
@@ -625,7 +599,7 @@ export class CodexJob {
         })
         .safeParse(message.params);
       if (reasoning.success) {
-        this.push({
+        this.emit({
           ...scope,
           type: "reasoning",
           id: reasoning.data.item.id,
@@ -662,7 +636,7 @@ export class CodexJob {
         .safeParse(message.params);
       if (search.success) {
         const action = search.data.item.action;
-        this.push({
+        this.emit({
           ...scope,
           type: "web_search",
           id: search.data.item.id,
@@ -686,7 +660,7 @@ export class CodexJob {
       if (message.method === "item/started") {
         const command = completedItem.safeParse(message.params);
         if (command.success && command.data.item.type === "commandExecution")
-          this.push({
+          this.emit({
             ...scope,
             type: "command_start",
             id: command.data.item.id,
@@ -738,7 +712,7 @@ export class CodexJob {
               item.tool === "followupTask"
             )
               state.closed = false;
-            this.push({
+            this.emit({
               type: "subagent",
               id: childId(id),
               parentId: state.parent === this.threadId ? null : childId(state.parent),
@@ -765,7 +739,7 @@ export class CodexJob {
           ])
           .safeParse(item.tool);
         if (operation.success)
-          this.push({
+          this.emit({
             ...scope,
             type: "collaboration",
             id: item.id,
@@ -800,7 +774,7 @@ export class CodexJob {
       const turn = result.data.turn;
       child.turnId = turn.id;
       child.active = message.method === "turn/started";
-      this.push({
+      this.emit({
         type: "subagent_turn",
         id: childTurnId(turn.id),
         subagentId: childId(nativeThread),
@@ -815,7 +789,7 @@ export class CodexJob {
         completedAt: turn.completedAt,
       });
       if (child.active && this.cancelRequested)
-        void this.interrupt(nativeThread, turn.id).catch((error) =>
+        void this.perform(this.interruptNative(nativeThread, turn.id)).catch((error) =>
           this.lifecycle.fail(error instanceof Error ? error.message : "subagent_interrupt_failed"),
         );
       this.finishIfReady();
@@ -840,8 +814,7 @@ export class CodexJob {
         }
         if (DELEGATION_TOOLS.has(parsed.data.tool) && this.delegations.enabled) {
           const requestId = message.id;
-          void this.delegations
-            .call(parsed.data.tool, parsed.data.arguments)
+          void this.perform(this.delegations.call(parsed.data.tool, parsed.data.arguments))
             .then((result) =>
               this.server?.respond(requestId, {
                 success: !result.isError,
@@ -854,13 +827,9 @@ export class CodexJob {
             .catch(() => this.server?.reject(requestId));
           return;
         }
-        runSync(
-          Ref.update(this.pendingTools, (pending) =>
-            new Map(pending).set(parsed.data.callId, message.id as number | string),
-          ),
-        );
+        this.pendingTools.set(parsed.data.callId, message.id);
         this.lifecycle.setStatus("waiting");
-        this.push({
+        this.emit({
           ...scope,
           type: "function_call",
           id: parsed.data.callId,
@@ -878,7 +847,7 @@ export class CodexJob {
           return;
         }
         const { itemId, questions } = parsed.data;
-        this.push({
+        this.emit({
           ...scope,
           type: "text",
           id: `user_input:${itemId}`,
@@ -905,13 +874,13 @@ export class CodexJob {
     if (message.method === "item/agentMessage/delta") {
       const delta = z.object({ itemId: z.string(), delta: z.string() }).safeParse(message.params);
       if (delta.success)
-        this.push({ ...scope, type: "delta", id: delta.data.itemId, text: delta.data.delta });
+        this.emit({ ...scope, type: "delta", id: delta.data.itemId, text: delta.data.delta });
     } else if (message.method === "item/completed") {
       const result = completedItem.safeParse(message.params);
       if (!result.success) return;
       const item = result.data.item;
       if (item.type === "mcpToolCall") {
-        this.push({
+        this.emit({
           ...scope,
           type: "mcp",
           id: item.id,
@@ -924,7 +893,7 @@ export class CodexJob {
         });
         return;
       }
-      this.push(
+      this.emit(
         item.type === "agentMessage"
           ? {
               ...scope,
@@ -1000,87 +969,83 @@ export class CodexJob {
     )
       this.lifecycle.setStatus(this.rootOutcome);
   }
-  poll(after: number): RuntimeBatch {
-    return this.lifecycle.poll(after);
+  protected override abandon(): void {
+    const failure = Effect.fail(new ExecutionStopped());
+    for (const pending of this.pendingCode.values()) Deferred.unsafeDone(pending, failure);
+    this.pendingCode.clear();
   }
-  control(id: string, command: RuntimeCommand): Promise<void> {
-    return runPromise(
-      this.operations.perform(
-        id,
-        command,
-        this.lifecycle.transition.withPermits(1)(
-          io("codex.control", () => this.apply(id, command)),
-        ),
-      ),
-    );
+  protected prepareCommand() {
+    return Effect.void;
   }
-  private async apply(id: string, command: RuntimeCommand): Promise<void> {
-    const rejected = (message: string) => new ApiError(409, "command_rejected", message);
-    if (command.type === "cancel") {
-      // Idempotent: a terminal or unstarted job has nothing left to interrupt.
-      if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
-      this.cancelRequested = true;
-      // A finished root must read as cancelled before a settling child can seal the outcome.
-      this.lifecycle.requestCancel();
-      if (this.rootOutcome) this.rootOutcome = "cancelled";
-      // Children are told before the shared abort signal closes their route.
-      await this.delegations.cancelAll();
-      this.codeAbort.abort();
-      for (const pending of this.pendingCode.values())
-        runSync(Deferred.fail(pending, new Error("Execution cancelled")));
-      this.pendingCode.clear();
-      if (!this.rootOutcome) await this.interrupt(this.threadId, this.nativeTurnId);
-      for (const [threadId, child] of this.children) {
-        if (child.active && child.turnId) await this.interrupt(threadId, child.turnId);
+  protected apply(id: string, command: RuntimeCommand) {
+    return Effect.gen(this, function* () {
+      const rejected = (message: string) => new ApiError(409, "command_rejected", message);
+      if (command.type === "cancel") {
+        // Idempotent: a terminal or unstarted job has nothing left to interrupt.
+        if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
+        this.cancelRequested = true;
+        // A finished root must read as cancelled before a settling child can seal the outcome.
+        this.lifecycle.requestCancel();
+        if (this.rootOutcome) this.rootOutcome = "cancelled";
+        // Children are told before the shared abort signal closes their route.
+        yield* this.delegations.cancelAll();
+        this.abort.abort();
+        for (const pending of this.pendingCode.values())
+          yield* Deferred.fail(pending, new ExecutionCancelled());
+        this.pendingCode.clear();
+        if (!this.rootOutcome) yield* this.interruptNative(this.threadId, this.nativeTurnId);
+        for (const [threadId, child] of this.children) {
+          if (child.active && child.turnId) yield* this.interruptNative(threadId, child.turnId);
+        }
+        this.finishIfReady();
+        return;
       }
-      this.finishIfReady();
-      return;
-    }
-    if (!this.server) throw rejected("App-server not started");
-    if (this.closing || !["running", "waiting"].includes(this.status))
-      throw rejected("Turn is no longer active");
-    if (command.type === "steer") {
-      try {
-        await this.server.request("turn/steer", {
-          threadId: this.threadId,
-          expectedTurnId: this.nativeTurnId,
-          input: this.input(command.input),
-        });
-      } catch (error) {
+      const server = this.server;
+      if (!server) return yield* rejected("App-server not started");
+      if (this.closing || !["running", "waiting"].includes(this.status))
+        return yield* rejected("Turn is no longer active");
+      if (command.type === "steer") {
         // Codex answered: the steer can never apply to this turn (it ended or
         // moved on). Transport failures stay transient and are retried.
-        if (error instanceof RpcError) throw rejected(`Codex rejected the steer: ${error.message}`);
-        throw error;
+        yield* server
+          .request("turn/steer", {
+            threadId: this.threadId,
+            expectedTurnId: this.nativeTurnId,
+            input: this.input(command.input),
+          })
+          .pipe(
+            Effect.catchTag("RpcError", (error) =>
+              rejected(`Codex rejected the steer: ${error.message}`),
+            ),
+          );
+        return;
       }
-    } else {
       const delegated = this.delegations.owns(command.callId);
       if (delegated) {
-        await this.delegations.routeToolResult(delegated, id, command);
+        yield* this.delegations.routeToolResult(delegated, id, command);
         return;
       }
       const codeResult = this.pendingCode.get(command.callId);
       if (codeResult) {
         this.pendingCode.delete(command.callId);
-        runSync(
-          Deferred.succeed(codeResult, {
-            content:
-              typeof command.output === "string"
-                ? [{ type: "text", text: command.output }]
-                : command.output.map((part): JsonValue => {
-                    if (part.type === "input_text") return { type: "text", text: part.text };
-                    return { type: "image", image_url: part.image_url };
-                  }),
-            isError: !command.success,
-          }),
-        );
+        yield* Deferred.succeed(codeResult, {
+          content:
+            typeof command.output === "string"
+              ? [{ type: "text", text: command.output }]
+              : command.output.map((part): JsonValue => {
+                  if (part.type === "input_text") return { type: "text", text: part.text };
+                  return { type: "image", image_url: part.image_url };
+                }),
+          isError: !command.success,
+        });
         this.lifecycle.setStatus(
-          this.pendingCode.size || runSync(Ref.get(this.pendingTools)).size ? "waiting" : "running",
+          this.pendingCode.size || this.pendingTools.size ? "waiting" : "running",
         );
         return;
       }
-      const requestId = runSync(Ref.get(this.pendingTools)).get(command.callId);
-      if (requestId === undefined) throw rejected("Unknown tool call");
-      this.server.respond(requestId, {
+      const requestId = this.pendingTools.get(command.callId);
+      if (requestId === undefined) return yield* rejected("Unknown tool call");
+      server.respond(requestId, {
         success: command.success,
         contentItems:
           typeof command.output === "string"
@@ -1091,15 +1056,11 @@ export class CodexJob {
                   : { type: "inputImage", imageUrl: part.image_url },
               ),
       });
-      const remaining = runSync(
-        Ref.updateAndGet(this.pendingTools, (pending) => {
-          const next = new Map(pending);
-          next.delete(command.callId);
-          return next;
-        }),
+      this.pendingTools.delete(command.callId);
+      this.lifecycle.setStatus(
+        this.pendingTools.size || this.pendingCode.size ? "waiting" : "running",
       );
-      this.lifecycle.setStatus(remaining.size || this.pendingCode.size ? "waiting" : "running");
-    }
+    });
   }
   private async respondCode(
     requestId: string | number,
@@ -1113,7 +1074,7 @@ export class CodexJob {
       const result = await executeCode(
         this.execution,
         input,
-        this.codeAbort.signal,
+        this.abort.signal,
         this.options.programmaticUrl,
         invocation,
       );
@@ -1126,152 +1087,169 @@ export class CodexJob {
     } catch {
       if (this.cancelRequested || this.closing) return;
       this.lifecycle.fail("programmatic_execution_uncertain");
-      await this.stop();
+      this.requestStop();
     } finally {
       this.codeInvocations.delete(invocation);
     }
   }
-  async codeTools(invocation: string): Promise<string[]> {
-    const context = this.codeInvocations.get(invocation);
-    if (!context || !this.server) throw new Error("No active code invocation");
-    let cursor: string | undefined;
-    const seen = new Set<string>();
-    do {
-      const page = z
-        .object({
-          data: z.array(
-            z.object({
-              name: z.string(),
-              tools: z.record(
-                z.string(),
-                z.object({ name: z.string(), inputSchema: z.record(z.string(), z.json()) }),
-              ),
-            }),
-          ),
-          nextCursor: z.string().nullish(),
-        })
-        .parse(
-          await this.server.request("mcpServerStatus/list", {
-            threadId: context.threadId,
-            detail: "toolsAndAuthOnly",
-            cursor,
-            limit: 100,
-          }),
-        );
-      for (const server of page.data)
-        for (const tool of Object.values(server.tools)) {
-          const configured = this.execution.agent.tools?.find(
-            (tool) => tool.type === "mcp" && tool.server_label === server.name,
-          );
-          if (
-            configured?.type === "mcp" &&
-            configured.allowed_tools &&
-            !configured.allowed_tools.includes(tool.name)
-          )
-            continue;
-          if (context.mcp.size >= 1000) throw new Error("MCP tool catalog is too large");
-          context.mcp.set(`mcp__${server.name}__${tool.name}`, {
-            server: server.name,
-            name: tool.name,
-            schema: tool.inputSchema,
-          });
-        }
-      cursor = page.nextCursor ?? undefined;
-      if (cursor && seen.has(cursor)) throw new Error("MCP pagination did not advance");
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-    return [
-      ...(this.execution.agent.tools ?? []).flatMap((tool) =>
-        tool.type === "function" ? [tool.name] : [],
-      ),
-      ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
-      ...context.mcp.keys(),
-    ];
+  private readonly mcpStatusPage = z.object({
+    data: z.array(
+      z.object({
+        name: z.string(),
+        tools: z.record(
+          z.string(),
+          z.object({ name: z.string(), inputSchema: z.record(z.string(), z.json()) }),
+        ),
+      }),
+    ),
+    nextCursor: z.string().nullish(),
+  });
+  codeTools(invocation: string): Effect.Effect<string[], ToolError> {
+    return Effect.gen(this, function* () {
+      const context = this.codeInvocations.get(invocation);
+      const server = this.server;
+      if (!context || !server)
+        return yield* new ToolUnavailable({ message: "No active code invocation" });
+      let cursor: string | undefined;
+      const seen = new Set<string>();
+      do {
+        const listed = yield* server.request("mcpServerStatus/list", {
+          threadId: context.threadId,
+          detail: "toolsAndAuthOnly",
+          cursor,
+          limit: 100,
+        });
+        const page = yield* attempt("codex.mcpServers", () => this.mcpStatusPage.parse(listed));
+        for (const listing of page.data)
+          for (const tool of Object.values(listing.tools)) {
+            const configured = this.execution.agent.tools?.find(
+              (tool) => tool.type === "mcp" && tool.server_label === listing.name,
+            );
+            if (
+              configured?.type === "mcp" &&
+              configured.allowed_tools &&
+              !configured.allowed_tools.includes(tool.name)
+            )
+              continue;
+            if (context.mcp.size >= 1000)
+              return yield* new ToolUnavailable({ message: "MCP tool catalog is too large" });
+            context.mcp.set(`mcp__${listing.name}__${tool.name}`, {
+              server: listing.name,
+              name: tool.name,
+              schema: tool.inputSchema,
+            });
+          }
+        cursor = page.nextCursor ?? undefined;
+        if (cursor && seen.has(cursor))
+          return yield* new ToolUnavailable({ message: "MCP pagination did not advance" });
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      return [
+        ...(this.execution.agent.tools ?? []).flatMap((tool) =>
+          tool.type === "function" ? [tool.name] : [],
+        ),
+        ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
+        ...context.mcp.keys(),
+      ];
+    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTools")));
   }
-  async codeTool(name: string, args: unknown, invocation: string): Promise<JsonValue> {
-    const context = this.codeInvocations.get(invocation);
-    if (!context) throw new Error("No active code invocation");
-    if (!codeEnabled(this.execution) || this.closing || this.codeAbort.signal.aborted)
-      throw new Error("No active code assignment");
-    if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
-      const result = await executeWorkspace(
-        this.options.sandboxUrl,
-        name as keyof typeof workspaceTools,
-        args,
-        this.codeAbort.signal,
-        (event) => this.push({ ...event, ...context.scope }),
-      );
-      return {
-        content: [{ type: "text", text: result.text }],
-        isError: result.exitCode !== null && result.exitCode !== 0,
-      };
-    }
-    const mcp = context.mcp.get(name);
-    if (mcp) {
-      const input = z.json().parse(z.fromJSONSchema(mcp.schema).parse(args));
-      const id = `mcp_${crypto.randomUUID().replaceAll("-", "")}`;
-      try {
-        const output = z.json().parse(
-          await this.server?.request("mcpServer/tool/call", {
+  codeTool(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError> {
+    return Effect.gen(this, function* () {
+      const context = this.codeInvocations.get(invocation);
+      if (!context) return yield* new ToolUnavailable({ message: "No active code invocation" });
+      if (!codeEnabled(this.execution) || this.closing || this.abort.signal.aborted)
+        return yield* new ToolUnavailable({ message: "No active code assignment" });
+      if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
+        const result = yield* io("codex.workspace", () =>
+          executeWorkspace(
+            this.options.sandboxUrl,
+            name as keyof typeof workspaceTools,
+            args,
+            this.abort.signal,
+            (event) => this.emit({ ...event, ...context.scope }),
+          ),
+        );
+        return {
+          content: [{ type: "text", text: result.text }],
+          isError: result.exitCode !== null && result.exitCode !== 0,
+        };
+      }
+      const mcp = context.mcp.get(name);
+      if (mcp) {
+        const input = yield* attempt("codex.mcpInput", () =>
+          z.json().parse(z.fromJSONSchema(mcp.schema).parse(args)),
+        );
+        const id = `mcp_${crypto.randomUUID().replaceAll("-", "")}`;
+        const record = (output: JsonValue | null, error: string | null, success: boolean) =>
+          this.emit({
+            ...context.scope,
+            type: "mcp",
+            id,
+            name: mcp.name,
+            server: mcp.server,
+            arguments: input,
+            output,
+            error,
+            success,
+          });
+        const server = this.server;
+        if (!server) return yield* new ToolUnavailable({ message: "No active code invocation" });
+        return yield* server
+          .request("mcpServer/tool/call", {
             threadId: context.threadId,
             server: mcp.server,
             tool: mcp.name,
             arguments: input,
-          }),
-        );
-        this.push({
-          ...context.scope,
-          type: "mcp",
-          id,
-          name: mcp.name,
-          server: mcp.server,
-          arguments: input,
-          output,
-          error: null,
-          success: !(output && typeof output === "object" && "isError" in output && output.isError),
-        });
-        return output;
-      } catch (error) {
-        this.push({
-          ...context.scope,
-          type: "mcp",
-          id,
-          name: mcp.name,
-          server: mcp.server,
-          arguments: input,
-          output: null,
-          error: "MCP request failed",
-          success: false,
-        });
-        throw error;
+          })
+          .pipe(
+            Effect.flatMap((raw) => attempt("codex.mcpOutput", () => z.json().parse(raw))),
+            Effect.tap((output) =>
+              Effect.sync(() =>
+                record(
+                  output,
+                  null,
+                  !(output && typeof output === "object" && "isError" in output && output.isError),
+                ),
+              ),
+            ),
+            Effect.tapError(() => Effect.sync(() => record(null, "MCP request failed", false))),
+          );
       }
-    }
-    const input = functionArguments(this.execution, name, args);
-    const id = `call_${crypto.randomUUID().replaceAll("-", "")}`;
-    const result = runSync(Deferred.make<JsonValue, Error>());
-    this.pendingCode.set(id, result);
-    this.push({ ...context.scope, type: "function_call", id, callId: id, name, arguments: input });
-    this.lifecycle.setStatus("waiting");
-    return runPromise(Deferred.await(result));
+      const input = yield* attempt("codex.functionArguments", () =>
+        functionArguments(this.execution, name, args),
+      );
+      const id = `call_${crypto.randomUUID().replaceAll("-", "")}`;
+      const result = yield* Deferred.make<JsonValue, ExecutionStopped | ExecutionCancelled>();
+      this.pendingCode.set(id, result);
+      this.emit({
+        ...context.scope,
+        type: "function_call",
+        id,
+        callId: id,
+        name,
+        arguments: input,
+      });
+      this.lifecycle.setStatus("waiting");
+      return yield* Deferred.await(result);
+    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTool")));
   }
-  private async interrupt(threadId: string, turnId: string): Promise<void> {
-    try {
-      await this.server?.request("turn/interrupt", { threadId, turnId });
-    } catch (error) {
-      // Completion can win the RPC race. Its terminal notification still decides
-      // when the job is finished; this acknowledgement alone never does.
-      if (!(error instanceof Error && error.message === "no active turn to interrupt")) throw error;
-    }
-  }
-  /** The public error is a stable code; the native reason goes to diagnostics. */
-  failStart(error: unknown): void {
-    this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
-    this.lifecycle.fail("native_harness_failed");
-  }
-  checkpoint(): Promise<NativeBundle> {
-    return runPromise(this.saved);
-  }
-  stop(): Promise<void> {
-    return runPromise(this.lifecycle.transition.withPermits(1)(this.stopped));
+  private interruptNative(threadId: string, turnId: string): Effect.Effect<void, RpcFailure> {
+    return this.server
+      ? this.server.request("turn/interrupt", { threadId, turnId }).pipe(
+          Effect.asVoid,
+          // Completion can win the RPC race. Its terminal notification still decides
+          // when the job is finished; this acknowledgement alone never does.
+          Effect.catchTag("RpcError", (error) =>
+            error.message === "no active turn to interrupt" ? Effect.void : Effect.fail(error),
+          ),
+        )
+      : Effect.void;
   }
 }
+/** Tool-path failures keep their tag; everything else is transient I/O for the route. */
+const rpcToServiceError =
+  (operation: string) =>
+  (cause: unknown): ToolError =>
+    cause instanceof ToolUnavailable || cause instanceof ApiError || cause instanceof OperationError
+      ? cause
+      : new OperationError({ operation, cause });

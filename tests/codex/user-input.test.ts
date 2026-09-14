@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, expect, it } from "vitest";
 
+import { runPromise } from "../../packages/agent-api/src/index.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
 /**
@@ -75,11 +76,15 @@ it("declines request_user_input questions as commentary and lets the turn contin
       diagnostics: (line) => diagnostics.push(line),
     },
   );
-  cleanup.push(() => job.stop());
-  await job.start();
-  for (let attempt = 0; attempt < 100 && job.poll(0).status === "running"; attempt++)
+  cleanup.push(() => runPromise(job.stop()));
+  await runPromise(job.start());
+  for (
+    let attempt = 0;
+    attempt < 100 && (await runPromise(job.poll(0))).status === "running";
+    attempt++
+  )
     await delay(50);
-  const batch = job.poll(0);
+  const batch = await runPromise(job.poll(0));
   expect(batch.status, diagnostics.join("\n")).toBe("completed");
   const commentary = batch.events.find(
     ({ event }) => event.type === "text" && event.phase === "commentary",

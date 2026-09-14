@@ -6,11 +6,10 @@ import {
   type Execution,
   executionSchema,
   HARNESSES,
-  io,
   runPromise,
   workspaceRequestSchema,
 } from "cf-open-agents-api";
-import { Context, Effect, Layer, Ref, Schema } from "effect";
+import { Context, Duration, Effect, Layer, Ref, Schema } from "effect";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
@@ -46,6 +45,9 @@ interface Active {
   readonly job: NativeJob;
   readonly fingerprint: string;
 }
+/** Upper bound for `GET /jobs/:turn?wait=`; the HarnessDO keeps its poll well under its fetch timeout. */
+export const LONG_POLL_MAX_MS = 25_000;
+const cursorQuery = z.coerce.number().int().min(0);
 
 /** Private Container HTTP API. Its owning HarnessDO is the authorization boundary. */
 export function createSupervisor(options: Options, factory: JobFactory = createJob) {
@@ -72,7 +74,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   const stop = lifecycle.withPermits(1)(
     Effect.gen(function* () {
       const current = yield* Ref.get(active);
-      if (current) yield* io("supervisor.stop", () => current.job.stop());
+      if (current) yield* current.job.stop();
     }),
   );
   const app = new Hono();
@@ -145,43 +147,40 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
               return yield* new ApiError(409, "active_execution", "An execution is still active");
             if (!Object.hasOwn(HARNESSES, body.execution.harness))
               return yield* new ApiError(400, "unsupported_harness", "Unsupported harness");
-            if (previous) yield* io("supervisor.stop", () => previous.job.stop());
+            if (previous) yield* previous.job.stop();
             const job = runtime.create(body.execution, runtime.options);
             yield* Ref.set(active, { job, fingerprint });
-            yield* io("supervisor.start", () => job.start(body.checkpoint)).pipe(
-              Effect.onError((cause) =>
-                Effect.gen(function* () {
-                  job.failStart(cause);
-                  yield* io("supervisor.cleanup", () => job.stop()).pipe(Effect.orDie);
-                }),
-              ),
-            );
+            yield* job
+              .start(body.checkpoint)
+              .pipe(
+                Effect.onError((cause) =>
+                  Effect.sync(() => job.failStart(cause)).pipe(Effect.zipRight(job.stop())),
+                ),
+              );
             return Response.json({ accepted: true });
           }),
         )
         .pipe(Effect.provide(layer)),
     );
   });
-  app.get("/jobs/:turn", (c) =>
-    runPromise(
+  /**
+   * `?after=N` answers at once with the retained events after `N`. `&wait=<ms>`
+   * (capped at 25 s) makes an empty answer wait that long for the next event or
+   * terminal outcome; a missing execution and terminal outcomes never wait.
+   */
+  app.get("/jobs/:turn", (c) => {
+    const after = cursorQuery.parse(c.req.query("after") ?? "0");
+    const wait = Math.min(cursorQuery.parse(c.req.query("wait") ?? "0"), LONG_POLL_MAX_MS);
+    return runPromise(
       lookup(c.req.param("turn")).pipe(
-        Effect.map((job) =>
-          Response.json(
-            job.poll(
-              z.coerce
-                .number()
-                .int()
-                .min(0)
-                .parse(c.req.query("after") ?? "0"),
-            ),
-          ),
-        ),
+        Effect.flatMap((job) => job.poll(after, Duration.millis(wait))),
+        Effect.map((batch) => Response.json(batch)),
         Effect.catchTag("ApiError", () =>
           Effect.succeed(Response.json({ status: "missing", events: [], cursor: 0 })),
         ),
       ),
-    ),
-  );
+    );
+  });
   app.post("/jobs/:turn/control", async (c) => {
     const body = decode(
       Schema.Struct({ operationId: Schema.String, command: commandSchema }),
@@ -191,7 +190,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       lifecycle.withPermits(1)(
         Effect.gen(function* () {
           const job = yield* lookup(c.req.param("turn"));
-          yield* io("supervisor.control", () => job.control(body.operationId, body.command));
+          yield* job.control(body.operationId, body.command);
           return c.body(null, 204);
         }),
       ),
@@ -202,7 +201,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       lifecycle.withPermits(1)(
         Effect.gen(function* () {
           const job = yield* lookup(c.req.param("turn"));
-          return Response.json(yield* io("supervisor.checkpoint", () => job.checkpoint()));
+          return Response.json(yield* job.checkpoint());
         }),
       ),
     ),
@@ -212,7 +211,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       Effect.gen(function* () {
         const job = yield* lookup(c.req.param("turn"));
         const mcp = job.mcp?.bind(job);
-        return mcp ? yield* io("supervisor.mcp", () => mcp(c.req.raw)) : c.body(null, 404);
+        return mcp ? yield* mcp(c.req.raw) : c.body(null, 404);
       }),
     ),
   );
@@ -223,25 +222,34 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
         const job = yield* lookup(c.req.param("turn"));
         const workspace = job.workspace?.bind(job);
         return workspace
-          ? Response.json(
-              yield* io("supervisor.workspace", () => workspace(input.tool, input.arguments)),
-            )
+          ? Response.json(yield* workspace(input.tool, input.arguments))
           : c.body(null, 404);
       }),
     );
   });
-  app.get("/jobs/:turn/code-tools", async (c) => {
+  app.get("/jobs/:turn/code-tools", (c) => {
     const invocation = z.string().uuid().parse(c.req.query("invocation"));
-    const job = await runPromise(lookup(c.req.param("turn")));
-    return job.codeTools ? Response.json(await job.codeTools(invocation)) : c.body(null, 404);
+    return runPromise(
+      Effect.gen(function* () {
+        const job = yield* lookup(c.req.param("turn"));
+        const codeTools = job.codeTools?.bind(job);
+        return codeTools ? Response.json(yield* codeTools(invocation)) : c.body(null, 404);
+      }),
+    );
   });
   app.post("/jobs/:turn/code-tool", async (c) => {
     const input = z
       .object({ name: z.string(), arguments: z.json(), invocation: z.string().uuid() })
       .parse(await c.req.json());
-    const job = await runPromise(lookup(c.req.param("turn")));
-    if (!job.codeTool) return c.body(null, 404);
-    return Response.json(await job.codeTool(input.name, input.arguments, input.invocation));
+    return runPromise(
+      Effect.gen(function* () {
+        const job = yield* lookup(c.req.param("turn"));
+        const codeTool = job.codeTool?.bind(job);
+        return codeTool
+          ? Response.json(yield* codeTool(input.name, input.arguments, input.invocation))
+          : c.body(null, 404);
+      }),
+    );
   });
   app.post("/stop", (c) => runPromise(stop.pipe(Effect.as(c.body(null, 204)))));
   return { app, stop: () => runPromise(stop) };
