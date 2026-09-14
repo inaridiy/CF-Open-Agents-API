@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { Context, Effect, Layer, Schema } from "effect";
+import { Context, Effect, Either, Layer, Schema } from "effect";
 import type {
   AgentSessionEnvironmentState,
   SessionTurnError,
@@ -76,63 +76,70 @@ export interface ForkSource {
 /** Leading input of a fork's first turn; the harness reads it as ordinary context. */
 export const TRANSCRIPT_LIMIT = 96_000;
 const TRANSCRIPT_ENTRY_LIMIT = 4_000;
-export function renderTranscript(items: readonly AgentSessionItem[]): string {
-  const clip = (text: string) =>
-    text.length > TRANSCRIPT_ENTRY_LIMIT
-      ? `${text.slice(0, TRANSCRIPT_ENTRY_LIMIT)}… [truncated]`
-      : text;
-  const json = (value: unknown) => clip(typeof value === "string" ? value : JSON.stringify(value));
-  const entries: string[] = [];
-  for (const item of items) {
-    switch (item.type) {
-      case "message": {
-        const text = item.content
-          .map((part) =>
-            part.type === "input_text" || part.type === "output_text"
-              ? part.text
-              : part.type === "input_image"
-                ? "[image]"
-                : "",
-          )
-          .join("\n");
-        entries.push(`${item.role === "user" ? "User" : "Assistant"}: ${clip(text)}`);
-        break;
+const clip = (text: string) =>
+  text.length > TRANSCRIPT_ENTRY_LIMIT
+    ? `${text.slice(0, TRANSCRIPT_ENTRY_LIMIT)}… [truncated]`
+    : text;
+const json = (value: unknown) => clip(typeof value === "string" ? value : JSON.stringify(value));
+function transcriptEntry(item: AgentSessionItem): string | undefined {
+  switch (item.type) {
+    case "message": {
+      const text = item.content
+        .map((part) =>
+          part.type === "input_text" || part.type === "output_text"
+            ? part.text
+            : part.type === "input_image"
+              ? "[image]"
+              : "",
+        )
+        .join("\n");
+      return `${item.role === "user" ? "User" : "Assistant"}: ${clip(text)}`;
+    }
+    case "function_call":
+      return `Assistant called ${item.name}(${json(item.arguments)})`;
+    case "function_call_output":
+      return `Function result (${item.status}): ${json(item.output ?? item.error ?? null)}`;
+    case "command_execution":
+      return `Command${item.cwd ? ` in ${item.cwd}` : ""}: ${clip(item.command)}\nExit code: ${item.exit_code ?? "none"}\n${clip(item.output ?? "")}`;
+    case "mcp_call":
+      return `MCP ${item.server_label}/${item.name}(${json(item.arguments)}) → ${json(item.output ?? item.error ?? null)}`;
+    case "web_search_call":
+      return `Web search: ${json(item.action)}`;
+    default:
+      // Reasoning and collaboration items are private to the original runtime.
+      return undefined;
+  }
+}
+/** Accumulates items page by page and only ever retains the bounded tail. */
+export class TranscriptBuilder {
+  private readonly entries: string[] = [];
+  private total = 0;
+  private omitted = 0;
+  private get joined(): number {
+    return this.total + 2 * Math.max(0, this.entries.length - 1);
+  }
+  add(items: readonly AgentSessionItem[]): void {
+    for (const item of items) {
+      const entry = transcriptEntry(item);
+      if (entry === undefined) continue;
+      this.entries.push(entry);
+      this.total += entry.length;
+      while (this.joined > TRANSCRIPT_LIMIT && this.entries.length > 1) {
+        this.total -= this.entries.shift()?.length ?? 0;
+        this.omitted++;
       }
-      case "function_call":
-        entries.push(`Assistant called ${item.name}(${json(item.arguments)})`);
-        break;
-      case "function_call_output":
-        entries.push(
-          `Function result (${item.status}): ${json(item.output ?? item.error ?? null)}`,
-        );
-        break;
-      case "command_execution":
-        entries.push(
-          `Command${item.cwd ? ` in ${item.cwd}` : ""}: ${clip(item.command)}\nExit code: ${item.exit_code ?? "none"}\n${clip(item.output ?? "")}`,
-        );
-        break;
-      case "mcp_call":
-        entries.push(
-          `MCP ${item.server_label}/${item.name}(${json(item.arguments)}) → ${json(item.output ?? item.error ?? null)}`,
-        );
-        break;
-      case "web_search_call":
-        entries.push(`Web search: ${json(item.action)}`);
-        break;
-      default:
-        // Reasoning and collaboration items are private to the original runtime.
-        break;
     }
   }
-  let omitted = 0;
-  let rendered = entries.join("\n\n");
-  while (rendered.length > TRANSCRIPT_LIMIT && entries.length > 1) {
-    entries.shift();
-    omitted++;
-    rendered = entries.join("\n\n");
+  render(): string {
+    let rendered = this.entries.join("\n\n");
+    if (rendered.length > TRANSCRIPT_LIMIT) rendered = rendered.slice(-TRANSCRIPT_LIMIT);
+    return this.omitted ? `[${this.omitted} earlier entries omitted]\n\n${rendered}` : rendered;
   }
-  if (rendered.length > TRANSCRIPT_LIMIT) rendered = `${rendered.slice(-TRANSCRIPT_LIMIT)}`;
-  return omitted ? `[${omitted} earlier entries omitted]\n\n${rendered}` : rendered;
+}
+export function renderTranscript(items: readonly AgentSessionItem[]): string {
+  const builder = new TranscriptBuilder();
+  builder.add(items);
+  return builder.render();
 }
 export function transcriptMessage(transcript: string): InputMessage {
   return {
@@ -149,6 +156,40 @@ interface Command {
   id: string;
   turnId: string;
   command: RuntimeCommand;
+  /** Input items added for a steer; removed if the executor never received the steer. */
+  itemIds?: string[];
+}
+/** Steer input the executor rejected after the fact; it runs as the next turn. */
+interface QueuedInput {
+  input: InputMessage[];
+}
+interface Listener {
+  cursor: number;
+  /** A creation stream ends once the initial turn settles or when there is no input. */
+  initial: boolean;
+}
+/** Failure categories the SDK's turn error type can carry verbatim. */
+const TURN_ERROR_CODES = new Set<SessionTurnError["code"]>([
+  "context_length_exceeded",
+  "session_budget_exceeded",
+  "usage_limit_exceeded",
+  "rate_limit_exceeded",
+  "server_overloaded",
+  "cyber_policy",
+  "connection_failed",
+  "server_error",
+  "authentication_error",
+  "invalid_request",
+  "resource_not_found",
+  "sandbox_error",
+  "executor_version_incompatible",
+  "active_turn_not_steerable",
+  "request_timeout",
+  "internal_error",
+]);
+/** Only an outcome nobody can confirm leaves the session failed; other turns return to idle. */
+export function isIndeterminate(error: string | undefined): boolean {
+  return error === "outcome_unknown" || (error?.endsWith("_uncertain") ?? false);
 }
 export interface SessionDependencies {
   drivers: Record<string, RuntimeDriver>;
@@ -156,6 +197,8 @@ export interface SessionDependencies {
   agents?: Record<string, AgentRegistration>;
   maxTurnMs: number;
   pollIntervalMs: number;
+  /** Interval of SSE keepalive comments while live streams exist. */
+  keepaliveMs?: number;
 }
 
 class Reconciliation extends Context.Tag("agent-api/Reconciliation")<
@@ -166,7 +209,9 @@ class Reconciliation extends Context.Tag("agent-api/Reconciliation")<
 export class SessionObject<Env = unknown> extends DurableObject<Env> {
   readonly db: SqlStore;
   private readonly reconciliation = Effect.unsafeMakeSemaphore(1);
-  private readonly listeners = new Map<ReadableStreamDefaultController<Uint8Array>, number>();
+  private readonly listeners = new Map<ReadableStreamDefaultController<Uint8Array>, Listener>();
+  private keepalive: ReturnType<typeof setInterval> | undefined;
+  private flushing = false;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.db = new SqlStore(ctx.storage);
@@ -246,7 +291,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.db.transaction(() => {
       const record = this.record();
       if (record.session.environment.type === "none") return;
-      if (this.db.get<string>("environment", "status") === status) return;
+      const current = this.db.get<string>("environment", "status");
+      if (current === status) return;
+      // A creation retry reports pending again; a settled environment never regresses.
+      if (status === "pending" && current !== undefined) return;
       this.db.put("environment", "status", status);
       this.emit({
         type: `agent.session.environment.${status}`,
@@ -282,6 +330,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         });
       }
     });
+    this.flush();
   }
   update(metadata: Record<string, string>): AgentSession {
     const record = this.record();
@@ -365,11 +414,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     const record = this.record();
     if (record.execution)
       throw new ApiError(409, "active_turn", "Wait for the current turn to stop before forking");
-    const items: AgentSessionItem[] = [];
+    // Pages are folded into the bounded transcript as they are read, never held together.
+    const transcript = new TranscriptBuilder();
     let after: string | undefined;
     do {
       const page = this.db.list<AgentSessionItem>("item", { order: "asc", limit: 100, after });
-      items.push(...page.data);
+      transcript.add(page.data);
       after = page.has_more ? (page.last_id ?? undefined) : undefined;
     } while (after);
     const lastTurn = this.db.list<Turn>("turn", { order: "desc", limit: 1 }).data[0];
@@ -382,7 +432,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       checkpoint: record.checkpoint,
       ...(record.environmentSpec ? { environmentSpec: record.environmentSpec } : {}),
       lastTurnId: lastTurn?.id ?? null,
-      transcript: renderTranscript(items),
+      transcript: transcript.render(),
     };
   }
 
@@ -439,9 +489,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                         "active_turn_not_steerable",
                         "This harness cannot steer an active turn",
                       );
-                    this.enqueue(record, { type: "steer", input: event.input });
-                  } else record = this.begin(record, event.input);
-                  this.addInput(record, event.input);
+                    const itemIds = this.addInput(record, event.input);
+                    this.enqueue(record, { type: "steer", input: event.input }, itemIds);
+                  } else {
+                    record = this.begin(record, event.input);
+                    this.addInput(record, event.input);
+                  }
                   break;
                 }
                 case "agent.session.input.cancel":
@@ -464,6 +517,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                       action.call_id === event.call_id &&
                       action.turn_id === event.turn_id,
                   );
+                  // The official SDK retries a tool result submitted before the call was
+                  // registered only when the response is a 400 whose `code` is
+                  // `invalid_request_error` and whose message is exactly this text
+                  // (openai/lib/agents/agent-session-stream.js, `#submit`). Keep both.
                   if (!action || !record.execution)
                     throw new ApiError(
                       400,
@@ -594,7 +651,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     });
     return next;
   }
-  private addInput(record: ActiveSession, input: InputMessage[]): void {
+  private addInput(record: ActiveSession, input: InputMessage[]): string[] {
+    const ids: string[] = [];
     for (const message of input) {
       const item = {
         ...message,
@@ -605,6 +663,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         status: "completed" as const,
       };
       this.db.put("item", item.id, item);
+      ids.push(item.id);
       this.emit({
         type: "agent.session.turn.item.added",
         event_id: identifier("evt"),
@@ -614,8 +673,9 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         item,
       });
     }
+    return ids;
   }
-  private enqueue(record: ActiveSession, command: RuntimeCommand): void {
+  private enqueue(record: ActiveSession, command: RuntimeCommand, itemIds?: string[]): void {
     if (command.type === "cancel") {
       if (!this.db.get("cancellation", record.execution.turnId))
         this.db.put("cancellation", record.execution.turnId, {
@@ -626,7 +686,24 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       return;
     }
     const id = identifier("op");
-    this.db.put("command", id, { id, turnId: record.execution.turnId, command } satisfies Command);
+    this.db.put("command", id, {
+      id,
+      turnId: record.execution.turnId,
+      command,
+      ...(itemIds ? { itemIds } : {}),
+    } satisfies Command);
+  }
+  /** The executor refused a queued command for good. A steer's input becomes the next turn. */
+  private reject(operation: Command): void {
+    this.db.remove("command", operation.id);
+    if (operation.command.type !== "steer") return;
+    for (const itemId of operation.itemIds ?? []) this.db.remove("item", itemId);
+    this.db.put("queued_input", operation.id, {
+      input: operation.command.input,
+    } satisfies QueuedInput);
+  }
+  private active(): boolean {
+    return !!this.db.get<SessionRecord>("state", "session")?.execution;
   }
   override alarm(): Promise<void> {
     const arm = io("session.arm", () =>
@@ -637,15 +714,17 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       Effect.ensuring(
         Effect.gen(this, function* () {
           this.flush();
-          if (this.db.get<SessionRecord>("state", "session")?.execution)
-            yield* arm.pipe(Effect.orDie);
+          if (this.active()) yield* arm.pipe(Effect.orDie);
         }),
       ),
     );
     return runPromise(
-      this.reconciliation
-        .withPermitsIfAvailable(1)(reconcile)
-        .pipe(Effect.asVoid, Effect.provide(Layer.succeed(Reconciliation, this.dependencies()))),
+      Effect.gen(this, function* () {
+        // The platform clears a fired alarm. While a turn is active, re-arm before the
+        // permit check so a busy reconciler cannot consume the only wake-up.
+        if (this.active()) yield* arm.pipe(Effect.orDie);
+        yield* this.reconciliation.withPermitsIfAvailable(1)(reconcile);
+      }).pipe(Effect.asVoid, Effect.provide(Layer.succeed(Reconciliation, this.dependencies()))),
     );
   }
   /** Every post-I/O transition compares the full durable execution identity. */
@@ -677,10 +756,18 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         this.ctx.storage.setAlarm(Date.now() + dependencies.pollIntervalMs),
       );
       const driver = dependencies.drivers[initial.driver];
-      if (!driver) return; // Cannot claim containment when its original executor is unavailable.
+      if (!driver) {
+        // The deployment no longer registers this executor: nothing can poll or stop it,
+        // and polling forever would only burn alarms.
+        yield* this.finish(execution, "failed", "executor_unavailable");
+        return;
+      }
+      const stopAndFail = (code: string) =>
+        driver
+          .stop(execution)
+          .pipe(Effect.zipRight(this.finish(execution, "failed", code)), Effect.asVoid);
       if (driver.revision !== initial.revision) {
-        yield* driver.stop(execution);
-        yield* this.finish(execution, "failed", "executor_version_incompatible");
+        yield* stopAndFail("executor_version_incompatible");
         return;
       }
       // Once completion is durable, recover the checkpoint directly, even if compute vanished.
@@ -689,12 +776,19 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         return;
       }
       if (Date.now() >= execution.deadline) {
-        yield* driver.stop(execution);
-        yield* this.finish(execution, "failed", "request_timeout");
+        yield* stopAndFail("request_timeout");
         return;
       }
       if (initial.phase === "starting") {
-        yield* driver.start(execution, `${execution.turnId}:start`);
+        const started = yield* driver
+          .start(execution, `${execution.turnId}:start`)
+          .pipe(Effect.either);
+        if (Either.isLeft(started)) {
+          // A typed rejection is permanent; an I/O failure is retried until the deadline.
+          if (started.left._tag !== "ApiError") return yield* Effect.fail(started.left);
+          yield* stopAndFail(started.left.code);
+          return;
+        }
         yield* this.transition(execution, (record) => {
           this.save({ ...record, phase: "running" });
           const turn = {
@@ -714,8 +808,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       }
       while (this.current(execution)) {
         if (Date.now() >= execution.deadline) {
-          yield* driver.stop(execution);
-          yield* this.finish(execution, "failed", "request_timeout");
+          yield* stopAndFail("request_timeout");
           return;
         }
         // Cancellation supersedes queued input. Keep its operation ID until the
@@ -730,28 +823,43 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
             this.db.put("cancellation", execution.turnId, cancel),
           );
         const commands = cancel ? [cancel] : queued;
+        // Delivery never blocks the poll: a refused command is dropped (a steer's input
+        // is queued for the next turn) and an unknown delivery outcome is retried after
+        // polling, so a turn the runtime already finished can still be sealed.
+        let retryDelivery = false;
         for (const operation of commands) {
           if (!this.current(execution)) return;
-          if (operation.turnId === execution.turnId)
-            yield* driver
-              .control(execution, operation.id, operation.command)
-              .pipe(
-                Effect.catchAll((error) =>
-                  cancel
-                    ? Effect.logWarning(
-                        "Cancellation delivery failed; reconciling native outcome",
-                        error,
-                      )
-                    : Effect.fail(error),
-                ),
-              );
-          if (!cancel)
-            yield* this.transition(execution, () => this.db.remove("command", operation.id));
+          if (operation.turnId !== execution.turnId) {
+            if (!cancel)
+              yield* this.transition(execution, () => this.db.remove("command", operation.id));
+            continue;
+          }
+          const delivered = yield* driver
+            .control(execution, operation.id, operation.command)
+            .pipe(Effect.either);
+          if (Either.isRight(delivered)) {
+            if (!cancel)
+              yield* this.transition(execution, () => this.db.remove("command", operation.id));
+            continue;
+          }
+          if (cancel) {
+            yield* Effect.logWarning(
+              "Cancellation delivery failed; reconciling native outcome",
+              delivered.left,
+            );
+          } else if (delivered.left._tag === "ApiError") {
+            yield* Effect.logWarning("Executor refused a queued command", delivered.left);
+            yield* this.transition(execution, () => this.reject(operation));
+          } else {
+            yield* Effect.logWarning("Command delivery failed; polling first", delivered.left);
+            retryDelivery = true;
+            break;
+          }
         }
         const current = this.current(execution);
         if (!current) return;
         const batch = yield* driver.poll(execution, current.cursor);
-        const phase = yield* this.transition(execution, (record) => {
+        const accepted = yield* this.transition(execution, (record) => {
           let next = record;
           for (const entry of batch.events) {
             if (entry.seq <= next.cursor) continue;
@@ -769,17 +877,21 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
           if (batch.status === "completed" && !pending) next = { ...next, phase: "checkpointing" };
           this.save(next);
           return pending ? "commands" : next.phase;
-        });
+        }).pipe(Effect.either);
+        if (Either.isLeft(accepted)) {
+          // A protocol violation cannot be retried into success: stop and fail with its code.
+          if (accepted.left._tag !== "ApiError") return yield* Effect.fail(accepted.left);
+          yield* stopAndFail(accepted.left.code);
+          return;
+        }
+        const phase = accepted.right;
         if (!phase) return;
         if (phase === "checkpointing") {
           yield* this.checkpoint(driver, execution);
           return;
         }
         if (batch.status === "failed" || batch.status === "missing") {
-          yield* driver.stop(execution);
-          yield* this.finish(
-            execution,
-            "failed",
+          yield* stopAndFail(
             batch.status === "missing" ? "outcome_unknown" : (batch.error ?? "executor_failed"),
           );
           return;
@@ -789,7 +901,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
           yield* this.finish(execution, "cancelled");
           return;
         }
-        if (phase !== "commands") return;
+        if (phase !== "commands" || retryDelivery) return;
       }
     });
   }
@@ -841,18 +953,13 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   ): void {
     const turnError: SessionTurnError | null = error
       ? {
-          code:
-            error === "request_timeout" ||
-            error === "executor_version_incompatible" ||
-            error === "active_turn_not_steerable" ||
-            error === "context_length_exceeded" ||
-            error === "rate_limit_exceeded" ||
-            error === "sandbox_error"
-              ? error
-              : "internal_error",
+          code: TURN_ERROR_CODES.has(error as SessionTurnError["code"])
+            ? (error as SessionTurnError["code"])
+            : "internal_error",
           message: error,
         }
       : null;
+    const indeterminate = status === "failed" && isIndeterminate(error);
     let after: string | undefined;
     do {
       const page = this.db.list<Turn>(status === "completed" ? "pending_subagent_turn" : "turn", {
@@ -904,10 +1011,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     const next: SessionRecord = {
       ...(status === "completed" ? retained : record),
       execution: null,
-      phase: status === "failed" ? "failed" : "idle",
+      phase: indeterminate ? "failed" : "idle",
       session: {
         ...record.session,
-        status: status === "failed" ? "failed" : "idle",
+        status: indeterminate ? "failed" : "idle",
         error: error ?? null,
         required_actions: [],
       },
@@ -922,21 +1029,50 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       usage: turn.usage,
     });
     this.emit({
-      type: status === "failed" ? "agent.session.failed" : "agent.session.idle",
+      type: indeterminate ? "agent.session.failed" : "agent.session.idle",
       event_id: identifier("evt"),
       session: next.session,
     });
+    // Steer input the runtime refused was never processed: run it now. Cancellation
+    // supersedes it, and an indeterminate session accepts no further input.
+    const queued = this.db.list<QueuedInput>("queued_input", { order: "asc", limit: 100 }).data;
+    this.db.clear("queued_input");
+    if (!queued.length || status === "cancelled" || indeterminate) return;
+    const input = queued.flatMap((entry) => entry.input);
+    const started = this.begin(next, input);
+    this.addInput(started, input);
+    this.save(started);
   }
   async delete(): Promise<{ id: string; object: "agent.session.deleted"; deleted: true }> {
-    const record = this.migrate(this.db.require<SessionRecord>("state", "session"));
+    const stored = this.db.get<SessionRecord>("state", "session");
+    if (!stored) {
+      // A purged object keeps only its tombstone, so a lost-response retry still succeeds.
+      const tombstone = this.db.get<{ id: string }>("state", "tombstone");
+      if (!tombstone) throw new ApiError(404, "not_found", "Session not found");
+      return { id: tombstone.id, object: "agent.session.deleted", deleted: true };
+    }
+    const record = this.migrate(stored);
     if (record.execution)
       throw new ApiError(409, "active_turn", "Cancel the active turn before deleting the session");
     this.save({ ...record, deleted: true });
-    for (const listener of this.listeners.keys()) listener.close();
-    this.listeners.clear();
+    this.closeListeners();
     return { id: record.session.id, object: "agent.session.deleted", deleted: true };
   }
-  stream(after?: number): Response {
+  /** Drop every stored record once the catalog no longer discovers the session. Idempotent. */
+  async purge(): Promise<void> {
+    const record = this.db.get<SessionRecord>("state", "session");
+    if (record && !record.deleted)
+      throw new ApiError(409, "not_deleted", "Delete the session before purging its storage");
+    const id = record?.session.id ?? this.db.get<{ id: string }>("state", "tombstone")?.id;
+    if (!id) return;
+    this.db.transaction(() => {
+      this.db.purge();
+      this.db.put("state", "tombstone", { id });
+    });
+    this.closeListeners();
+    await this.ctx.storage.deleteAlarm();
+  }
+  stream(after?: number, options: { initial?: boolean } = {}): Response {
     this.record();
     if (this.listeners.size >= 64)
       throw new ApiError(429, "stream_limit", "Too many live streams for this session");
@@ -946,13 +1082,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       {
         start: (value) => {
           controller = value;
-          this.listeners.set(value, cursor);
+          this.listeners.set(value, { cursor, initial: options.initial ?? false });
+          this.watch();
           this.flush();
         },
         pull: () => this.flush(),
-        cancel: () => {
-          this.listeners.delete(controller);
-        },
+        cancel: () => this.detach(controller),
       },
       { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength },
     );
@@ -964,19 +1099,64 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       },
     });
   }
+  /** Keepalive comments keep idle proxies from closing a stream while a turn is quiet. */
+  private watch(): void {
+    if (this.keepalive || !this.listeners.size) return;
+    const encoded = new TextEncoder().encode(": keepalive\n\n");
+    this.keepalive = setInterval(() => {
+      for (const listener of this.listeners.keys())
+        if ((listener.desiredSize ?? 0) > 0) listener.enqueue(encoded);
+    }, this.dependencies().keepaliveMs ?? 15_000);
+  }
+  private detach(controller: ReadableStreamDefaultController<Uint8Array>): void {
+    this.listeners.delete(controller);
+    if (this.listeners.size || !this.keepalive) return;
+    clearInterval(this.keepalive);
+    this.keepalive = undefined;
+  }
+  private closeListener(controller: ReadableStreamDefaultController<Uint8Array>): void {
+    try {
+      controller.close();
+    } catch {
+      // The consumer already went away; nothing is left to close.
+    }
+    this.detach(controller);
+  }
+  private closeListeners(): void {
+    for (const listener of [...this.listeners.keys()]) this.closeListener(listener);
+  }
+  /** A creation stream covers the initial turn only, or nothing when no input was given. */
+  private initialSettled(event: AgentSessionEvent): boolean {
+    if (event.type === "agent.session.idle" || event.type === "agent.session.failed") return true;
+    if (event.type !== "agent.session.created") return false;
+    return (
+      !this.active() && this.db.list<Turn>("turn", { order: "asc", limit: 1 }).data.length === 0
+    );
+  }
   private flush(): void {
-    for (const [listener, cursor] of this.listeners) {
-      if ((listener.desiredSize ?? 0) <= 0) continue;
-      const entries = this.db.events<AgentSessionEvent>(cursor, 64);
-      for (const { seq, event } of entries) {
-        if ((listener.desiredSize ?? 0) <= 0) break;
-        listener.enqueue(
-          new TextEncoder().encode(
-            `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
-          ),
-        );
-        this.listeners.set(listener, seq);
+    // enqueue() can call pull() synchronously; a nested flush must not re-read events.
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      for (const [listener, state] of this.listeners) {
+        if ((listener.desiredSize ?? 0) <= 0) continue;
+        const entries = this.db.events<AgentSessionEvent>(state.cursor, 64);
+        for (const { seq, event } of entries) {
+          if ((listener.desiredSize ?? 0) <= 0) break;
+          state.cursor = seq;
+          listener.enqueue(
+            new TextEncoder().encode(
+              `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+            ),
+          );
+          if (state.initial && this.initialSettled(event)) {
+            this.closeListener(listener);
+            break;
+          }
+        }
       }
+    } finally {
+      this.flushing = false;
     }
   }
 }

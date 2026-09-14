@@ -91,7 +91,7 @@ it("overlapping alarms share reconciliation while new input stays independently 
   });
 });
 
-it("a noncontiguous runtime batch rolls back every event and its cursor together", async () => {
+it("a noncontiguous runtime batch rolls back every event and fails the turn at once", async () => {
   const session = await api.beta.agents.sessions.create({
     agent: { model: "test" },
     environment: { type: "none" },
@@ -99,12 +99,15 @@ it("a noncontiguous runtime batch rolls back every event and its cursor together
   const result = await runInDurableObject<SessionDO, unknown>(
     env.SESSIONS.getByName(JSON.stringify(["effect", session.id])),
     async (instance) => {
+      let stops = 0;
       const driver = fromPromiseDriver({
         name: "fixture",
         revision: "test-v1",
         capabilities: { steer: true, functions: true, sandbox: false },
         start: async () => {},
-        stop: async () => {},
+        stop: async () => {
+          stops++;
+        },
         control: async () => {},
         poll: async () => ({
           status: "completed",
@@ -131,14 +134,30 @@ it("a noncontiguous runtime batch rolls back every event and its cursor together
       });
       await instance.submit([message], "initial");
       await instance.alarm();
+      const turn = instance.turns({ order: "asc", limit: 1 }).data[0];
       return {
         cursor: instance.db.require<SessionRecord>("state", "session").cursor,
         outputs: instance
           .items({ order: "asc", limit: 100 })
           .data.filter((item) => item.type === "message" && item.role === "assistant"),
         status: instance.retrieve().status,
+        error: instance.retrieve().error,
+        turn: { status: turn?.status, error: turn?.error },
+        stops,
       };
     },
   );
-  expect(result).toEqual({ cursor: 0, outputs: [], status: "in_progress" });
+  // The batch is rolled back atomically; a protocol violation then fails the turn on the
+  // first occurrence and the session returns to idle instead of retrying until its deadline.
+  expect(result).toEqual({
+    cursor: 0,
+    outputs: [],
+    status: "idle",
+    error: "invalid_runtime_cursor",
+    turn: {
+      status: "failed",
+      error: { code: "internal_error", message: "invalid_runtime_cursor" },
+    },
+    stops: 1,
+  });
 });

@@ -10,12 +10,23 @@ import type {
   JsonWire,
   Turn,
 } from "./protocol.js";
-import { identifier } from "./protocol.js";
+import { ApiError, identifier } from "./protocol.js";
 import type { RuntimeEvent } from "./runtime.js";
 import type { ActiveSession, SessionRecord } from "./session.js";
 import type { SqlStore } from "./storage.js";
 
 type OutputItem = JsonWire<UpstreamOutputItem>;
+/** A runtime event naming state this session never created is a protocol violation, not a retry. */
+function runtimeRecord<T>(db: SqlStore, kind: string, id: string): T {
+  const value = db.get<T>(kind, id);
+  if (!value)
+    throw new ApiError(
+      409,
+      "invalid_runtime_event",
+      `Runtime event references an unknown ${kind}: ${id}`,
+    );
+  return value;
+}
 type AssistantMessage = Extract<OutputItem, { type: "message" }>;
 interface OutputPosition {
   index: number;
@@ -58,7 +69,7 @@ export function acceptRuntimeEvent(
     return record;
   }
   if (event.type === "subagent_turn") {
-    db.require<Subagent>("subagent", event.subagentId);
+    runtimeRecord<Subagent>(db, "subagent", event.subagentId);
     const previous = db.get<Turn>("turn", event.id);
     const turn: Turn = {
       id: event.id,
@@ -109,7 +120,7 @@ export function acceptRuntimeEvent(
   }
   const turnId = event.turnId ?? record.execution.turnId;
   if (event.type === "usage") {
-    const turn = db.require<Turn>("turn", turnId);
+    const turn = runtimeRecord<Turn>(db, "turn", turnId);
     const previous = turn.usage;
     const total = record.session.usage;
     const add = (current: number | undefined, next: number, old: number | undefined) =>
@@ -505,7 +516,7 @@ export function acceptRuntimeEvent(
       ...record,
       session: { ...record.session, required_actions, status: "requires_action" },
     };
-    const turn = db.require<Turn>("turn", turnId);
+    const turn = runtimeRecord<Turn>(db, "turn", turnId);
     turn.status = "waiting";
     db.put("turn", turnId, turn);
     emit({

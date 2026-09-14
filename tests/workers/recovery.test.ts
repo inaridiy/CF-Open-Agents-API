@@ -328,8 +328,12 @@ it("keeps subagent tool results scoped and delays child completion until checkpo
 
 it("interrupted deletion can be retried without breaking tenant listings", async () => {
   const session = await api.beta.agents.sessions.create(params);
+  const other = await api.beta.agents.sessions.create(params);
   // Stop between the two production DELETE RPC calls to model a lost response.
   await stub(session.id).delete();
+  // Discovery still lists the deleted session; the page omits it instead of failing.
+  const during = await api.beta.agents.sessions.list();
+  expect(during.data.map((entry) => entry.id)).toEqual([other.id]);
   const deletion = await api.beta.agents.sessions.delete(session.id).then(
     () => 200,
     (e) => e.status,
