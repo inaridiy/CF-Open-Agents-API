@@ -8,6 +8,28 @@ export {
   runSync,
   type ServiceError,
 } from "./effect.js";
+export {
+  CheckpointIncompatible,
+  CommandRejected,
+  type DomainError,
+  ExecutionMissing,
+  IdempotencyConflict,
+  InvalidCursor,
+  InvalidRuntimeEvent,
+  InvalidSessionState,
+  isDomainError,
+  projectApiError,
+  RecordTooLarge,
+  RuntimeRejected,
+  SessionFailed,
+  SessionNotFound,
+  StorageFailure,
+  Superseded,
+  toApiError,
+  TransportFailure,
+  TurnCheckpointing,
+  UnknownToolCall,
+} from "./errors.js";
 export { HARNESSES, type HarnessName } from "./harnesses.js";
 export { programmaticInputSchema, programmaticTool } from "./programmatic-contract.js";
 export * from "./protocol.js";

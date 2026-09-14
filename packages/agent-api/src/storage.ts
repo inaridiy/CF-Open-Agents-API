@@ -10,6 +10,7 @@ import {
   sql,
 } from "kysely";
 
+import { InvalidCursor, RecordTooLarge } from "./errors.js";
 import type { PageQuery } from "./protocol.js";
 import { ApiError } from "./protocol.js";
 
@@ -24,12 +25,7 @@ function encodeRow(value: unknown, ...keys: string[]): string {
   const size =
     encoder.encode(serialized).byteLength +
     keys.reduce((total, key) => total + encoder.encode(key).byteLength, 0);
-  if (size > MAX_ROW_BYTES)
-    throw new ApiError(
-      413,
-      "storage_record_too_large",
-      "Serialized record exceeds 1,900,000 bytes",
-    );
+  if (size > MAX_ROW_BYTES) throw new RecordTooLarge({ bytes: size });
   return serialized;
 }
 
@@ -197,8 +193,7 @@ export class SqlStore {
           filter.value,
         );
       const cursor = this.execute(cursorQuery)[0];
-      if (!cursor)
-        throw new ApiError(400, "invalid_cursor", "Cursor does not belong to this collection");
+      if (!cursor) throw new InvalidCursor();
       const comparison = query.order === "asc" ? ">" : "<";
       selection = selection.where((eb) =>
         eb.or([

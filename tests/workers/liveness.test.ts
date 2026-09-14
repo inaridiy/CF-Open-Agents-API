@@ -278,7 +278,7 @@ it.each([
         return {
           ...sealed,
           turnError: instance.turns({ order: "asc", limit: 1 }).data[0]?.error,
-          accepted: accepted.ok,
+          accepted: accepted._tag === "Right",
           resumed: instance.retrieve().status,
           // The SDK throws on any event carrying a truthy top-level `error` member.
           topLevelErrors: events.filter((event) => "error" in event && event.error).length,
@@ -484,14 +484,14 @@ it("pages and fork transcripts stay bounded when records are large", async () =>
         after = page.has_more ? (page.last_id ?? undefined) : undefined;
       } while (after);
       const source = JSON.parse(instance.forkSource()) as {
-        ok: boolean;
-        value: { transcript: string };
+        _tag: "Right";
+        right: { transcript: string };
       };
       return {
         firstPage: first.data.length,
         firstHasMore: first.has_more,
         ids,
-        transcript: source.value.transcript.length,
+        transcript: source.right.transcript.length,
       };
     },
   );

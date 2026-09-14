@@ -325,8 +325,13 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
               "model_not_found",
               "No model is registered with this name",
             );
-          return yield* io("model.inference", () =>
-            adapter.fetch(new Request(request, { body: bytes })),
+          return yield* io("model.inference", (signal) =>
+            adapter.fetch(
+              new Request(request, {
+                body: bytes,
+                signal: AbortSignal.any([request.signal, signal]),
+              }),
+            ),
           );
         }).pipe(
           Effect.provide(Layer.sync(Models, () => models(env))),

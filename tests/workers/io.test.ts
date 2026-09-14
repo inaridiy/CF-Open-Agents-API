@@ -1,13 +1,15 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 import { abortAllDurableObjects, reset, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { Effect, Fiber } from "effect";
+import { Effect, Exit, Fiber } from "effect";
 import { afterEach, expect, it } from "vitest";
 
-import { runPromise } from "../../packages/agent-api/src/effect.js";
-import { copyKnownLength } from "../../packages/agent-api/src/files.js";
+import { runPromise, runSync } from "../../packages/agent-api/src/effect.js";
+import { copyKnownLength, uploadInputFile } from "../../packages/agent-api/src/files.js";
 import { proxyMcp } from "../../packages/agent-api/src/mcp.js";
 import { nativeModel } from "../../packages/agent-api/src/models.js";
+import type { Execution } from "../../packages/agent-api/src/runtime.js";
+import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import { VaultRepository } from "../../packages/agent-api/src/vaults.js";
 import type { CatalogDO, TestEnv } from "./worker.js";
 
@@ -285,4 +287,91 @@ it("a late OAuth response cannot overwrite a manual rotation, even back to the s
       expect(await runPromise(repository.token([vault.id], serverURL))).toBe("current");
     },
   );
+});
+
+const execution: Execution = {
+  sessionId: "sess_interrupt",
+  turnId: "turn_interrupt",
+  generation: 1,
+  harness: "fixture",
+  model: "fixture-model",
+  agent: { model: "test" },
+  input: [],
+  checkpoint: null,
+  deadline: Date.now() + 60_000,
+  sandbox: false,
+};
+
+it("interrupting a fiber mid-driver call aborts the underlying Promise through io's signal", async () => {
+  const entered = Promise.withResolvers<void>();
+  const aborted = Promise.withResolvers<unknown>();
+  const driver = fromPromiseDriver({
+    name: "fixture",
+    revision: "test-v1",
+    capabilities: { steer: true, functions: true, sandbox: false },
+    start: async () => {},
+    stop: async () => {},
+    control: async () => {},
+    checkpoint: async () => ({ version: 1, driver: "fixture", revision: "test-v1", native: "x" }),
+    // A poll that only ends when the fiber's interruption reaches it, like a containerFetch.
+    poll: (_execution, _after, signal) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            aborted.resolve(signal.reason);
+            reject(signal.reason as Error);
+          },
+          { once: true },
+        );
+        entered.resolve();
+      }),
+  });
+  const fiber = Effect.runFork(driver.poll(execution, 0));
+  await entered.promise;
+  const exit = await runPromise(Fiber.interrupt(fiber));
+  expect(Exit.isInterrupted(exit)).toBe(true);
+  expect(await aborted.promise).toBeInstanceOf(Error);
+});
+
+it("an uninterruptible R2 write completes before its interrupted fiber stops", async () => {
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  let key: string | undefined;
+  const bucket = {
+    put: async (name: string, body: ReadableStream, options?: R2PutOptions) => {
+      key = name;
+      entered.resolve();
+      await gate.promise;
+      return env.ASSETS.put(name, body, options);
+    },
+  } as unknown as R2Bucket;
+  const form = new FormData();
+  form.set("file", new File(["durable bytes"], "note.txt", { type: "text/plain" }));
+  form.set("purpose", "user_data");
+  const fiber = Effect.runFork(uploadInputFile(bucket, form));
+  await entered.promise;
+  let settled = false;
+  const interrupted = runPromise(Fiber.interrupt(fiber)).then((exit) => {
+    settled = true;
+    return exit;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  // The interrupt is queued behind the put; the fiber has not stopped yet.
+  expect(settled).toBe(false);
+  gate.resolve();
+  const exit = await interrupted;
+  expect(Exit.isInterrupted(exit)).toBe(true);
+  if (!key) throw new Error("The write never started");
+  expect(await (await env.ASSETS.get(key))?.text()).toBe("durable bytes");
+});
+
+it("runSync refuses to run an effect that suspends and names the operation", () => {
+  expect(runSync(Effect.succeed(1))).toBe(1);
+  expect(() =>
+    runSync(
+      Effect.promise(() => Promise.resolve(1)),
+      "test.async",
+    ),
+  ).toThrow(/test\.async ran an asynchronous effect/);
 });

@@ -1,7 +1,13 @@
-import { type Effect, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
-import { io, type ServiceError } from "./effect.js";
 import type { EnvironmentDriver } from "./environments.js";
+import {
+  CommandRejected,
+  ExecutionMissing,
+  rejection,
+  RuntimeRejected,
+  TransportFailure,
+} from "./errors.js";
 import type { AgentConfig, InputMessage, JsonValue } from "./protocol.js";
 import { agentConfigSchema, functionOutputSchema, inputMessageSchema } from "./protocol.js";
 
@@ -275,6 +281,10 @@ export type RuntimeBatch = typeof batchSchema.Type;
 /**
  * Implementations must deduplicate start/control by operationId. A missing job
  * after an acknowledged start means outcome_unknown, never permission to replay.
+ *
+ * Failures are typed per method. `TransportFailure` is the only retryable one: no
+ * answer, or an answer nobody can classify. Every other tag is a definite answer that
+ * the reconciler acts on at once and never retries.
  */
 export interface RuntimeDriver {
   readonly name: string;
@@ -304,35 +314,73 @@ export interface RuntimeDriver {
      */
     toolsFixedAtStart?: boolean;
   };
-  start(execution: Execution, operationId: string): Effect.Effect<void, ServiceError>;
-  poll(execution: Execution, after: number): Effect.Effect<RuntimeBatch, ServiceError>;
+  start(
+    execution: Execution,
+    operationId: string,
+  ): Effect.Effect<void, RuntimeRejected | TransportFailure>;
+  poll(execution: Execution, after: number): Effect.Effect<RuntimeBatch, TransportFailure>;
   control(
     execution: Execution,
     operationId: string,
     command: RuntimeCommand,
-  ): Effect.Effect<void, ServiceError>;
-  checkpoint(execution: Execution): Effect.Effect<Checkpoint, ServiceError>;
-  stop(execution: Execution): Effect.Effect<void, ServiceError>;
+  ): Effect.Effect<void, CommandRejected | ExecutionMissing | TransportFailure>;
+  checkpoint(execution: Execution): Effect.Effect<Checkpoint, RuntimeRejected | TransportFailure>;
+  stop(execution: Execution): Effect.Effect<void, TransportFailure>;
 }
 
-/** Migration adapter for external Promise drivers. All calls are lazy and typed. */
-export type PromiseRuntimeDriver = {
-  [K in keyof RuntimeDriver]: RuntimeDriver[K] extends (
-    ...args: infer P
-  ) => Effect.Effect<infer A, ServiceError>
-    ? (...args: P) => Promise<A>
-    : RuntimeDriver[K];
+/**
+ * Migration adapter for external Promise drivers. All calls are lazy and typed. Each
+ * method also receives the fiber's interruption signal; a driver that can cancel the
+ * underlying call should honor it, and one that cannot may ignore it.
+ *
+ * A thrown `{ status, code }` answer (an `ApiError`, its RPC wire name, or a plain
+ * object) is a definite rejection: `404 execution_missing` and any other answer to
+ * `control` become `ExecutionMissing` and `CommandRejected`; an answer to `start` or
+ * `checkpoint` becomes `RuntimeRejected`. Everything else is a `TransportFailure`.
+ */
+export interface PromiseRuntimeDriver {
+  readonly name: string;
+  readonly revision: string;
+  readonly capabilities: RuntimeDriver["capabilities"];
+  start(execution: Execution, operationId: string, signal: AbortSignal): Promise<void>;
+  poll(execution: Execution, after: number, signal: AbortSignal): Promise<RuntimeBatch>;
+  control(
+    execution: Execution,
+    operationId: string,
+    command: RuntimeCommand,
+    signal: AbortSignal,
+  ): Promise<void>;
+  checkpoint(execution: Execution, signal: AbortSignal): Promise<Checkpoint>;
+  stop(execution: Execution, signal: AbortSignal): Promise<void>;
+}
+const call = <A, E>(f: (signal: AbortSignal) => Promise<A>, onFailure: (cause: unknown) => E) =>
+  Effect.tryPromise({ try: (signal) => f(signal), catch: onFailure });
+const transport = (operation: string) => (cause: unknown) =>
+  new TransportFailure({ operation, cause });
+const rejected = (operation: string) => (cause: unknown) => {
+  const answer = rejection(cause);
+  return answer ? new RuntimeRejected(answer) : transport(operation)(cause);
+};
+const refused = (cause: unknown) => {
+  const answer = rejection(cause);
+  if (!answer) return transport("runtime.control")(cause);
+  return answer.status === 404 && answer.code === "execution_missing"
+    ? new ExecutionMissing({ message: answer.message })
+    : new CommandRejected({ code: answer.code, message: answer.message });
 };
 export const fromPromiseDriver = (driver: PromiseRuntimeDriver): RuntimeDriver => ({
   name: driver.name,
   revision: driver.revision,
   capabilities: driver.capabilities,
-  start: (execution, id) => io("runtime.start", () => driver.start(execution, id)),
-  poll: (execution, after) => io("runtime.poll", () => driver.poll(execution, after)),
+  start: (execution, id) =>
+    call((signal) => driver.start(execution, id, signal), rejected("runtime.start")),
+  poll: (execution, after) =>
+    call((signal) => driver.poll(execution, after, signal), transport("runtime.poll")),
   control: (execution, id, command) =>
-    io("runtime.control", () => driver.control(execution, id, command)),
-  checkpoint: (execution) => io("runtime.checkpoint", () => driver.checkpoint(execution)),
-  stop: (execution) => io("runtime.stop", () => driver.stop(execution)),
+    call((signal) => driver.control(execution, id, command, signal), refused),
+  checkpoint: (execution) =>
+    call((signal) => driver.checkpoint(execution, signal), rejected("runtime.checkpoint")),
+  stop: (execution) => call((signal) => driver.stop(execution, signal), transport("runtime.stop")),
 });
 
 export interface AgentRegistration {
