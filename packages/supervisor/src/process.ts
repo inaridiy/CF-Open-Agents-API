@@ -54,6 +54,35 @@ export class ProcessGone extends Data.TaggedError("ProcessGone")<{ readonly mess
 export class StartupTimeout extends Data.TaggedError("StartupTimeout")<{
   readonly message: string;
 }> {}
+/** The native runtime could not be brought up; `cause` names the step that refused. */
+export class NativeStartupFailed extends Data.TaggedError("NativeStartupFailed")<{
+  readonly runtime: string;
+  readonly cause: unknown;
+}> {
+  override get message(): string {
+    return `${this.runtime} startup failed`;
+  }
+}
+/** The native process ended while its turn was still open. */
+export class NativeExited extends Data.TaggedError("NativeExited")<{
+  readonly runtime: string;
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}> {
+  override get message(): string {
+    return `${this.runtime} exited (code ${this.code ?? "none"}, signal ${this.signal ?? "none"})`;
+  }
+}
+/** The native turn ended in failure; `code` is the public batch error it was reported as. */
+export class NativeTurnFailed extends Data.TaggedError("NativeTurnFailed")<{
+  readonly runtime: string;
+  readonly code: string;
+  readonly reason: string;
+}> {
+  override get message(): string {
+    return `${this.runtime} turn failed (${this.code}): ${this.reason}`;
+  }
+}
 
 /**
  * Resolves once `ready` accepts the tail of the process's stdout, and fails when the

@@ -14,20 +14,21 @@ import {
 import type { BetaContentBlock } from "@anthropic-ai/sdk/resources/beta";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ApiError,
-  type Execution,
-  type InputMessage,
-  io,
-  workspaceTools,
-} from "cf-open-agents-api";
-import { Data, Effect } from "effect";
+import { type Execution, type InputMessage, io, workspaceTools } from "cf-open-agents-api";
+import { Effect } from "effect";
 import { z } from "zod";
 
 import { type NativeOptions, ToolJob, type ToolScope } from "./job.js";
-import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
+import {
+  CommandRejected,
+  describeFailure,
+  ExecutionStopped,
+  type TurnErrorCode,
+  Wake,
+  within,
+} from "./lifecycle.js";
 import { imageContent } from "./media.js";
-import { exitedWithin } from "./process.js";
+import { exitedWithin, NativeStartupFailed, NativeTurnFailed } from "./process.js";
 
 /** Tool input key that carries a subagent attribution from the PreToolUse hook to the MCP handler. */
 const SCOPE_KEY = "__cf_scope";
@@ -36,12 +37,7 @@ const INTERRUPT_GRACE = "10 seconds";
 /** Time allowed for the CLI to exit and flush its session files once its input ends. */
 const EXIT_GRACE = "5 seconds";
 
-/** The CLI's message stream ended without the turn's result. */
-class ClaudeCodeExited extends Data.TaggedError("ClaudeCodeExited")<{}> {
-  override get message(): string {
-    return "Claude Code exited without a completed result";
-  }
-}
+const RUNTIME = "claude-code";
 const SUBAGENT_PROMPT =
   "You are a subagent working on one delegated subtask for the main agent. Complete the subtask with the tools available and reply with a concise report of the result.";
 
@@ -50,8 +46,9 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   private readonly items: SDKUserMessage[] = [];
   private wake?: () => void;
   closed = false;
+  /** The queue closes with the turn; a push after that has nowhere to go. */
   push(message: SDKUserMessage): void {
-    if (this.closed) throw new Error("Input is closed");
+    if (this.closed) throw new ExecutionStopped();
     this.items.push(message);
     this.wake?.();
   }
@@ -213,7 +210,10 @@ export class ClaudeCodeJob extends ToolJob {
     for (const definition of this.toolDefinitions()) {
       const schema = z.fromJSONSchema(z.record(z.string(), z.json()).parse(definition.inputSchema));
       if (!(schema instanceof z.ZodObject))
-        throw new Error("Tool parameters must describe an object");
+        throw new NativeStartupFailed({
+          runtime: RUNTIME,
+          cause: `Tool ${definition.name} parameters must describe an object`,
+        });
       instance.registerTool(
         definition.name,
         {
@@ -387,7 +387,12 @@ export class ClaudeCodeJob extends ToolJob {
         // The turn is exposed as complete only once the CLI has written its history.
         yield* this.cliExited();
         if (this.cancelling) return;
-        if (outcome !== "completed") return yield* new ClaudeCodeExited();
+        if (outcome !== "completed")
+          return yield* new NativeTurnFailed({
+            runtime: RUNTIME,
+            code: "native_harness_failed",
+            reason: "Claude Code exited without a completed result",
+          });
       }),
     );
   }
@@ -410,7 +415,10 @@ export class ClaudeCodeJob extends ToolJob {
           (server) => server.name === "workspace" && server.status === "connected",
         )
       )
-        throw new Error("Workspace MCP server failed to connect");
+        throw new NativeStartupFailed({
+          runtime: RUNTIME,
+          cause: "Workspace MCP server failed to connect",
+        });
       if (message.type === "system" && message.subtype === "task_started") {
         if (message.tool_use_id) {
           const child = this.child({ taskToolUseId: message.tool_use_id }, message.task_id);
@@ -799,7 +807,7 @@ export class ClaudeCodeJob extends ToolJob {
   }
   protected override steer(messages: InputMessage[]) {
     return Effect.gen(this, function* () {
-      const finished = () => new ApiError(409, "command_rejected", "Turn has already finished");
+      const finished = () => new CommandRejected({ reason: "Turn has already finished" });
       const input = this.input;
       if (!input || this.finished || input.closed) return yield* finished();
       const message = yield* io("claude.input", () => this.userMessage(messages));

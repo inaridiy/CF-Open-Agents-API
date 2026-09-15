@@ -167,7 +167,7 @@ it("duplicate operation IDs share both success and uncertain failures and reject
   expect(outcomes.every((result) => result.status === "rejected")).toBe(true);
   await expect(
     runPromise(operations.perform("op", { output: "changed" }, Effect.void)),
-  ).rejects.toMatchObject({ code: "idempotency_conflict" });
+  ).rejects.toMatchObject({ _tag: "IdempotencyConflict" });
   await expect(runPromise(operations.perform("op", { output: "first" }, write))).rejects.toThrow();
   expect(writes).toBe(1);
 });

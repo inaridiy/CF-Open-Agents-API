@@ -2,29 +2,30 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Execution, RuntimeCommand } from "cf-open-agents-api";
-import {
-  ApiError,
-  attempt,
-  io,
-  type JsonValue,
-  OperationError,
-  programmaticTool,
-  workspaceTools,
-} from "cf-open-agents-api";
+import { attempt, io, type JsonValue, programmaticTool, workspaceTools } from "cf-open-agents-api";
 import { Deferred, Effect, type Scope, Stream } from "effect";
 import { z } from "zod";
 
 import { restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS } from "./delegation.js";
-import { Job, type JobOptions, type ToolError, ToolUnavailable } from "./job.js";
+import { Job, type JobOptions, ToolUnavailable } from "./job.js";
 import { AppServer, type RpcFailure, type RpcMessage } from "./json-rpc.js";
 import {
+  asFailure,
+  CommandRejected,
   describeFailure,
   ExecutionCancelled,
   ExecutionStopped,
+  type TaggedFailure,
   type TurnErrorCode,
 } from "./lifecycle.js";
-import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
+import {
+  CodeCallsOutstanding,
+  codeEnabled,
+  codeToolNames,
+  executeCode,
+  functionArguments,
+} from "./programmatic.js";
 import { executeWorkspace } from "./workspace.js";
 
 const threadResponse = z.object({ thread: z.object({ id: z.string() }) });
@@ -979,7 +980,7 @@ export class CodexJob extends Job {
   }
   protected apply(id: string, command: RuntimeCommand) {
     return Effect.gen(this, function* () {
-      const rejected = (message: string) => new ApiError(409, "command_rejected", message);
+      const rejected = (reason: string) => new CommandRejected({ reason });
       if (command.type === "cancel") {
         // Idempotent: a terminal or unstarted job has nothing left to interrupt.
         if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
@@ -1079,7 +1080,7 @@ export class CodexJob extends Job {
         invocation,
       );
       if (result.terminal || (result.isError && this.pendingCode.size))
-        throw new Error("Code execution left unfinished tool calls");
+        throw new CodeCallsOutstanding();
       this.server?.respond(requestId, {
         success: !result.isError,
         contentItems: result.content.map((part) => ({ type: "inputText", text: part.text })),
@@ -1104,7 +1105,7 @@ export class CodexJob extends Job {
     ),
     nextCursor: z.string().nullish(),
   });
-  codeTools(invocation: string): Effect.Effect<string[], ToolError> {
+  codeTools(invocation: string): Effect.Effect<string[], TaggedFailure> {
     return Effect.gen(this, function* () {
       const context = this.codeInvocations.get(invocation);
       const server = this.server;
@@ -1144,16 +1145,14 @@ export class CodexJob extends Job {
           return yield* new ToolUnavailable({ message: "MCP pagination did not advance" });
         if (cursor) seen.add(cursor);
       } while (cursor);
-      return [
-        ...(this.execution.agent.tools ?? []).flatMap((tool) =>
-          tool.type === "function" ? [tool.name] : [],
-        ),
-        ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
-        ...context.mcp.keys(),
-      ];
-    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTools")));
+      return [...codeToolNames(this.execution), ...context.mcp.keys()];
+    }).pipe(Effect.mapError(asFailure("codex.codeTools")));
   }
-  codeTool(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError> {
+  codeTool(
+    name: string,
+    args: unknown,
+    invocation: string,
+  ): Effect.Effect<JsonValue, TaggedFailure> {
     return Effect.gen(this, function* () {
       const context = this.codeInvocations.get(invocation);
       if (!context) return yield* new ToolUnavailable({ message: "No active code invocation" });
@@ -1231,7 +1230,7 @@ export class CodexJob extends Job {
       });
       this.lifecycle.setStatus("waiting");
       return yield* Deferred.await(result);
-    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTool")));
+    }).pipe(Effect.mapError(asFailure("codex.codeTool")));
   }
   private interruptNative(threadId: string, turnId: string): Effect.Effect<void, RpcFailure> {
     return this.server
@@ -1246,10 +1245,3 @@ export class CodexJob extends Job {
       : Effect.void;
   }
 }
-/** Tool-path failures keep their tag; everything else is transient I/O for the route. */
-const rpcToServiceError =
-  (operation: string) =>
-  (cause: unknown): ToolError =>
-    cause instanceof ToolUnavailable || cause instanceof ApiError || cause instanceof OperationError
-      ? cause
-      : new OperationError({ operation, cause });

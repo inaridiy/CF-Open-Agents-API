@@ -4,7 +4,24 @@ import {
   workspaceResultSchema,
   workspaceTools,
 } from "cf-open-agents-api";
+import { Data } from "effect";
 import { z } from "zod";
+
+/** The execution has no sandbox, or the job is stopping: no workspace call can be made. */
+export class NoSandboxAssignment extends Data.TaggedError("NoSandboxAssignment")<{}> {
+  override get message(): string {
+    return "No active sandbox assignment";
+  }
+}
+/** The sandbox refused or broke off a workspace tool call; the model reads `reason`. */
+export class WorkspaceToolFailed extends Data.TaggedError("WorkspaceToolFailed")<{
+  readonly tool: string;
+  readonly reason: string;
+}> {
+  override get message(): string {
+    return this.reason;
+  }
+}
 
 const streamEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("delta"), text: z.string() }),
@@ -31,12 +48,13 @@ export async function executeWorkspace(
       body: JSON.stringify({ tool: name, arguments: input }),
       signal,
     });
-    if (!response.ok) throw new Error(`Sandbox operation failed (${response.status})`);
+    const failed = (reason: string) => new WorkspaceToolFailed({ tool: name, reason });
+    if (!response.ok) throw failed(`Sandbox operation failed (${response.status})`);
     let result: z.infer<typeof workspaceResultSchema> | undefined;
     if (!response.headers.get("content-type")?.includes("application/x-ndjson"))
       result = workspaceResultSchema.parse(await response.json());
     else {
-      if (!response.body) throw new Error("Missing command stream");
+      if (!response.body) throw failed("Missing command stream");
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -46,7 +64,7 @@ export async function executeWorkspace(
           buffer += chunk.done
             ? decoder.decode()
             : decoder.decode(chunk.value as Uint8Array, { stream: true });
-          if (buffer.length > 8_000_000) throw new Error("Command stream exceeds its limit");
+          if (buffer.length > 8_000_000) throw failed("Command stream exceeds its limit");
           for (;;) {
             const boundary = buffer.indexOf("\n");
             if (boundary < 0) break;
@@ -54,7 +72,7 @@ export async function executeWorkspace(
             buffer = buffer.slice(boundary + 1);
             if (!line) continue;
             const event = streamEvent.parse(JSON.parse(line));
-            if (event.type === "error") throw new Error(event.message);
+            if (event.type === "error") throw failed(event.message);
             // Callers parse the result strictly; the stream tag must not leak into it.
             if (event.type === "result") result = { text: event.text, exitCode: event.exitCode };
             else {
@@ -68,7 +86,7 @@ export async function executeWorkspace(
         await reader.cancel();
       }
     }
-    if (!result) throw new Error("Command stream ended without a result");
+    if (!result) throw failed("Command stream ended without a result");
     if (command)
       emit({
         type: "command",

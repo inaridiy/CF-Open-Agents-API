@@ -1,8 +1,8 @@
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { decodeEffect, io, type ServiceError } from "cf-open-agents-api";
-import { Context, Data, Effect, Layer, type ParseResult, Ref, Schema } from "effect";
+import { io, type ServiceError } from "cf-open-agents-api";
+import { Context, Data, Effect, Layer, Ref, Schema } from "effect";
 
 import { Buffer } from "./buffer.js";
 
@@ -31,11 +31,19 @@ export class InvalidCheckpointPath extends Data.TaggedError("InvalidCheckpointPa
     return "Invalid checkpoint path";
   }
 }
+/** The bundle handed to `restore` is not one `capture` produced. */
+export class InvalidCheckpoint extends Data.TaggedError("InvalidCheckpoint")<{
+  readonly issues: string;
+}> {
+  override get message(): string {
+    return `Invalid native checkpoint: ${this.issues}`;
+  }
+}
 export type CheckpointError =
   | ServiceError
   | CheckpointTooLarge
   | InvalidCheckpointPath
-  | ParseResult.ParseError;
+  | InvalidCheckpoint;
 class CheckpointFiles extends Context.Tag("supervisor/CheckpointFiles")<
   CheckpointFiles,
   {
@@ -102,7 +110,11 @@ export function capture(
 export function restore(home: string, value: unknown): Effect.Effect<string, CheckpointError> {
   return Effect.gen(function* () {
     const fs = yield* CheckpointFiles;
-    const bundle = yield* decodeEffect(bundleSchema, value);
+    const invalid = (error: { readonly message: string }) =>
+      new InvalidCheckpoint({ issues: error.message });
+    const bundle = yield* Schema.decodeUnknown(bundleSchema, { onExcessProperty: "error" })(
+      value,
+    ).pipe(Effect.mapError(invalid));
     // Decode and validate every entry before the first filesystem write.
     let bytes = 0;
     const entries = yield* Effect.forEach(Object.entries(bundle.files), ([path, encoded]) =>
@@ -114,7 +126,9 @@ export function restore(home: string, value: unknown): Effect.Effect<string, Che
           path.split("/").some((part) => !part || part === "." || part === "..")
         )
           return yield* new InvalidCheckpointPath({ path });
-        const data = yield* Schema.decodeUnknown(Schema.Uint8ArrayFromBase64)(encoded);
+        const data = yield* Schema.decodeUnknown(Schema.Uint8ArrayFromBase64)(encoded).pipe(
+          Effect.mapError(invalid),
+        );
         bytes += data.byteLength;
         if (bytes > MAX_BYTES) return yield* new CheckpointTooLarge({});
         return { path, data };

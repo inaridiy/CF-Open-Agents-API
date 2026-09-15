@@ -16,19 +16,19 @@ import type {
   ToolPart,
 } from "@opencode-ai/sdk/v2/types";
 import {
-  ApiError,
   type Execution,
   type InputMessage,
   io,
+  OperationError,
   type RuntimeEvent,
 } from "cf-open-agents-api";
-import { Data, Deferred, Effect, Option } from "effect";
+import { Deferred, Effect, Option } from "effect";
 
 import { Buffer } from "./buffer.js";
 import { type NativeOptions, ToolJob } from "./job.js";
-import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
+import { CommandRejected, describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
 import { imageContent } from "./media.js";
-import { awaitReady } from "./process.js";
+import { awaitReady, NativeExited, NativeStartupFailed, NativeTurnFailed } from "./process.js";
 
 type Client = ReturnType<typeof createOpencodeClient>;
 type PromptRequest = Parameters<Client["session"]["prompt"]>[0];
@@ -50,10 +50,7 @@ const STARTUP_BOUND = "30 seconds";
 /** Time allowed for the event feed to echo a barrier before the turn goes on without it. */
 const BARRIER_BOUND = "10 seconds";
 
-/** The native turn cannot continue; the message names the OpenCode condition. */
-class OpenCodeTurnFailed extends Data.TaggedError("OpenCodeTurnFailed")<{
-  readonly message: string;
-}> {}
+const RUNTIME = "opencode";
 
 interface ChildState {
   readonly sessionId: string;
@@ -165,7 +162,8 @@ export class OpenCodeJob extends ToolJob {
     reservation.listen(0, "127.0.0.1");
     await once(reservation, "listening");
     const address = reservation.address();
-    if (!address || typeof address === "string") throw new Error("No OpenCode port available");
+    if (!address || typeof address === "string")
+      throw new NativeStartupFailed({ runtime: RUNTIME, cause: "No port available" });
     await new Promise<void>((resolve) => reservation.close(() => resolve()));
     const sandbox = this.execution.sandbox;
     const subagents = this.subagentsEnabled;
@@ -295,9 +293,9 @@ export class OpenCodeJob extends ToolJob {
     // The job's resources own the server process: closing them terminates it (SIGTERM, 5 s, SIGKILL).
     await this.own(child, "5 seconds");
     child.stderr?.on("data", (data) => this.options.diagnostics(String(data)));
-    child.once("exit", () => {
+    child.once("exit", (code, signal) => {
       if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
-        this.failStart(new Error("OpenCode exited"));
+        this.failStart(new NativeExited({ runtime: RUNTIME, code, signal }));
     });
     await this.perform(
       awaitReady(
@@ -317,7 +315,11 @@ export class OpenCodeJob extends ToolJob {
     const sessionId =
       previous ??
       (await client.session.create({ title: this.execution.sessionId }, { signal })).data?.id;
-    if (!sessionId) throw new Error("OpenCode did not create a session");
+    if (!sessionId)
+      throw new NativeStartupFailed({
+        runtime: RUNTIME,
+        cause: "OpenCode did not create a session",
+      });
     this.sessionId = sessionId;
     if (previous) await client.session.get({ sessionID: previous }, { signal });
     this.run(this.turn(client));
@@ -570,24 +572,31 @@ export class OpenCodeJob extends ToolJob {
           Effect.forkScoped,
         );
         yield* Deferred.await(subscribed);
-        const failed = (message: string) => new OpenCodeTurnFailed({ message });
-        if (streamError) return yield* failed(describeFailure(streamError));
+        // The public code is applied where the condition is seen; the tag carries it for diagnostics.
+        const failed = (code: string, reason: string) =>
+          new NativeTurnFailed({ runtime: RUNTIME, code, reason });
+        if (streamError)
+          return yield* failed("native_harness_failed", describeFailure(streamError));
         const prompt = (input: PromptParts) =>
           Effect.gen(this, function* () {
             const result = yield* io("opencode.prompt", (signal) =>
               client.session.prompt(this.promptRequest(input), { signal: this.signals(signal) }),
             );
-            if (streamError) return yield* failed(describeFailure(streamError));
+            if (streamError)
+              return yield* failed("native_harness_failed", describeFailure(streamError));
             const info = result.data?.info;
             if (!result.data || !info)
-              return yield* failed("OpenCode returned no assistant message");
+              return yield* failed(
+                "native_harness_failed",
+                "OpenCode returned no assistant message",
+              );
             if (info.error) {
               if (info.error.name === "MessageAbortedError")
-                return yield* failed("OpenCode turn aborted");
+                return yield* failed("native_harness_failed", "OpenCode turn aborted");
               const mapped = opencodeTurnError(info.error);
               this.options.diagnostics(`opencode ${info.error.name}: ${mapped.detail}`);
               this.lifecycle.fail(mapped.code);
-              return yield* failed(`OpenCode turn failed: ${info.error.name}`);
+              return yield* failed(mapped.code, `OpenCode turn failed: ${info.error.name}`);
             }
             const finish = info.finish ?? "stop";
             // A structured answer is delivered through the StructuredOutput tool call.
@@ -595,7 +604,7 @@ export class OpenCodeJob extends ToolJob {
             if (!structured && !["stop", "end_turn", "unknown"].includes(finish)) {
               this.options.diagnostics(`opencode finish=${finish}`);
               this.lifecycle.fail("internal_error");
-              return yield* failed(`OpenCode turn finished with ${finish}`);
+              return yield* failed("internal_error", `OpenCode turn finished with ${finish}`);
             }
             return result.data;
           });
@@ -743,16 +752,12 @@ export class OpenCodeJob extends ToolJob {
     return Effect.gen(this, function* () {
       const client = this.client;
       if (!client || !this.sessionId)
-        return yield* new ApiError(409, "command_rejected", "OpenCode session is not running");
+        return yield* new CommandRejected({ reason: "OpenCode session is not running" });
       const parts = yield* io("opencode.input", () => this.inputParts(input));
       yield* this.locked(
         Effect.gen(this, function* () {
           if (this.settling || this.closing)
-            return yield* new ApiError(
-              409,
-              "command_rejected",
-              "OpenCode turn has already settled",
-            );
+            return yield* new CommandRejected({ reason: "OpenCode turn has already settled" });
           const stored = yield* io("opencode.steer", (signal) =>
             client.session.prompt(
               { ...this.promptRequest(parts), noReply: true },
@@ -760,10 +765,12 @@ export class OpenCodeJob extends ToolJob {
             ),
           );
           // With `noReply` the created user message is returned instead of an assistant one.
+          // A stored message we cannot see is an unknown outcome: transient, so the Worker retries.
           const info = stored.data?.info as Message | undefined;
           if (info?.role !== "user")
-            return yield* new OpenCodeTurnFailed({
-              message: "OpenCode did not store the steered message",
+            return yield* new OperationError({
+              operation: "opencode.steer",
+              cause: "OpenCode did not store the steered message",
             });
           this.steered.set(info.id, parts);
         }),

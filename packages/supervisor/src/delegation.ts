@@ -1,6 +1,5 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
-  ApiError,
   attempt,
   batchSchema,
   decodeEffect,
@@ -14,7 +13,7 @@ import {
 import { Data, Deferred, Duration, Effect, type Scope } from "effect";
 import { z } from "zod";
 
-import { within } from "./lifecycle.js";
+import { CommandRejected, within } from "./lifecycle.js";
 
 type ChildStatus = "in_progress" | "completed" | "cancelled" | "failed";
 interface Child {
@@ -470,7 +469,7 @@ export class Delegations {
     child: Child,
     operationId: string,
     command: Extract<RuntimeCommand, { type: "tool_result" }>,
-  ): Effect.Effect<void, ApiError | RouteError> {
+  ): Effect.Effect<void, CommandRejected | RouteError> {
     return Effect.gen(this, function* () {
       const routed = yield* this.request(`${this.execution.turnId}/${child.subagentId}/control`, {
         operationId,
@@ -480,11 +479,9 @@ export class Delegations {
         if (routed.left._tag !== "DelegateRouteError" || routed.left.status !== 409)
           return yield* routed.left;
         child.pending.delete(command.callId);
-        return yield* new ApiError(
-          409,
-          "command_rejected",
-          `Delegated subagent ${child.subagentId} no longer accepts tool results`,
-        );
+        return yield* new CommandRejected({
+          reason: `Delegated subagent ${child.subagentId} no longer accepts tool results`,
+        });
       }
       child.pending.delete(command.callId);
     });

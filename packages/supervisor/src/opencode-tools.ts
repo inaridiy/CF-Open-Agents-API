@@ -1,10 +1,12 @@
 import { workspaceResultSchema, workspaceTools } from "cf-open-agents-api";
 import { z } from "zod";
 
+import { NoSandboxAssignment, WorkspaceToolFailed } from "./workspace.js";
+
 /** OpenCode gives same-name plugin tools precedence over its built-in tools. */
 export default async function workspacePlugin() {
   const endpoint = process.env.CF_WORKSPACE_ENDPOINT;
-  if (!endpoint) throw new Error("No workspace endpoint is configured");
+  if (!endpoint) throw new NoSandboxAssignment();
   const definitions = {
     bash: {
       command: z.string(),
@@ -46,7 +48,11 @@ export default async function workspacePlugin() {
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ tool: name, arguments: normalized }),
             });
-            if (!response.ok) throw new Error("Sandbox tool failed");
+            if (!response.ok)
+              throw new WorkspaceToolFailed({
+                tool: name,
+                reason: `Sandbox tool failed (${response.status})`,
+              });
             const result = workspaceResultSchema.parse(await response.json());
             return result.text;
           },
