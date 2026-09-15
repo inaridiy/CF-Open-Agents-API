@@ -13,6 +13,7 @@ import {
   type RuntimeEvent,
   runPromise,
 } from "../../packages/agent-api/src/index.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { CodexJob, type CodexOptions, turnErrorCode } from "../../packages/supervisor/src/codex.js";
 
 const cleanup: (() => Promise<unknown>)[] = [];
@@ -66,7 +67,7 @@ async function runCodex(
   const requests: Record<string, unknown>[] = [];
   const handle = async (request: IncomingMessage, response: ServerResponse) => {
     const chunks: Uint8Array[] = [];
-    for await (const chunk of request) chunks.push(chunk);
+    for await (const chunk of request) chunks.push(chunk as Uint8Array);
     const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
     requests.push(body);
     script(body, response, requests.length);
@@ -184,7 +185,7 @@ it("maps every documented codexErrorInfo variant without throwing", () => {
   );
   expect(turnErrorCode("other")).toBe("internal_error");
   expect(turnErrorCode(null)).toBe("internal_error");
-  expect(turnErrorCode(undefined)).toBe("internal_error");
+  expect(turnErrorCode(void 0)).toBe("internal_error");
 });
 
 /**

@@ -2,11 +2,25 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+/**
+ * @param {string} root
+ * @returns {string[]}
+ */
 export function checkHarness(root) {
+  /** @type {string[]} */
   const errors = [];
+  /**
+   * @param {string} file
+   * @returns {string}
+   */
   const read = (file) => readFileSync(join(root, file), "utf8");
-  const config = JSON.parse(read(".agents/harness.json"));
-  const lock = JSON.parse(read("skills-lock.json"));
+  const config = /** @type {{ documents: string[], localSkills: string[] }} */ (
+    JSON.parse(read(".agents/harness.json"))
+  );
+  const lock =
+    /** @type {{ skills: Record<string, { source?: string, skillPath?: string, computedHash?: string }> }} */ (
+      JSON.parse(read("skills-lock.json"))
+    );
   const documents = new Set(["AGENTS.md", "CLAUDE.md", ...config.documents]);
   for (const name of readdirSync(join(root, "docs")))
     if (name.endsWith(".md")) documents.add(`docs/${name}`);

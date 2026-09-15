@@ -258,8 +258,8 @@ export class Operations {
       const entry = yield* Ref.modify(this.entries, (entries) => {
         const previous = entries.get(id);
         if (previous) return [previous, entries] as const;
-        const entry = { fingerprint, effect: cached };
-        return [entry, new Map(entries).set(id, entry)] as const;
+        const created = { fingerprint, effect: cached };
+        return [created, new Map(entries).set(id, created)] as const;
       });
       if (entry.fingerprint !== fingerprint)
         return yield* new ApiError(
@@ -274,10 +274,10 @@ export class Operations {
 
 /** Join concurrent callers, cache success, allow retry after a failed attempt. */
 export function once<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
-  const value = SynchronizedRef.unsafeMake<{ readonly value: A } | undefined>(undefined);
+  const value = SynchronizedRef.unsafeMake<{ readonly value: A } | undefined>(void 0);
   return SynchronizedRef.modifyEffect(value, (saved) =>
     saved
       ? Effect.succeed([saved.value, saved] as const)
-      : effect.pipe(Effect.map((value) => [value, { value }] as const)),
+      : effect.pipe(Effect.map((resolved) => [resolved, { value: resolved }] as const)),
   );
 }

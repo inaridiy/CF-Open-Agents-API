@@ -400,7 +400,7 @@ export async function encodeModelResponse(
       },
       async cancel() {
         abort();
-        await iterator.return(undefined);
+        await iterator.return(void 0);
       },
     }),
     {

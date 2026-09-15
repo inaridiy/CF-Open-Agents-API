@@ -9,6 +9,7 @@ import { expect, it } from "vitest";
 import { runPromise } from "../../packages/agent-api/src/index.js";
 import { constrainCodexSearch } from "../../packages/agent-api/src/models/codex-search.js";
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
 const imageUrl =
@@ -21,7 +22,7 @@ it.each(["configured", "defaults"] as const)(
     const requests: Record<string, unknown>[] = [];
     const handle = async (request: IncomingMessage, response: ServerResponse) => {
       const chunks: Uint8Array[] = [];
-      for await (const chunk of request) chunks.push(chunk);
+      for await (const chunk of request) chunks.push(chunk as Uint8Array);
       // Apply the same egress correction as HarnessDO before the scripted provider.
       const body = constrainCodexSearch(
         JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>,

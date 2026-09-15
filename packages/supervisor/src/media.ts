@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { Buffer } from "./buffer.js";
+
 const dataImage = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([a-zA-Z0-9+/=\r\n]+)$/;
 /** Inline image data forwarded to a native runtime; base64 text, so ~15 MiB decoded. */
 const INLINE_IMAGE_LIMIT = 20 * 1024 * 1024;

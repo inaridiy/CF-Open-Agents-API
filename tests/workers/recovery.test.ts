@@ -25,6 +25,12 @@ const api = new OpenAI({
   maxRetries: 0,
   fetch: (input, init) => exports.default.fetch(new Request(input, init)),
 });
+type LegacySessionRecord = {
+  schemaVersion?: number;
+  agent: { multi_agent?: unknown };
+  execution: { agent: { multi_agent?: unknown } };
+  [key: string]: unknown;
+};
 const params = { agent: { model: "test" }, environment: { type: "none" as const } };
 const stub = (id: string) => env.SESSIONS.getByName(JSON.stringify(["review", id]));
 const message = (text: string) => ({
@@ -47,11 +53,11 @@ it("migrates the legacy nullable subagent limit after eviction without losing in
   await stub(session.id).submit([message("preserved legacy input")], "legacy");
   await runInDurableObject<SessionDO, void>(stub(session.id), async (instance) => {
     const record = instance.db.require(SessionKinds.state, "session");
-    const legacy = JSON.parse(JSON.stringify(record));
+    const legacy = JSON.parse(JSON.stringify(record)) as LegacySessionRecord;
     delete legacy.schemaVersion;
     legacy.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
     legacy.execution.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
-    instance.db.put(SessionKinds.state, "session", legacy);
+    instance.db.put(SessionKinds.state, "session", legacy as unknown as SessionRecord);
   });
   await abortAllDurableObjects();
   expect((await api.beta.agents.sessions.retrieve(session.id)).id).toBe(session.id);
@@ -339,11 +345,11 @@ it("interrupted deletion can be retried without breaking tenant listings", async
   expect(during.data.map((entry) => entry.id)).toEqual([other.id]);
   const deletion = await api.beta.agents.sessions.delete(session.id).then(
     () => 200,
-    (e) => e.status,
+    (e: { status: number }) => e.status,
   );
   const listing = await api.beta.agents.sessions.list().then(
     () => 200,
-    (e) => e.status,
+    (e: { status: number }) => e.status,
   );
   expect(deletion).toBe(200);
   expect(listing).toBe(200);
@@ -512,7 +518,7 @@ it.each([
     );
     expect(result).toMatchObject({
       status,
-      completed_at: expect.any(Number),
+      completed_at: expect.any(Number) as number,
       usage: { total_tokens: 10 },
     });
     await abortAllDurableObjects();
@@ -530,10 +536,12 @@ it.each([
 it("direct deletion migrates legacy records and remains idempotent after eviction", async () => {
   const session = await api.beta.agents.sessions.create(params);
   await runInDurableObject<SessionDO, void>(stub(session.id), (instance) => {
-    const legacy = JSON.parse(JSON.stringify(instance.db.require(SessionKinds.state, "session")));
+    const legacy = JSON.parse(
+      JSON.stringify(instance.db.require(SessionKinds.state, "session")),
+    ) as LegacySessionRecord;
     delete legacy.schemaVersion;
     legacy.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
-    instance.db.put(SessionKinds.state, "session", legacy);
+    instance.db.put(SessionKinds.state, "session", legacy as unknown as SessionRecord);
   });
   await abortAllDurableObjects();
   expect(await stub(session.id).delete()).toMatchObject({ deleted: true });

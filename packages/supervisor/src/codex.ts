@@ -1123,7 +1123,7 @@ export class CodexJob extends Job {
         for (const listing of page.data)
           for (const tool of Object.values(listing.tools)) {
             const configured = this.execution.agent.tools?.find(
-              (tool) => tool.type === "mcp" && tool.server_label === listing.name,
+              (candidate) => candidate.type === "mcp" && candidate.server_label === listing.name,
             );
             if (
               configured?.type === "mcp" &&

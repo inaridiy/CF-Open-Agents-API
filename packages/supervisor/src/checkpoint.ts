@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { decodeEffect, io, type ServiceError } from "cf-open-agents-api";
 import { Context, Data, Effect, Layer, type ParseResult, Ref, Schema } from "effect";
 
+import { Buffer } from "./buffer.js";
+
 const bundleSchema = Schema.Struct({
   version: Schema.Literal(1),
   threadId: Schema.String,

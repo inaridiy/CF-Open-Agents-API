@@ -10,6 +10,7 @@ import {
   type RuntimeEvent,
   runPromise,
 } from "../../packages/agent-api/src/index.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { type NativeOptions, ToolJob } from "../../packages/supervisor/src/job.js";
 import { EVENT_LOG_LIMIT } from "../../packages/supervisor/src/lifecycle.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
@@ -262,8 +263,8 @@ it("the control route distinguishes rejected commands, missing executions and re
   let job: ProbeJob | undefined;
   const supervisor = createSupervisor(
     { ...baseOptions, binary: "unused" },
-    (execution, options) => {
-      job = new ProbeJob(execution, options);
+    (startedExecution, options) => {
+      job = new ProbeJob(startedExecution, options);
       return job;
     },
   );

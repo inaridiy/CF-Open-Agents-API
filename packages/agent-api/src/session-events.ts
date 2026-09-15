@@ -148,8 +148,8 @@ export function acceptRuntimeEvent(
     ? SessionKinds.subagentItem(event.subagentId)
     : SessionKinds.item;
   const context = { session_id: record.session.id, turn_id: turnId };
-  const emit = (event: AgentSessionEvent) => {
-    db.append(event);
+  const emit = (sessionEvent: AgentSessionEvent) => {
+    db.append(sessionEvent);
   };
   const previous = db.get(SessionKinds.output, `${turnId}:${event.id}`);
   const itemId =

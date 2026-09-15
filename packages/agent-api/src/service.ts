@@ -1,6 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { Effect } from "effect";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { HostedSkill } from "openai/resources/beta/agents/agents";
 
@@ -822,7 +822,7 @@ export function createAgentService<Env extends AgentBindings>(
       await next();
     });
     // Authenticated callers only: an anonymous request never buffers an upload.
-    app.use("*", async (c, next) =>
+    app.use("*", async (c: Context<RouteEnv<Env>, "*", {}>, next) =>
       bodyLimit({
         maxSize:
           c.req.path === "/v1/files"

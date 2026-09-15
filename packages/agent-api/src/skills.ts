@@ -75,7 +75,7 @@ export async function readSkillUpload(
     throw invalid("default must be a boolean");
   if (uploads.reduce((sum, file) => sum + file.size, 0) > SKILL_UPLOAD_LIMIT)
     throw new ApiError(413, "skill_too_large", "Skill upload exceeds 16 MiB");
-  const entries: Record<string, Uint8Array> = Object.create(null);
+  const entries = Object.create(null) as Record<string, Uint8Array>;
   const executable = new Set<string>();
   if (uploads.length === 1 && uploads[0]?.name.toLowerCase().endsWith(".zip")) {
     const unpacked = readSkillZip(new Uint8Array(await uploads[0].arrayBuffer()), expandedLimit);
@@ -105,7 +105,7 @@ export async function readSkillUpload(
   const manifest = manifests[0];
   if (!manifest) throw invalid("Missing SKILL.md");
   const root = manifest.slice(0, -"SKILL.md".length);
-  const normalized: Record<string, Uint8Array> = Object.create(null);
+  const normalized = Object.create(null) as Record<string, Uint8Array>;
   let total = 0;
   for (const [path, bytes] of Object.entries(entries)) {
     if (!path.startsWith(root)) throw invalid("All files must belong to the skill directory");

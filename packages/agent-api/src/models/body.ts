@@ -11,12 +11,12 @@ export const readModelBodyEffect = (request: Request) =>
       if (!body) return yield* new ApiError(400, "missing_model_input", "Model input is required");
       const reader = yield* Effect.acquireRelease(
         Effect.sync(() => body.getReader()),
-        (reader) =>
+        (acquired) =>
           io("model.body.close", async () => {
             try {
-              await reader.cancel();
+              await acquired.cancel();
             } finally {
-              reader.releaseLock();
+              acquired.releaseLock();
             }
           }).pipe(Effect.orDie),
       );
@@ -25,10 +25,11 @@ export const readModelBodyEffect = (request: Request) =>
       for (;;) {
         const next = yield* io("model.body.read", () => reader.read());
         if (next.done) break;
-        size += next.value.byteLength;
+        const value = next.value as Uint8Array;
+        size += value.byteLength;
         if (size > 4 * 1024 * 1024)
           return yield* new ApiError(413, "model_input_too_large", "Model input exceeds 4 MiB");
-        chunks.push(next.value);
+        chunks.push(value);
       }
       const bytes = new Uint8Array(size);
       let offset = 0;

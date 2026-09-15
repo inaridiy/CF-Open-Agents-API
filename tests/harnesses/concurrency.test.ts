@@ -12,6 +12,7 @@ import {
   type RuntimeCommand,
   runPromise,
 } from "../../packages/agent-api/src/index.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { type NativeJob, type NativeOptions, ToolJob } from "../../packages/supervisor/src/job.js";
 import { Operations } from "../../packages/supervisor/src/lifecycle.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
@@ -48,7 +49,10 @@ class FakeJob implements NativeJob {
   commands: RuntimeCommand[] = [];
   stopped = false;
   snapshot = async () => ({ version: 1 as const, threadId: "native", files: {} });
-  constructor(readonly execution: Execution) {}
+  readonly execution: Execution;
+  constructor(startedExecution: Execution) {
+    this.execution = startedExecution;
+  }
   start() {
     return Effect.void;
   }
@@ -73,8 +77,8 @@ class FakeJob implements NativeJob {
 
 it("a control body delayed across replacement never targets the new job", async () => {
   const jobs: FakeJob[] = [];
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     jobs.push(job);
     return job;
   });
@@ -117,8 +121,8 @@ it("checkpoint holds ownership until capture finishes before a replacement start
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const jobs: FakeJob[] = [];
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     jobs.push(job);
     return job;
   });
@@ -173,9 +177,9 @@ class WaitingJob extends ToolJob {
   readonly opening = Promise.withResolvers<void>();
   readonly release = Promise.withResolvers<void>();
   closes = 0;
-  constructor(options: NativeOptions) {
-    super(execution, options);
-    this.home = options.directory;
+  constructor(nativeOptions: NativeOptions) {
+    super(execution, nativeOptions);
+    this.home = nativeOptions.directory;
   }
   protected async open() {
     this.opening.resolve();
@@ -266,8 +270,8 @@ it("concurrent checkpoints capture one quiescent home and share the saved bundle
 });
 
 it("retained event pages do not hide completion from ownership replacement", async () => {
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     // Pagination can still advertise running while older events remain to be read.
     job.poll = () => Effect.succeed({ status: "running", events: [], cursor: 0 });
     return job;

@@ -24,6 +24,7 @@ import {
 } from "cf-open-agents-api";
 import { Data, Deferred, Effect, Option } from "effect";
 
+import { Buffer } from "./buffer.js";
 import { type NativeOptions, ToolJob } from "./job.js";
 import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
 import { imageContent } from "./media.js";
@@ -658,7 +659,7 @@ export class OpenCodeJob extends ToolJob {
           client.session.status({}, { signal: this.signals(signal) }),
         ).pipe(
           Effect.map((response) => response.data),
-          Effect.orElseSucceed(() => undefined),
+          Effect.orElseSucceed(() => {}),
         );
         const busy =
           status && typeof status === "object" && this.sessionId in status
@@ -786,13 +787,14 @@ export class OpenCodeJob extends ToolJob {
    * itself, so the match waits, bounded, for the next tool-part update.
    */
   private scopeFor(name: string, args: unknown): Effect.Effect<EventScope | undefined> {
-    if (!this.children.size) return Effect.succeed(undefined);
+    const unscoped: EventScope | undefined = undefined;
+    if (!this.children.size) return Effect.succeed(unscoped);
     const wanted = JSON.stringify(args ?? {});
     const tool = `${WORKSPACE_PREFIX}${name}`;
     const lookup = (): Option.Option<EventScope | undefined> => {
       for (const running of this.runningTools.values())
         if (running.tool === tool && running.input === wanted) {
-          if (running.sessionId === this.sessionId) return Option.some(undefined);
+          if (running.sessionId === this.sessionId) return Option.some(unscoped);
           const child = this.children.get(running.sessionId);
           if (child) return Option.some({ subagentId: child.subagentId, turnId: child.turnId });
         }

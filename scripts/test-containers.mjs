@@ -46,17 +46,18 @@ try {
   }
   if (!ready) throw new Error("Wrangler did not become ready within five minutes");
   const smoke = spawn(process.execPath, ["scripts/container-smoke.mjs"], { stdio: "inherit" });
-  const [code] = await once(smoke, "exit");
+  const [code] = /** @type {[number]} */ (await once(smoke, "exit"));
   if (code !== 0) throw new Error(`Container smoke exited: ${code}`);
 } catch (error) {
   console.error((await readFile(logPath, "utf8")).split("\n").slice(-80).join("\n"));
   throw error;
 } finally {
   if (worker.pid && worker.exitCode === null) {
-    process.kill(-worker.pid, "SIGTERM");
+    const pid = worker.pid;
+    process.kill(-pid, "SIGTERM");
     const timer = setTimeout(() => {
       try {
-        process.kill(-worker.pid, "SIGKILL");
+        process.kill(-pid, "SIGKILL");
       } catch {
         /* Already exited. */
       }

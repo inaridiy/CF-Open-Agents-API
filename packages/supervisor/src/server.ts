@@ -51,7 +51,7 @@ const cursorQuery = z.coerce.number().int().min(0);
 
 /** Private Container HTTP API. Its owning HarnessDO is the authorization boundary. */
 export function createSupervisor(options: Options, factory: JobFactory = createJob) {
-  const active = Ref.unsafeMake<Active | undefined>(undefined);
+  const active = Ref.unsafeMake<Active | undefined>(void 0);
   // Bounded native stderr tail so the Worker can log why an execution failed.
   const recent: string[] = [];
   const forward = options.diagnostics;

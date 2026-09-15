@@ -140,7 +140,7 @@ export async function discoverCapabilities(
         if (Array.isArray(input)) return input.map(substitute);
         if (input && typeof input === "object")
           return Object.fromEntries(
-            Object.entries(input).map(([key, value]) => [key, substitute(value)]),
+            Object.entries(input).map(([key, entryValue]) => [key, substitute(entryValue)]),
           );
         return input;
       };

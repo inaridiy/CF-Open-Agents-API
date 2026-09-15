@@ -7,10 +7,21 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const directory = await mkdtemp(join(tmpdir(), "cf-package-consumer-"));
-const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-const library = JSON.parse(
-  await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
-);
+const manifest =
+  /** @type {{ packageManager: string, devDependencies: Record<string, string> }} */ (
+    JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  );
+const library =
+  /** @type {{ name: string, version: string, dependencies: Record<string, string>, peerDependencies: Record<string, string> }} */ (
+    JSON.parse(
+      await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
+    )
+  );
+/**
+ * @param {string} command
+ * @param {readonly string[]} args
+ * @param {string} cwd
+ */
 const run = (command, args, cwd) => execFileSync(command, args, { cwd, stdio: "inherit" });
 try {
   run("pnpm", ["--filter", library.name, "pack", "--pack-destination", directory], root);

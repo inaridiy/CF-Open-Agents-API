@@ -634,7 +634,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     if (name === "cf_call_tool") {
       const input = z.object({ name: z.string(), arguments: z.json() }).parse(args);
       const tool = this.execution.agent.tools?.find(
-        (tool) => tool.type === "function" && tool.name === input.name,
+        (candidate) => candidate.type === "function" && candidate.name === input.name,
       );
       if (tool?.type !== "function" || !this.discovered.has(tool.name))
         throw new Error("Discover the deferred tool before calling it");
@@ -683,8 +683,8 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     });
     return Effect.scoped(
       Effect.gen(function* () {
-        yield* Effect.acquireRelease(Effect.succeed(server), (server) =>
-          io("mcp.close", () => server.close()).pipe(Effect.orDie),
+        yield* Effect.acquireRelease(Effect.succeed(server), (acquiredServer) =>
+          io("mcp.close", () => acquiredServer.close()).pipe(Effect.orDie),
         );
         yield* io("mcp.connect", () => server.connect(transport));
         return yield* io("mcp.request", () => transport.handleRequest(request));

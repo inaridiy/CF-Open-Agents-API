@@ -198,7 +198,7 @@ async function readBounded(response: Response, limit: number): Promise<string> {
     while (text.length < limit) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      text += decoder.decode(chunk.value, { stream: true });
+      text += decoder.decode(chunk.value as Uint8Array, { stream: true });
     }
   } finally {
     await reader.cancel().catch(() => {});
@@ -339,7 +339,7 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
           return yield* io("model.inference", (signal) =>
             adapter.fetch(
               new Request(request, {
-                body: bytes,
+                ...(request.method === "GET" || request.method === "HEAD" ? {} : { body: bytes }),
                 signal: AbortSignal.any([request.signal, signal]),
               }),
             ),

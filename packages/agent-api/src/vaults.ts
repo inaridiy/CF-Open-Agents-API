@@ -187,7 +187,7 @@ export class VaultRepository {
       const record = yield* attempt("vault.match", () =>
         this.matching(vaultIds, url, credentialId),
       );
-      if (!record) return undefined;
+      if (!record) return;
       const token = yield* attempt("vault.expiry", () => this.usableToken(record));
       if (token !== undefined) return token;
       return yield* this.refreshGate.withPermits(1)(
@@ -256,7 +256,7 @@ export class VaultRepository {
           // remains interruptible, including when the server never sends headers.
           const controller = yield* Effect.acquireRelease(
             Effect.sync(() => new AbortController()),
-            (controller) => Effect.sync(() => controller.abort()),
+            (acquired) => Effect.sync(() => acquired.abort()),
           );
           const response = yield* requestWithoutRedirect(
             "vault.refresh.request",

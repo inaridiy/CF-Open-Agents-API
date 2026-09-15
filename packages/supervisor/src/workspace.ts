@@ -43,7 +43,9 @@ export async function executeWorkspace(
       try {
         for (;;) {
           const chunk = await reader.read();
-          buffer += chunk.done ? decoder.decode() : decoder.decode(chunk.value, { stream: true });
+          buffer += chunk.done
+            ? decoder.decode()
+            : decoder.decode(chunk.value as Uint8Array, { stream: true });
           if (buffer.length > 8_000_000) throw new Error("Command stream exceeds its limit");
           for (;;) {
             const boundary = buffer.indexOf("\n");

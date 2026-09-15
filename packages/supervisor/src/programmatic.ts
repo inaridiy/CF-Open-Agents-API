@@ -40,7 +40,7 @@ export async function executeCode(
 export function functionArguments(execution: Execution, name: string, args: unknown): JsonValue {
   if (!codeEnabled(execution)) throw new Error("Programmatic tool calling is disabled");
   const tool = execution.agent.tools?.find(
-    (tool) => tool.type === "function" && tool.name === name,
+    (candidate) => candidate.type === "function" && candidate.name === name,
   );
   if (tool?.type !== "function") throw new Error("Unknown function tool");
   return z.json().parse(z.fromJSONSchema(tool.parameters).parse(args));

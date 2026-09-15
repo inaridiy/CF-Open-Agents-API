@@ -83,7 +83,10 @@ export default class CallerWorker extends WorkerEntrypoint<CallerBindings> {
       if (error instanceof SyntaxError)
         return Response.json({ error: "Invalid JSON" }, { status: 400 });
       if (error instanceof OpenAI.APIError)
-        return Response.json({ error: error.message }, { status: error.status ?? 502 });
+        return Response.json(
+          { error: error.message },
+          { status: (error.status as number | undefined) ?? 502 },
+        );
       const known = error instanceof Error ? remoteApiError(error) : undefined;
       return Response.json(
         { error: known?.message ?? "Agent request failed" },

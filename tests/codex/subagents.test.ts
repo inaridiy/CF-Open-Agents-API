@@ -8,6 +8,7 @@ import { expect, it } from "vitest";
 
 import { runPromise } from "../../packages/agent-api/src/index.js";
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
 it.each(["complete", "cancel", "immediate"])(
@@ -23,7 +24,7 @@ it.each(["complete", "cancel", "immediate"])(
     let spawned = false;
     const handle = async (request: IncomingMessage, response: ServerResponse) => {
       const chunks: Uint8Array[] = [];
-      for await (const chunk of request) chunks.push(chunk);
+      for await (const chunk of request) chunks.push(chunk as Uint8Array);
       const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
       requests.push(body);
       const input = body.input as { role?: string; content?: { text?: string }[] }[];

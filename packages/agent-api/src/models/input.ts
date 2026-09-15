@@ -211,7 +211,7 @@ export async function decodeModelRequest(request: Request): Promise<ModelInput> 
     (raw.type === "namespace"
       ? list.parse(raw.tools).map((tool) => ({ ...tool, namespace: string(raw.name) }))
       : [raw]
-    ).map((raw) => ({ raw, discovered })),
+    ).map((nested) => ({ raw: nested, discovered })),
   );
   for (const { raw, discovered } of definitions) {
     const definition = protocol === "chat-completions" ? object.parse(raw.function) : raw;

@@ -21,8 +21,8 @@ print(base64.b64encode(output.getvalue()).decode())
 `,
   ])
 ).stdout.trim();
-const config = JSON.parse(
-  await readFile(new URL("../tests/containers/wrangler.jsonc", import.meta.url), "utf8"),
+const config = /** @type {{ name: string }} */ (
+  JSON.parse(await readFile(new URL("../tests/containers/wrangler.jsonc", import.meta.url), "utf8"))
 );
 assert(config.name.endsWith("-container-test"), "Expected a dedicated Container test Worker");
 const prefix = `workerd-${config.name}-`;
@@ -38,7 +38,9 @@ const api = new OpenAI({
   maxRetries: 0,
 });
 const sessions = api.beta.agents.sessions;
+/** @type {string} */
 let sessionId;
+/** @type {Set<string>} */
 const owned = new Set();
 async function complete(respondToTools = true) {
   for (let i = 0; i < 120; i++) {
@@ -67,7 +69,20 @@ async function complete(respondToTools = true) {
 async function remember() {
   for (const name of await containers()) if (!before.has(name)) owned.add(name);
 }
-/** `/cf/v1` fork extension; the official SDK has no equivalent call. */
+/**
+ * @typedef {{
+ *   id: string,
+ *   status: string,
+ *   agent: { model: string, multi_agent: { enabled: boolean } },
+ *   environment: { id: string },
+ * }} ForkedSession
+ */
+/**
+ * `/cf/v1` fork extension; the official SDK has no equivalent call.
+ * @param {string} id
+ * @param {unknown} body
+ * @returns {Promise<ForkedSession>}
+ */
 async function fork(id, body) {
   const response = await fetch(`http://127.0.0.1:8799/cf/v1/sessions/${id}/fork`, {
     method: "POST",
@@ -76,7 +91,7 @@ async function fork(id, body) {
   });
   const text = await response.text();
   assert.equal(response.status, 200, text);
-  return JSON.parse(text);
+  return /** @type {ForkedSession} */ (JSON.parse(text));
 }
 try {
   const vault = await api.beta.agents.vaults.create({ name: "MCP smoke" });
@@ -163,11 +178,14 @@ try {
       input: "create-proof: write the sandbox proof.",
     });
     sessionId = session.id;
+    const environment = /** @type {{ id: string, skills: { type: string, version: string }[] }} */ (
+      session.environment
+    );
     await complete();
     await remember();
     const items = (await sessions.items.list(sessionId)).data;
     assert.equal(
-      session.environment.skills.find((skill) => skill.type === "skill_reference")?.version,
+      environment.skills.find((skill) => skill.type === "skill_reference")?.version,
       "1",
     );
     // The session pinned version 1; a newer default and deletion must not change it.
@@ -199,7 +217,7 @@ try {
     );
     if (harnessName === "codex") {
       const files = [];
-      for await (const file of api.beta.agents.environments.files.list(session.environment.id, {
+      for await (const file of api.beta.agents.environments.files.list(environment.id, {
         limit: 1,
       }))
         files.push(file);
@@ -208,7 +226,7 @@ try {
         file: new File(["uploaded-after-checkpoint"], "追加.txt"),
         purpose: "user_data",
       });
-      await api.beta.agents.environments.files.create(session.environment.id, {
+      await api.beta.agents.environments.files.create(environment.id, {
         type: "file_id",
         path: "/workspace/uploaded.txt",
         file_id: upload.id,
@@ -219,13 +237,13 @@ try {
         "/workspace/一覧/界",
         "/workspace/一覧外/file",
       ])
-        await api.beta.agents.environments.files.create(session.environment.id, {
+        await api.beta.agents.environments.files.create(environment.id, {
           type: "inline",
           path,
           data: "AAH/",
         });
       const scoped = [];
-      for await (const file of api.beta.agents.environments.files.list(session.environment.id, {
+      for await (const file of api.beta.agents.environments.files.list(environment.id, {
         path: "/workspace/一覧",
         order: "asc",
         limit: 1,
@@ -396,7 +414,7 @@ try {
     });
     assert.equal(recovered.status, "idle");
     assert.equal(recovered.agent.multi_agent.enabled, true);
-    assert.notEqual(recovered.environment.id, session.environment.id);
+    assert.notEqual(recovered.environment.id, environment.id);
     sessionId = recovered.id;
     await sessions.events.create(sessionId, {
       events: [

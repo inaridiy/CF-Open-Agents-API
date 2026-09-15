@@ -347,9 +347,9 @@ it("reports usage for a cancelled turn after interrupting the native query", asy
       command: { type: "cancel" },
     });
     expect(cancel.status, cancel.body).toBe(204);
-    const batch = await h.waitFor(execution.turnId, (batch) => batch.status === "cancelled");
+    const cancelled = await h.waitFor(execution.turnId, (batch) => batch.status === "cancelled");
     expect(
-      events(batch).find((event) => event.type === "usage"),
+      events(cancelled).find((event) => event.type === "usage"),
       h.context(),
     ).toMatchObject({ usage: { input_tokens: 24 } });
   } finally {

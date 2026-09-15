@@ -17,9 +17,10 @@ export async function fetchAssignedImage(url: string, signal: AbortSignal): Prom
     for (;;) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      size += chunk.value.byteLength;
+      const value = chunk.value as Uint8Array;
+      size += value.byteLength;
       if (size > 1_000_000) return new Response("Image exceeds 1 MB", { status: 413 });
-      chunks.push(chunk.value);
+      chunks.push(value);
     }
     const bytes = new Uint8Array(size);
     let offset = 0;

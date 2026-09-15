@@ -341,8 +341,8 @@ it.each([
 
 it("steering reaches the model within the same turn", async () => {
   let release: () => void = () => {};
-  const held = new Promise<void>((resolve) => {
-    release = resolve;
+  const held = new Promise<void>((releaseResolve) => {
+    release = releaseResolve;
   });
   const model = await chatFixture((request, index) =>
     index === 0

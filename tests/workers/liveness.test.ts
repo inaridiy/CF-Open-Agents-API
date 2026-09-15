@@ -550,7 +550,7 @@ it("live streams send keepalive comments while a turn is quiet", async () => {
     install(instance, driver({}), { keepaliveMs: 20 });
     const reader = instance.stream().body?.getReader();
     if (!reader) throw new Error("Missing stream body");
-    const text = new TextDecoder().decode((await reader.read()).value);
+    const text = new TextDecoder().decode((await reader.read()).value as Uint8Array);
     await reader.cancel();
     return text;
   });

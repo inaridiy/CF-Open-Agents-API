@@ -6,11 +6,18 @@ import { test } from "node:test";
 
 import { checkHarness } from "./check-harness.mjs";
 
+/**
+ * @param {import("node:test").TestContext} t
+ */
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "cf-harness-check-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const path of [".agents/skills/provider", ".claude/skills", "docs"])
     mkdirSync(join(root, path), { recursive: true });
+  /**
+   * @param {string} path
+   * @param {string} value
+   */
   const write = (path, value) => writeFileSync(join(root, path), value);
   write("AGENTS.md", "[Guide](docs/guide.md)\n");
   write("CLAUDE.md", "@AGENTS.md\n");

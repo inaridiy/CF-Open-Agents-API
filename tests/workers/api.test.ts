@@ -93,7 +93,7 @@ it("rolls back all inputs when a later event in the batch fails validation", asy
   ).rejects.toMatchObject({
     status: 400,
     code: "invalid_request_error",
-    message: expect.stringContaining("Unknown pending tool call: missing"),
+    message: expect.stringContaining("Unknown pending tool call: missing") as string,
   });
   expect((await api.beta.agents.sessions.retrieve(session.id)).status).toBe("idle");
   expect((await api.beta.agents.sessions.turns.list(session.id)).data).toHaveLength(0);

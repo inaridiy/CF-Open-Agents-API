@@ -14,6 +14,7 @@ import {
   type RuntimeBatch,
 } from "../../packages/agent-api/src/index.js";
 import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/models.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
 
@@ -41,9 +42,9 @@ it.each<HarnessName>(["codex", "claude-code", "opencode"])(
             ).toBe(true);
             const received = history.includes("image-result");
             const tool = tools?.find(
-              (tool) =>
-                tool.type === "function" &&
-                (tool.name === "lookup" || tool.name.endsWith("function_0")),
+              (candidate) =>
+                candidate.type === "function" &&
+                (candidate.name === "lookup" || candidate.name.endsWith("function_0")),
             );
             if (!tool) throw new Error("Missing function tool");
             return {

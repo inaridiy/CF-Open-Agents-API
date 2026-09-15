@@ -311,14 +311,14 @@ export class ClaudeCodeJob extends ToolJob {
         enableFileCheckpointing: false,
         mcpServers: { workspace },
         ...(subagents ? { forwardSubagentText: true, hooks, agents } : {}),
-        canUseTool: async (name, input) => {
+        canUseTool: async (name, toolInput) => {
           if (name.startsWith("mcp__workspace__"))
-            return { behavior: "allow", updatedInput: input };
+            return { behavior: "allow", updatedInput: toolInput };
           if (name === "WebSearch" && webSearch)
             return {
               behavior: "allow",
               updatedInput: {
-                ...input,
+                ...toolInput,
                 ...(webSearch.allowed_domains?.length
                   ? { allowed_domains: webSearch.allowed_domains }
                   : {}),
@@ -330,7 +330,7 @@ export class ClaudeCodeJob extends ToolJob {
               this.maxChildren
             )
               return { behavior: "deny", message: "Concurrent subagent limit reached" };
-            return { behavior: "allow", updatedInput: input };
+            return { behavior: "allow", updatedInput: toolInput };
           }
           return {
             behavior: "deny",
@@ -678,15 +678,15 @@ export class ClaudeCodeJob extends ToolJob {
     }
   }
   private searchStarted(id: string, input: unknown, scope?: ToolScope): void {
-    const query =
+    const searchQuery =
       input && typeof input === "object" && typeof (input as { query?: unknown }).query === "string"
         ? (input as { query: string }).query
         : null;
-    this.searches.set(id, { query, scope });
+    this.searches.set(id, { query: searchQuery, scope });
     this.emit({
       type: "web_search",
       id,
-      action: { type: "search", query, queries: null },
+      action: { type: "search", query: searchQuery, queries: null },
       status: "in_progress",
       ...scope,
     });

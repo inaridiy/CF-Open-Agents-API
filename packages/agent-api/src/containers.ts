@@ -723,10 +723,14 @@ export class HarnessContainer<
         return yield* io("modelRequest", (signal) =>
           this.env.MODEL_GATEWAY.fetch(
             new Request(request, {
-              body:
-                current.harness === "codex" && current.webSearchMode !== undefined
-                  ? JSON.stringify(constrainCodexSearch(body, current.webSearchMode))
-                  : bytes,
+              ...(request.method === "GET" || request.method === "HEAD"
+                ? {}
+                : {
+                    body:
+                      current.harness === "codex" && current.webSearchMode !== undefined
+                        ? JSON.stringify(constrainCodexSearch(body, current.webSearchMode))
+                        : bytes,
+                  }),
               signal: AbortSignal.any([request.signal, signal]),
             }),
           ),

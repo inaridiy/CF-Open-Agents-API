@@ -73,11 +73,9 @@ const ERRORS = [
   "import/no-empty-named-blocks",
 ] as const;
 
-/** Quality families that still carry pre-existing findings; they become errors once clean. */
-const WARNINGS = [
+/** Promoted to errors once their findings were cleared (2026-09-15). */
+const PROMOTED = [
   "no-shadow",
-  "no-nested-ternary",
-  "complexity",
   "typescript/no-unsafe-argument",
   "typescript/no-unsafe-assignment",
   "typescript/no-unsafe-call",
@@ -85,12 +83,14 @@ const WARNINGS = [
   "typescript/no-unsafe-return",
   "unicorn/no-useless-undefined",
 ] as const;
+/** Quality families that still carry pre-existing findings; they become errors once clean. */
+const WARNINGS = ["no-nested-ternary", "complexity"] as const;
 
 const asWarning = (rules: Record<string, unknown>) =>
   Object.fromEntries(
     Object.entries(rules).map(([name, rule]) => [
       name,
-      Array.isArray(rule) ? ["warn", ...rule.slice(1)] : "warn",
+      Array.isArray(rule) ? ["warn", ...(rule as unknown[]).slice(1)] : "warn",
     ]),
   ) as RuleMap;
 
@@ -98,6 +98,7 @@ export default defineConfig({
   plugins: ["eslint", "typescript", "unicorn", "oxc", "import", "promise"],
   rules: {
     ...pick(core, ERRORS),
+    ...pick(core, PROMOTED),
     ...asWarning(pick(core, WARNINGS)),
     "typescript/switch-exhaustiveness-check": [
       "error",

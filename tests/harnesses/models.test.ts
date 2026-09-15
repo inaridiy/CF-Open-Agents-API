@@ -196,7 +196,11 @@ it("OpenAI-compatible preset rewrites the upstream model and uses the configured
       );
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer provider-secret");
       expect(
-        JSON.parse(typeof init?.body === "string" ? init.body : JSON.stringify(init?.body)).model,
+        (
+          JSON.parse(typeof init?.body === "string" ? init.body : JSON.stringify(init?.body)) as {
+            model: string;
+          }
+        ).model,
       ).toBe("provider-model");
       return new Response(
         'data: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{"content":"Compatible model reached."},"finish_reason":null}]}\n\ndata: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"provider-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
@@ -435,7 +439,7 @@ it("OpenAI-compatible preset sends reasoning_effort and a json_schema response f
     fetch: async (_input, init) => {
       const body = JSON.parse(
         typeof init?.body === "string" ? init.body : JSON.stringify(init?.body),
-      );
+      ) as Record<string, unknown>;
       expect(body.reasoning_effort).toBe("medium");
       expect(body.response_format).toMatchObject({
         type: "json_schema",
