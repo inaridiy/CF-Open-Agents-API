@@ -11,6 +11,7 @@ import OpenAI from "openai";
 import type { AgentSession } from "openai/resources/beta/agents/agents";
 import { afterEach, expect, it } from "vitest";
 
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
 import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
@@ -35,7 +36,7 @@ const params = { agent: { model: "test" }, environment: { type: "none" as const 
 const stub = (id: string) => env.SESSIONS.getByName(JSON.stringify([tenant, id]));
 const record = (id: string) =>
   runInDurableObject<SessionDO, SessionRecord>(stub(id), (instance) =>
-    instance.db.require<SessionRecord>("state", "session"),
+    instance.db.require(SessionKinds.state, "session"),
   );
 async function fork(id: string, body: unknown = {}, key?: string, who = tenant) {
   const response = await exports.default.fetch(

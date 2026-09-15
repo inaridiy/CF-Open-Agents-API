@@ -17,6 +17,7 @@ import { proxyMcp } from "./mcp.js";
 import { fetchAssignedImage } from "./media.js";
 import { readModelBody } from "./models/body.js";
 import { constrainCodexSearch } from "./models/codex-search.js";
+import { kind } from "./persistence/kind.js";
 import { discoverCapabilities } from "./portable-capabilities.js";
 import { programmaticInputSchema } from "./programmatic-contract.js";
 import { runProgrammatic } from "./programmatic.js";
@@ -91,6 +92,17 @@ interface SandboxState {
   /** The deployment provisioning hook already ran for this workspace. */
   provisioned: boolean;
 }
+/** Every record kind a HarnessDO stores; singletons live under the id `current`. */
+const Kinds = {
+  assignment: kind<Assignment>("assignment"),
+  sandbox: kind<SandboxState>("sandbox"),
+  /** id = subagent id. */
+  child: kind<ChildRecord>("child"),
+  /** id = generation: the checkpoint committed for that turn. */
+  checkpoint: kind<Checkpoint>("checkpoint"),
+  /** id = generation: the artifact manifest published for that turn. */
+  artifacts: kind<NonNullable<Checkpoint["artifacts"]>>("artifacts"),
+} as const;
 const SANDBOX_MARKER = "/tmp/cf-open-agents-sandbox.json";
 const IMAGE_DIGEST_LIMIT = 256;
 const spawnRequestSchema = z.object({
@@ -265,7 +277,10 @@ export class HarnessContainer<
       if (terminal) {
         const current = await runPromise(this.assignment());
         if (current.turnId === assignment.turnId && current.generation === assignment.generation) {
-          this.db.put("assignment", "current", { ...current, revoked: true } satisfies Assignment);
+          this.db.put(Kinds.assignment, "current", {
+            ...current,
+            revoked: true,
+          } satisfies Assignment);
           // A child reports the uncertain outcome; its parent's failure destroys the shared sandbox.
           if (assignment.sandbox && !assignment.parent) {
             this.forgetSandbox();
@@ -310,10 +325,10 @@ export class HarnessContainer<
     );
   }
   private sandboxState(): SandboxState | undefined {
-    return this.db.get<SandboxState>("sandbox", "current");
+    return this.db.get(Kinds.sandbox, "current");
   }
   private forgetSandbox(): void {
-    this.db.remove("sandbox", "current");
+    this.db.remove(Kinds.sandbox, "current");
   }
   /** Record the workspace the live filesystem holds, inside the container and durably. */
   private rememberSandbox(sandbox: ISandbox, state: SandboxState) {
@@ -322,7 +337,7 @@ export class HarnessContainer<
         sandbox.writeFile(SANDBOX_MARKER, JSON.stringify({ workspaceId: state.workspaceId })),
       );
       if (!written.success) return yield* Effect.fail(new Error("Sandbox marker write failed"));
-      yield* attempt("sandbox.remember", () => this.db.put("sandbox", "current", state));
+      yield* attempt("sandbox.remember", () => this.db.put(Kinds.sandbox, "current", state));
     });
   }
   /** True when the running sandbox provably holds `workspaceId`; any doubt means restore. */
@@ -366,7 +381,7 @@ export class HarnessContainer<
   protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
   private assignment() {
     return attempt("assignment", () => {
-      const assignment = this.db.get<Assignment>("assignment", "current");
+      const assignment = this.db.get(Kinds.assignment, "current");
       if (!assignment)
         throw new ApiError(409, "unassigned_container", "Container has no session assignment");
       return assignment;
@@ -434,7 +449,7 @@ export class HarnessContainer<
     if (request.method === "POST" && target === "spawn" && !action)
       return this.spawnChild(assignment, delegation, await request.json());
     if (!target) return new Response(null, { status: 404 });
-    const child = this.db.get<ChildRecord>("child", target);
+    const child = this.db.get(Kinds.child, target);
     if (!child || child.execution.parent?.turnId !== turnId)
       return new Response("Unknown subagent", { status: 404 });
     if (request.method === "GET" && !action) {
@@ -450,7 +465,7 @@ export class HarnessContainer<
       );
       if (batch.status !== "running" && batch.status !== "waiting") {
         // Durable before the child Container disappears, so a lost response can be retried.
-        this.db.put("child", target, { ...child, terminal: batch } satisfies ChildRecord);
+        this.db.put(Kinds.child, target, { ...child, terminal: batch } satisfies ChildRecord);
         await this.child(target)
           .stopExecution(child.execution)
           .catch((error) => console.warn("Delegated child stop failed", { error: String(error) }));
@@ -478,7 +493,7 @@ export class HarnessContainer<
     const delegate = delegation.delegates.find((entry) => entry.alias === parsed.data.alias);
     if (!delegate) return new Response("Unknown delegate", { status: 404 });
     const children = assignment.children ?? [];
-    const active = children.filter((id) => !this.db.get<ChildRecord>("child", id)?.terminal).length;
+    const active = children.filter((id) => !this.db.get(Kinds.child, id)?.terminal).length;
     if (active >= delegation.maxConcurrentSubagents)
       return new Response("Concurrent subagent limit reached", { status: 409 });
     const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -510,8 +525,8 @@ export class HarnessContainer<
       parent: { turnId: assignment.turnId, subagentId },
     };
     this.db.transaction(() => {
-      this.db.put("child", subagentId, { execution } satisfies ChildRecord);
-      this.db.put("assignment", "current", {
+      this.db.put(Kinds.child, subagentId, { execution } satisfies ChildRecord);
+      this.db.put(Kinds.assignment, "current", {
         ...assignment,
         children: [...children, subagentId],
       } satisfies Assignment);
@@ -520,7 +535,7 @@ export class HarnessContainer<
       await this.child(subagentId).startExecution(execution, `${turnId}:start`);
     } catch (error) {
       console.warn("Delegated child start failed", { subagentId, error: String(error) });
-      this.db.put("child", subagentId, {
+      this.db.put(Kinds.child, subagentId, {
         execution,
         terminal: { status: "failed", events: [], cursor: 0, error: "subagent_start_failed" },
       } satisfies ChildRecord);
@@ -659,7 +674,7 @@ export class HarnessContainer<
           ),
         );
       const previous = yield* attempt("startAttempt", () =>
-        this.db.get<Assignment>("assignment", "current"),
+        this.db.get(Kinds.assignment, "current"),
       );
       if (
         previous &&
@@ -725,7 +740,7 @@ export class HarnessContainer<
         ...(execution.parent ? { parent: execution.parent } : {}),
       };
       for (const controller of this.codeExecutions) controller.abort();
-      yield* attempt("startAttempt", () => this.db.put("assignment", "current", assignment));
+      yield* attempt("startAttempt", () => this.db.put(Kinds.assignment, "current", assignment));
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const previousCheckpoint = execution.checkpoint;
       const previousWorkspace = previousCheckpoint?.workspace ?? this.environment.base();
@@ -835,7 +850,7 @@ export class HarnessContainer<
       // between them, or mid-request, would leave a marker for a job that never started.
       const result = yield* Effect.uninterruptible(
         attempt("startAttempt", () =>
-          this.db.put("assignment", "current", { ...assignment, dispatched: true }),
+          this.db.put(Kinds.assignment, "current", { ...assignment, dispatched: true }),
         ).pipe(
           Effect.zipRight(
             io("startAttempt", () =>
@@ -933,7 +948,7 @@ export class HarnessContainer<
             assignment.imageDigests ?? [],
           );
           yield* attempt("controlExecution.images", () =>
-            this.db.put("assignment", "current", { ...assignment, imageDigests }),
+            this.db.put(Kinds.assignment, "current", { ...assignment, imageDigests }),
           );
         }
         // Interruptible: the supervisor deduplicates control by operationId, so an aborted
@@ -989,7 +1004,7 @@ export class HarnessContainer<
         );
       const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
       const committed = yield* attempt("snapshot", () =>
-        this.db.get<Checkpoint>("checkpoint", String(execution.generation)),
+        this.db.get(Kinds.checkpoint, String(execution.generation)),
       );
       if (committed) return committed;
       const response = yield* io("snapshot", (signal) =>
@@ -1031,7 +1046,7 @@ export class HarnessContainer<
         environmentFileVersion: this.environment.fileVersion(),
       };
       yield* attempt("snapshot", () =>
-        this.db.put("checkpoint", String(execution.generation), checkpoint),
+        this.db.put(Kinds.checkpoint, String(execution.generation), checkpoint),
       );
       return checkpoint;
     });
@@ -1043,7 +1058,7 @@ export class HarnessContainer<
         return [];
       const manifestKey = String(execution.generation);
       let manifest = yield* attempt("artifact.manifest.get", () =>
-        this.db.get<NonNullable<Checkpoint["artifacts"]>>("artifacts", manifestKey),
+        this.db.get(Kinds.artifacts, manifestKey),
       );
       if (!manifest) {
         const listing = yield* io("artifact.list", () =>
@@ -1082,8 +1097,9 @@ export class HarnessContainer<
             };
           }),
         );
+        const built = manifest;
         yield* attempt("artifact.manifest.commit", () =>
-          this.db.put("artifacts", manifestKey, manifest),
+          this.db.put(Kinds.artifacts, manifestKey, built),
         );
       }
       yield* Effect.forEach(
@@ -1117,7 +1133,7 @@ export class HarnessContainer<
         return;
       for (const controller of this.codeExecutions) controller.abort();
       yield* attempt("stopAttempt.revoke", () =>
-        this.db.put("assignment", "current", { ...assignment, revoked: true }),
+        this.db.put(Kinds.assignment, "current", { ...assignment, revoked: true }),
       );
       // Native stderr is lost with the Container; keep a bounded tail in Worker logs.
       if (assignment.dispatched)
@@ -1136,7 +1152,7 @@ export class HarnessContainer<
         }).pipe(Effect.ignore);
       // Children stop before the parent releases the sandbox they share.
       for (const subagentId of assignment.children ?? []) {
-        const child = this.db.get<ChildRecord>("child", subagentId);
+        const child = this.db.get(Kinds.child, subagentId);
         if (child && !child.terminal)
           yield* io("stopAttempt.child", () =>
             this.child(subagentId).stopExecution(child.execution),

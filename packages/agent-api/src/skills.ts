@@ -4,6 +4,7 @@ import type { SkillVersion } from "openai/resources/skills/versions/versions";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 
+import { kind } from "./persistence/kind.js";
 import { ApiError, canonicalJSON, identifier, type PageQuery, parse } from "./protocol.js";
 import { readSkillZip } from "./skill-zip.js";
 import type { SqlStore } from "./storage.js";
@@ -36,6 +37,16 @@ export interface SkillOperation {
   key: string;
   resource?: Skill | SkillVersion;
 }
+/** Every record kind the skill repository stores inside the tenant catalog. */
+const Kinds = {
+  skill: kind<Skill>("skill"),
+  skillOperation: kind<SkillOperation>("skill_operation"),
+  /** id = skill id: the last version number handed out. */
+  skillCounter: kind<number>("skill_counter"),
+  skillVersion: (skillId: string) => kind<StoredSkillVersion>(`skill_version:${skillId}`),
+  /** Version number to version id. */
+  skillVersionNumber: (skillId: string) => kind<string>(`skill_version_number:${skillId}`),
+} as const;
 const invalid = (message: string) => new ApiError(400, "invalid_skill", message);
 function validPath(path: string): void {
   if (
@@ -149,7 +160,7 @@ export class SkillRepository {
       hash: input.hash,
       makeDefault: input.makeDefault,
     });
-    const previous = this.db.get<SkillOperation>("skill_operation", input.operationId);
+    const previous = this.db.get(Kinds.skillOperation, input.operationId);
     if (previous) {
       if (previous.fingerprint !== fingerprint)
         throw new ApiError(
@@ -161,14 +172,14 @@ export class SkillRepository {
     }
     if (input.skillId) this.retrieve(input.skillId);
     const operation = { fingerprint, key: `skills/${identifier("bundle")}.zip` };
-    this.db.put("skill_operation", input.operationId, operation);
+    this.db.put(Kinds.skillOperation, input.operationId, operation);
     return operation;
   }
   retrieve(id: string): Skill {
-    return this.db.require<Skill>("skill", id);
+    return this.db.require(Kinds.skill, id);
   }
   list(query: PageQuery) {
-    return this.db.list<Skill>("skill", query);
+    return this.db.list(Kinds.skill, query);
   }
   version(skillId: string, selector?: string | null): StoredSkillVersion {
     const skill = this.retrieve(skillId);
@@ -178,12 +189,12 @@ export class SkillRepository {
         : selector === "latest"
           ? skill.latest_version
           : selector;
-    const id = this.db.require<string>(`skill_version_number:${skillId}`, number);
-    return this.db.require<StoredSkillVersion>(`skill_version:${skillId}`, id);
+    const id = this.db.require(Kinds.skillVersionNumber(skillId), number);
+    return this.db.require(Kinds.skillVersion(skillId), id);
   }
   versions(skillId: string, query: PageQuery) {
     this.retrieve(skillId);
-    const page = this.db.list<StoredSkillVersion>(`skill_version:${skillId}`, query);
+    const page = this.db.list(Kinds.skillVersion(skillId), query);
     return { ...page, data: page.data.map(({ resource }) => resource) };
   }
   add(
@@ -199,7 +210,7 @@ export class SkillRepository {
         throw new ApiError(409, "idempotency_conflict", "Skill upload reservation changed");
       const skill = input.skillId ? this.retrieve(input.skillId) : undefined;
       const skillId = skill?.id ?? identifier("skill");
-      const next = (this.db.get<number>("skill_counter", skillId) ?? 0) + 1;
+      const next = (this.db.get(Kinds.skillCounter, skillId) ?? 0) + 1;
       const version: SkillVersion = {
         id: identifier("skillver"),
         object: "skill.version",
@@ -218,16 +229,16 @@ export class SkillRepository {
         name: !skill || input.makeDefault ? input.name : skill.name,
         description: !skill || input.makeDefault ? input.description : skill.description,
       };
-      this.db.put("skill_counter", skillId, next);
-      this.db.put(`skill_version:${skillId}`, version.id, {
+      this.db.put(Kinds.skillCounter, skillId, next);
+      this.db.put(Kinds.skillVersion(skillId), version.id, {
         schemaVersion: 1,
         resource: version,
         key: input.key,
       } satisfies StoredSkillVersion);
-      this.db.put(`skill_version_number:${skillId}`, version.version, version.id);
-      this.db.put("skill", skillId, resource);
+      this.db.put(Kinds.skillVersionNumber(skillId), version.version, version.id);
+      this.db.put(Kinds.skill, skillId, resource);
       const result = skill ? version : resource;
-      this.db.put("skill_operation", input.operationId, { ...operation, resource: result });
+      this.db.put(Kinds.skillOperation, input.operationId, { ...operation, resource: result });
       return result;
     });
   }
@@ -242,7 +253,7 @@ export class SkillRepository {
         name: version.name,
         description: version.description,
       };
-      this.db.put("skill", skillId, resource);
+      this.db.put(Kinds.skill, skillId, resource);
       return resource;
     });
   }
@@ -256,10 +267,10 @@ export class SkillRepository {
           "default_skill_version",
           "Select another default version or delete the entire skill",
         );
-      this.db.remove(`skill_version:${skillId}`, version.id);
-      this.db.remove(`skill_version_number:${skillId}`, version.version);
+      this.db.remove(Kinds.skillVersion(skillId), version.id);
+      this.db.remove(Kinds.skillVersionNumber(skillId), version.version);
       const latest = this.versions(skillId, { order: "desc", limit: 1 }).data[0];
-      if (latest) this.db.put("skill", skillId, { ...skill, latest_version: latest.version });
+      if (latest) this.db.put(Kinds.skill, skillId, { ...skill, latest_version: latest.version });
       return {
         id: version.id,
         object: "skill.version.deleted" as const,
@@ -271,9 +282,9 @@ export class SkillRepository {
   delete(skillId: string) {
     return this.db.transaction(() => {
       this.retrieve(skillId);
-      this.db.clear(`skill_version:${skillId}`);
-      this.db.clear(`skill_version_number:${skillId}`);
-      this.db.remove("skill", skillId);
+      this.db.clear(Kinds.skillVersion(skillId));
+      this.db.clear(Kinds.skillVersionNumber(skillId));
+      this.db.remove(Kinds.skill, skillId);
       return { id: skillId, object: "skill.deleted" as const, deleted: true };
     });
   }

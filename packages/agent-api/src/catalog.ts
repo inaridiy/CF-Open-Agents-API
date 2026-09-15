@@ -13,6 +13,7 @@ import {
 import type { EnvironmentSpec } from "./environments.js";
 import { encodeRpc, IdempotencyConflict, rpcEnvelope } from "./errors.js";
 import type { StoredInputFile } from "./files.js";
+import { kind } from "./persistence/kind.js";
 import type { Agent, PageQuery } from "./protocol.js";
 import { ApiError, canonicalJSON, identifier, parse, savedAgentSchema } from "./protocol.js";
 import type { SessionRecord } from "./session.js";
@@ -33,6 +34,25 @@ const reservationSchema = Schema.declare<Reservation>(
 /** String carriers: the RPC type of the session record inside a reservation is too deep. */
 export const ReservationResult = Schema.parseJson(rpcEnvelope(Schema.NullOr(reservationSchema)));
 export const ReserveResult = Schema.parseJson(rpcEnvelope(reservationSchema));
+interface TemplateRecord {
+  version: 1;
+  resource: EnvironmentTemplate;
+  configuration: TemplateConfiguration;
+}
+/** Every record kind the tenant catalog stores; skills and vaults declare their own. */
+export const CatalogKinds = {
+  inputFile: kind<StoredInputFile>("input_file"),
+  template: kind<TemplateRecord>("template"),
+  environment: kind<EnvironmentSpec & { version: 1 }>("environment"),
+  /** Idempotency key to the session it reserved. */
+  reservation: kind<Reservation>("reservation"),
+  /** Session id back to its reservation key, so deletion can drop both. */
+  reservationSession: kind<{ key: string }>("reservation_session"),
+  session: kind<{ id: string; agent_id: string }>("session"),
+  agent: kind<Agent>("agent"),
+  agentKey: kind<{ fingerprint: string; id: string }>("agent_key"),
+  agentKeyIndex: kind<{ key: string }>("agent_key_index"),
+} as const;
 
 /** One catalog per authenticated tenant, never one global object. */
 export class CatalogObject extends DurableObject {
@@ -66,19 +86,19 @@ export class CatalogObject extends DurableObject {
     return this.skillStore.deleteVersion(...args);
   }
   saveFile(record: StoredInputFile): void {
-    this.db.put("input_file", record.resource.id, record);
+    this.db.put(CatalogKinds.inputFile, record.resource.id, record);
   }
   file(id: string): StoredInputFile {
-    const record = this.db.require<StoredInputFile>("input_file", id);
+    const record = this.db.require(CatalogKinds.inputFile, id);
     if (record.resource.expires_at !== undefined && record.resource.expires_at <= Date.now() / 1000)
       throw new ApiError(404, "not_found", "File not found");
     return record;
   }
   deleteFile(id: string): void {
-    this.db.remove("input_file", id);
+    this.db.remove(CatalogKinds.inputFile, id);
   }
   files(query: PageQuery, purpose?: string) {
-    const page = this.db.list<StoredInputFile>("input_file", query, {
+    const page = this.db.list(CatalogKinds.inputFile, query, {
       ...(purpose ? { field: "resource.purpose" as const, value: purpose } : {}),
       expiresAfter: Date.now() / 1000,
     });
@@ -126,17 +146,17 @@ export class CatalogObject extends DurableObject {
       created_at: now,
       updated_at: now,
     };
-    this.db.put("template", resource.id, { version: 1, resource, configuration: input });
+    this.db.put(CatalogKinds.template, resource.id, { version: 1, resource, configuration: input });
     return resource;
   }
   template(id: string): EnvironmentTemplate {
-    return this.db.require<{ resource: EnvironmentTemplate }>("template", id).resource;
+    return this.db.require(CatalogKinds.template, id).resource;
   }
   templateConfiguration(id: string): TemplateConfiguration {
-    return this.db.require<{ configuration: TemplateConfiguration }>("template", id).configuration;
+    return this.db.require(CatalogKinds.template, id).configuration;
   }
   templates(query: PageQuery) {
-    const page = this.db.list<{ resource: EnvironmentTemplate }>("template", query);
+    const page = this.db.list(CatalogKinds.template, query);
     return { ...page, data: page.data.map(({ resource }) => resource) };
   }
   updateTemplate(id: string, parameters: TemplateConfiguration): EnvironmentTemplate {
@@ -149,27 +169,27 @@ export class CatalogObject extends DurableObject {
         name: configuration.name ?? null,
         updated_at: Math.floor(Date.now() / 1000),
       };
-      this.db.put("template", id, { version: 1, resource, configuration });
+      this.db.put(CatalogKinds.template, id, { version: 1, resource, configuration });
       return resource;
     });
   }
   deleteTemplate(id: string) {
     this.template(id);
-    this.db.remove("template", id);
+    this.db.remove(CatalogKinds.template, id);
     return { id, object: "agent.environment.template.deleted" as const, deleted: true };
   }
   registerEnvironment(spec: EnvironmentSpec): void {
-    this.db.put("environment", spec.id, { version: 1, ...spec });
+    this.db.put(CatalogKinds.environment, spec.id, { version: 1, ...spec });
   }
   environment(id: string): EnvironmentSpec {
-    return this.db.require<EnvironmentSpec>("environment", id);
+    return this.db.require(CatalogKinds.environment, id);
   }
   reservation(key: string, fingerprint: string): string {
     return runSync(
       encodeRpc(
         ReservationResult,
         attempt("catalog.reservation", () => {
-          const previous = this.db.get<Reservation>("reservation", key);
+          const previous = this.db.get(CatalogKinds.reservation, key);
           if (previous && previous.fingerprint !== fingerprint)
             throw new IdempotencyConflict({ subject: "session parameters" });
           return previous ?? null;
@@ -184,16 +204,16 @@ export class CatalogObject extends DurableObject {
         ReserveResult,
         attempt("catalog.reserve", () =>
           this.db.transaction(() => {
-            const previous = this.db.get<Reservation>("reservation", key);
+            const previous = this.db.get(CatalogKinds.reservation, key);
             if (previous) {
               if (previous.fingerprint !== fingerprint)
                 throw new IdempotencyConflict({ subject: "session parameters" });
               return previous;
             }
             const reservation = { id: record.session.id, record, ready: false, fingerprint };
-            this.db.put("reservation", key, reservation);
+            this.db.put(CatalogKinds.reservation, key, reservation);
             // Deletion finds the reservation by session, so the key's record can be removed.
-            this.db.put("reservation_session", record.session.id, { key });
+            this.db.put(CatalogKinds.reservationSession, record.session.id, { key });
             return reservation;
           }),
         ),
@@ -203,39 +223,39 @@ export class CatalogObject extends DurableObject {
   }
   commit(key: string): void {
     this.db.transaction(() => {
-      const reservation = this.db.require<Reservation>("reservation", key);
+      const reservation = this.db.require(CatalogKinds.reservation, key);
       if (reservation.ready) return;
-      this.db.put("reservation", key, { ...reservation, ready: true });
-      this.db.put("session", reservation.id, {
+      this.db.put(CatalogKinds.reservation, key, { ...reservation, ready: true });
+      this.db.put(CatalogKinds.session, reservation.id, {
         id: reservation.id,
         agent_id: reservation.record.session.agent.id,
       });
     });
   }
   owns(id: string): boolean {
-    return this.db.get("session", id) !== undefined;
+    return this.db.get(CatalogKinds.session, id) !== undefined;
   }
   sessions(query: PageQuery & { agent_id?: string }) {
-    return this.db.list<{ id: string; agent_id: string }>(
-      "session",
+    return this.db.list(
+      CatalogKinds.session,
       query,
       query.agent_id ? { field: "agent_id", value: query.agent_id } : undefined,
     );
   }
   deleteSession(id: string): void {
     this.db.transaction(() => {
-      this.db.remove("session", id);
-      const index = this.db.get<{ key: string }>("reservation_session", id);
+      this.db.remove(CatalogKinds.session, id);
+      const index = this.db.get(CatalogKinds.reservationSession, id);
       if (!index) return;
-      this.db.remove("reservation", index.key);
-      this.db.remove("reservation_session", id);
+      this.db.remove(CatalogKinds.reservation, index.key);
+      this.db.remove(CatalogKinds.reservationSession, id);
     });
   }
   agent(id: string): Agent {
-    return this.db.require<Agent>("agent", id);
+    return this.db.require(CatalogKinds.agent, id);
   }
   agents(query: PageQuery) {
-    return this.db.list<Agent>("agent", query);
+    return this.db.list(CatalogKinds.agent, query);
   }
   saveAgent(agent: Agent, key: string): Agent {
     return this.db.transaction(() => {
@@ -245,26 +265,26 @@ export class CatalogObject extends DurableObject {
         created_at: undefined,
         updated_at: undefined,
       });
-      const previous = this.db.get<{ fingerprint: string; id: string }>("agent_key", key);
+      const previous = this.db.get(CatalogKinds.agentKey, key);
       if (previous) {
         if (previous.fingerprint !== fingerprint)
           throw new IdempotencyConflict({ subject: "agent parameters" });
         return this.agent(previous.id);
       }
-      this.db.put("agent", agent.id, agent);
-      this.db.put("agent_key", key, { fingerprint, id: agent.id });
-      this.db.put("agent_key_index", agent.id, { key });
+      this.db.put(CatalogKinds.agent, agent.id, agent);
+      this.db.put(CatalogKinds.agentKey, key, { fingerprint, id: agent.id });
+      this.db.put(CatalogKinds.agentKeyIndex, agent.id, { key });
       return agent;
     });
   }
   deleteAgent(id: string) {
     this.db.transaction(() => {
       this.agent(id);
-      this.db.remove("agent", id);
-      const index = this.db.get<{ key: string }>("agent_key_index", id);
+      this.db.remove(CatalogKinds.agent, id);
+      const index = this.db.get(CatalogKinds.agentKeyIndex, id);
       if (!index) return;
-      this.db.remove("agent_key", index.key);
-      this.db.remove("agent_key_index", id);
+      this.db.remove(CatalogKinds.agentKey, index.key);
+      this.db.remove(CatalogKinds.agentKeyIndex, id);
     });
     return { id, object: "agent.deleted" as const, deleted: true };
   }
@@ -289,7 +309,7 @@ export class CatalogObject extends DurableObject {
         ...input,
       });
       const resource = { ...agentResource(configuration), id, created_at: previous.created_at };
-      this.db.put("agent", id, resource);
+      this.db.put(CatalogKinds.agent, id, resource);
       return resource;
     });
   }

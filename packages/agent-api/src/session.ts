@@ -5,7 +5,6 @@ import type {
   SessionTurnError,
   Subagent,
 } from "openai/resources/beta/agents/agents";
-import type { SessionArtifact } from "openai/resources/beta/agents/sessions/artifacts";
 
 import { attempt, io, runPromise, runSync } from "./effect.js";
 import type { EnvironmentSpec } from "./environments.js";
@@ -14,18 +13,26 @@ import {
   encodeRpc,
   IdempotencyConflict,
   InvalidRuntimeEvent,
-  InvalidSessionState,
-  isDomainError,
   rpcEnvelope,
   SessionFailed,
   SessionNotFound,
-  StorageFailure,
-  Superseded,
+  type StorageFailure,
   toApiError,
   type TransportFailure,
   TurnCheckpointing,
   UnknownToolCall,
 } from "./errors.js";
+import { SessionKinds } from "./persistence/session-kinds.js";
+import {
+  type ActiveSession,
+  type ArtifactRecord,
+  type Command,
+  migrate,
+  type QueuedInput,
+  type SessionRecord,
+} from "./persistence/session-record.js";
+import { makeSessionRepo, type SessionRepo, type Sync } from "./persistence/session-repo.js";
+import { makeSessionTx, type SessionTx } from "./persistence/session-tx.js";
 import type {
   AgentConfig,
   AgentSession,
@@ -43,48 +50,18 @@ import {
   identifier,
   remoteImageURLs,
 } from "./protocol.js";
-import {
-  type AgentRegistration,
-  type Checkpoint,
-  type Execution,
-  executionSchema,
-  type RuntimeCommand,
-  type RuntimeDriver,
+import type {
+  AgentRegistration,
+  Checkpoint,
+  Execution,
+  RuntimeCommand,
+  RuntimeDriver,
 } from "./runtime.js";
 import { acceptRuntimeEvent, finishOutputItems, recordToolResult } from "./session-events.js";
 import { SqlStore } from "./storage.js";
 
-export interface ArtifactRecord extends SessionArtifact {
-  key: string;
-}
+export type { ActiveSession, ArtifactRecord, SessionRecord } from "./persistence/session-record.js";
 
-interface SessionBase {
-  readonly schemaVersion?: 2;
-  readonly tenant: string;
-  readonly session: Readonly<AgentSession>;
-  readonly agent: AgentConfig;
-  readonly driver: string;
-  readonly revision: string;
-  readonly model: string;
-  readonly generation: number;
-  readonly checkpoint: Checkpoint | null;
-  readonly cursor: number;
-  readonly deleted: boolean;
-  readonly environmentSpec?: EnvironmentSpec;
-  /** Set by a fork whose native history could not be carried; consumed by the next completed turn. */
-  readonly inheritedTranscript?: string;
-  readonly forkedFrom?: { sessionId: string; turnId: string | null };
-}
-/** The persisted shape is unchanged; impossible phase/execution pairs are unrepresentable. */
-const executionState = Schema.Union(
-  Schema.Struct({ phase: Schema.Literal("idle", "failed"), execution: Schema.Null }),
-  Schema.Struct({
-    phase: Schema.Literal("starting", "running", "checkpointing"),
-    execution: executionSchema,
-  }),
-);
-export type SessionRecord = SessionBase & typeof executionState.Type;
-export type ActiveSession = Extract<SessionRecord, { execution: Execution }>;
 /** Committed state another session can continue from. */
 export interface ForkSource {
   session: AgentSession;
@@ -183,17 +160,6 @@ export function transcriptMessage(transcript: string): InputMessage {
     ],
   };
 }
-interface Command {
-  id: string;
-  turnId: string;
-  command: RuntimeCommand;
-  /** Input items added for a steer; removed if the executor never received the steer. */
-  itemIds?: string[];
-}
-/** Steer input the executor rejected after the fact; it runs as the next turn. */
-interface QueuedInput {
-  input: InputMessage[];
-}
 interface Listener {
   cursor: number;
   /** A creation stream ends once the initial turn settles or when there is no input. */
@@ -238,24 +204,25 @@ class Reconciliation extends Context.Tag("agent-api/Reconciliation")<
 >() {}
 
 export class SessionObject<Env = unknown> extends DurableObject<Env> {
-  readonly db: SqlStore;
+  /** The durable store; tests read it through `SessionKinds`. */
+  readonly db = new SqlStore(this.ctx.storage);
+  /** Synchronous typed view for in-transaction and read-only work. */
+  private readonly tx: SessionTx = makeSessionTx(this.db);
+  /** Effect edge of the seam: one `transactionSync` per `transaction`. */
+  private readonly repo: SessionRepo = makeSessionRepo(this.db, this.ctx.storage);
   private readonly reconciliation = Effect.unsafeMakeSemaphore(1);
   private readonly listeners = new Map<ReadableStreamDefaultController<Uint8Array>, Listener>();
   private keepalive: ReturnType<typeof setInterval> | undefined;
   private flushing = false;
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.db = new SqlStore(ctx.storage);
-  }
   protected dependencies(): SessionDependencies {
     throw new Error("SessionObject must be configured through createAgentService");
   }
   initialize(record: SessionRecord): AgentSession {
-    const existing = this.db.get<SessionRecord>("state", "session");
+    const existing = this.db.get(SessionKinds.state, "session");
     if (existing) return existing.session;
     let migrated = record;
     this.db.transaction(() => {
-      migrated = this.migrate(record);
+      migrated = migrate(record);
       this.save(migrated);
       this.emit({
         event_id: identifier("evt"),
@@ -266,56 +233,13 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     return migrated.session;
   }
   private record(): SessionRecord {
-    const original = this.db.get<SessionRecord>("state", "session");
-    if (!original) throw new SessionNotFound();
-    const record = this.migrate(original);
-    this.validate(record);
-    if (record !== original) this.save(record);
-    if (record.deleted) throw new SessionNotFound();
-    return record;
-  }
-  private migrate(record: SessionRecord): SessionRecord {
-    if (record.schemaVersion === 2) return record;
-    if (record.schemaVersion !== undefined)
-      throw new InvalidSessionState({ reason: "Unsupported session record version" });
-    // Alpha records stored the response-only null limit in request configuration.
-    const agent = (config: AgentConfig): AgentConfig => ({
-      ...config,
-      ...(config.multi_agent
-        ? {
-            multi_agent: {
-              enabled: config.multi_agent.enabled,
-              ...(config.multi_agent.max_concurrent_subagents != null
-                ? { max_concurrent_subagents: config.multi_agent.max_concurrent_subagents }
-                : {}),
-            },
-          }
-        : {}),
-    });
-    const base = { ...record, schemaVersion: 2 as const, agent: agent(record.agent) };
-    return record.execution
-      ? {
-          ...base,
-          phase: record.phase,
-          execution: { ...record.execution, agent: agent(record.execution.agent) },
-        }
-      : { ...base, phase: record.phase, execution: null };
-  }
-  private validate(record: SessionRecord): void {
-    if (
-      !Schema.is(executionState)(record) ||
-      (record.execution &&
-        (record.execution.generation !== record.generation ||
-          record.execution.sessionId !== record.session.id))
-    )
-      throw new InvalidSessionState({ reason: "Persisted execution state is inconsistent" });
+    return this.tx.requireSession();
   }
   private save(record: SessionRecord): void {
-    this.validate(record);
-    this.db.put("state", "session", record);
+    this.tx.save(record);
   }
   private emit(event: AgentSessionEvent): void {
-    this.db.append(event);
+    this.tx.emit(event);
   }
   retrieve(): AgentSession {
     return this.record().session;
@@ -324,14 +248,14 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.db.transaction(() => {
       const record = this.record();
       if (record.session.environment.type === "none") return;
-      const current = this.db.get<string>("environment", "status");
+      const current = this.db.get(SessionKinds.environment, "status");
       if (current === status) return;
       // A creation retry reports pending again; a settled environment never regresses.
       if (status === "pending" && current !== undefined) return;
       // Only a connected sandbox can disconnect, and a failed setup never reconnects.
       if (status === "disconnected" && current !== "connected") return;
       if (status === "connected" && current === "failed") return;
-      this.db.put("environment", "status", status);
+      this.db.put(SessionKinds.environment, "status", status);
       this.emit({
         type: `agent.session.environment.${status}`,
         event_id: identifier("evt"),
@@ -376,36 +300,39 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   items(query: PageQuery) {
     this.record();
-    return this.db.list<AgentSessionItem>("item", query);
+    return this.db.list(SessionKinds.item, query);
   }
   turns(query: PageQuery) {
     const record = this.record();
-    return this.db.list<Turn>("turn", query, { field: "agent_id", value: record.session.agent.id });
+    return this.db.list(SessionKinds.turn, query, {
+      field: "agent_id",
+      value: record.session.agent.id,
+    });
   }
   turn(id: string): Turn {
     this.record();
-    return this.db.require<Turn>("turn", id);
+    return this.tx.requireTurn(id);
   }
   subagents(query: PageQuery) {
     this.record();
-    return this.db.list<Subagent>("subagent", query);
+    return this.db.list(SessionKinds.subagent, query);
   }
   subagent(id: string): Subagent {
     this.record();
-    return this.db.require<Subagent>("subagent", id);
+    return this.db.require(SessionKinds.subagent, id);
   }
   subagentItems(id: string, query: PageQuery, turnId?: string) {
     this.subagent(id);
     if (turnId) this.subagentTurn(id, turnId);
-    return this.db.list<AgentSessionItem>(
-      `subagent_item:${id}`,
+    return this.db.list(
+      SessionKinds.subagentItem(id),
       query,
       turnId ? { field: "turn_id", value: turnId } : undefined,
     );
   }
   subagentTurns(id: string, query: PageQuery) {
     this.subagent(id);
-    return this.db.list<Turn>("turn", query, { field: "agent_id", value: id });
+    return this.db.list(SessionKinds.turn, query, { field: "agent_id", value: id });
   }
   subagentTurn(id: string, turnId: string): Turn {
     this.subagent(id);
@@ -415,8 +342,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   artifacts(query: PageQuery, environmentId?: string) {
     this.record();
-    const page = this.db.list<ArtifactRecord>(
-      "artifact",
+    const page = this.db.list(
+      SessionKinds.artifact,
       query,
       environmentId ? { field: "environment_id", value: environmentId } : undefined,
     );
@@ -424,16 +351,16 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   artifact(id: string): ArtifactRecord {
     this.record();
-    return this.db.require<ArtifactRecord>("artifact", id);
+    return this.db.require(SessionKinds.artifact, id);
   }
   deleteArtifact(id: string): string {
     const artifact = this.artifact(id);
-    this.db.remove("artifact", id);
+    this.db.remove(SessionKinds.artifact, id);
     return artifact.key;
   }
   replay(after: number) {
     this.record();
-    return this.db.events<AgentSessionEvent>(after);
+    return this.db.events(after);
   }
   /** Committed state only: an active turn has no consistent checkpoint yet. */
   forkSource(): string {
@@ -453,11 +380,11 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     const transcript = new TranscriptBuilder();
     let after: string | undefined;
     do {
-      const page = this.db.list<AgentSessionItem>("item", { order: "asc", limit: 100, after });
+      const page = this.db.list(SessionKinds.item, { order: "asc", limit: 100, after });
       transcript.add(page.data);
       after = page.has_more ? (page.last_id ?? undefined) : undefined;
     } while (after);
-    const lastTurn = this.db.list<Turn>("turn", { order: "desc", limit: 1 }).data[0];
+    const lastTurn = this.db.list(SessionKinds.turn, { order: "desc", limit: 1 }).data[0];
     return {
       session: record.session,
       agent: record.agent,
@@ -482,7 +409,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
             this.db.transaction(() => {
               let record = this.record();
               const fingerprint = canonicalJSON(events);
-              const previous = this.db.get<string>("idempotency", key);
+              const previous = this.db.get(SessionKinds.idempotency, key);
               if (previous) {
                 if (previous !== fingerprint) throw new IdempotencyConflict({ subject: "input" });
                 return;
@@ -555,7 +482,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                     );
                     if (!action || !record.execution)
                       throw new UnknownToolCall({ callId: event.call_id });
-                    recordToolResult(this.db, record, event);
+                    recordToolResult(this.tx, record, event);
                     this.enqueue(record, {
                       type: "tool_result",
                       callId: event.call_id,
@@ -574,8 +501,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                       },
                     };
                     if (!required_actions.length) {
-                      const turn = this.turn(event.turn_id);
-                      this.db.put("turn", turn.id, { ...turn, status: "in_progress" });
+                      const turn = this.tx.requireTurn(event.turn_id);
+                      this.tx.putTurn({ ...turn, status: "in_progress" });
                       this.emit({
                         type: "agent.session.in_progress",
                         event_id: identifier("evt"),
@@ -586,7 +513,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                   }
                 }
               }
-              this.db.put("idempotency", key, fingerprint);
+              this.db.put(SessionKinds.idempotency, key, fingerprint);
               // Accepted input counts as activity even when it only queues a command.
               record = {
                 ...record,
@@ -670,7 +597,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       subagent_id: null,
       usage: null,
     };
-    this.db.put("turn", id, turn);
+    this.tx.putTurn(turn);
     this.emit({
       event_id: identifier("evt"),
       type: "agent.session.turn.created",
@@ -696,7 +623,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         phase: null,
         status: "completed" as const,
       };
-      this.db.put("item", item.id, item);
+      this.db.put(SessionKinds.item, item.id, item);
       ids.push(item.id);
       this.emit({
         type: "agent.session.turn.item.added",
@@ -711,8 +638,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   private enqueue(record: ActiveSession, command: RuntimeCommand, itemIds?: string[]): void {
     if (command.type === "cancel") {
-      if (!this.db.get("cancellation", record.execution.turnId))
-        this.db.put("cancellation", record.execution.turnId, {
+      if (!this.tx.cancellation(record.execution.turnId))
+        this.db.put(SessionKinds.cancellation, record.execution.turnId, {
           id: identifier("op"),
           turnId: record.execution.turnId,
           command,
@@ -720,7 +647,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       return;
     }
     const id = identifier("op");
-    this.db.put("command", id, {
+    this.db.put(SessionKinds.command, id, {
       id,
       turnId: record.execution.turnId,
       command,
@@ -729,15 +656,15 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** The executor refused a queued command for good. A steer's input becomes the next turn. */
   private reject(operation: Command): void {
-    this.db.remove("command", operation.id);
+    this.db.remove(SessionKinds.command, operation.id);
     if (operation.command.type !== "steer") return;
-    for (const itemId of operation.itemIds ?? []) this.db.remove("item", itemId);
-    this.db.put("queued_input", operation.id, {
+    for (const itemId of operation.itemIds ?? []) this.db.remove(SessionKinds.item, itemId);
+    this.db.put(SessionKinds.queuedInput, operation.id, {
       input: operation.command.input,
     } satisfies QueuedInput);
   }
   private active(): boolean {
-    return !!this.db.get<SessionRecord>("state", "session")?.execution;
+    return !!this.db.get(SessionKinds.state, "session")?.execution;
   }
   override alarm(): Promise<void> {
     const arm = io("session.arm", () =>
@@ -763,7 +690,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Every post-I/O transition compares the full durable execution identity. */
   private current(execution: Execution): ActiveSession | undefined {
-    const record = this.db.get<SessionRecord>("state", "session");
+    const record = this.db.get(SessionKinds.state, "session");
     return record &&
       !record.deleted &&
       record.execution?.generation === execution.generation &&
@@ -775,40 +702,16 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
    * The fenced unit of work: `f` runs inside one synchronous transaction, only while
    * `execution` is still the durable identity; otherwise it fails with `Superseded`. A
    * throw rolls the transaction back and keeps its tag; anything untyped is a storage
-   * failure. `f` may not return a Promise or an Effect (type-enforced, as in SqlStore).
+   * failure. `f` may not return a Promise or an Effect (type-enforced by the repository).
    */
-  private transition<A>(
-    execution: Execution,
-    f: (
-      record: ActiveSession,
-    ) => A &
-      (A extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown),
-  ) {
-    return Effect.suspend(() => {
-      try {
-        return Effect.succeed(
-          this.db.storage.transactionSync(() => {
-            const record = this.current(execution);
-            if (!record)
-              throw new Superseded({ turnId: execution.turnId, generation: execution.generation });
-            return f(record);
-          }),
-        );
-      } catch (thrown) {
-        return Effect.fail(
-          isDomainError(thrown) || thrown instanceof ApiError
-            ? thrown
-            : new StorageFailure({ operation: "session.transition", cause: thrown }),
-        );
-      }
-    });
+  private transition<A>(execution: Execution, f: (record: ActiveSession) => Sync<A>) {
+    return this.repo.transaction((tx) => f(tx.fenced(execution)));
   }
   private advance() {
     return Effect.gen(this, function* () {
       const dependencies = yield* Reconciliation;
-      const initial = this.db.get<SessionRecord>("state", "session");
+      const initial = yield* this.repo.read((tx) => tx.session());
       if (!initial?.execution || initial.deleted) return;
-      yield* attempt("session.validate", () => this.validate(initial));
       const execution = initial.execution;
       yield* io("session.arm", () =>
         this.ctx.storage.setAlarm(Date.now() + dependencies.pollIntervalMs),
@@ -854,11 +757,11 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         yield* this.transition(execution, (record) => {
           this.save({ ...record, phase: "running" });
           const turn = {
-            ...this.turn(execution.turnId),
+            ...this.tx.requireTurn(execution.turnId),
             status: "in_progress" as const,
             started_at: Math.floor(Date.now() / 1000),
           };
-          this.db.put("turn", turn.id, turn);
+          this.tx.putTurn(turn);
           this.emit({
             type: "agent.session.turn.in_progress",
             event_id: identifier("evt"),
@@ -875,14 +778,14 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         }
         // Cancellation supersedes queued input. Keep its operation ID until the
         // native terminal outcome is durable, including across lost responses.
-        const cancellation = this.db.get<Command>("cancellation", execution.turnId);
+        const cancellation = this.tx.cancellation(execution.turnId);
         // Also accept cancellation records written by the previous implementation.
-        const queued = this.db.list<Command>("command", { order: "asc", limit: 100 }).data;
+        const queued = this.tx.commands(100);
         const legacyCancellation = queued.find((operation) => operation.command.type === "cancel");
         const cancel = cancellation ?? legacyCancellation;
         if (cancel && !cancellation)
           yield* this.transition(execution, () =>
-            this.db.put("cancellation", execution.turnId, cancel),
+            this.db.put(SessionKinds.cancellation, execution.turnId, cancel),
           );
         const commands = cancel ? [cancel] : queued;
         // Delivery never blocks the poll: a refused command is dropped (a steer's input
@@ -893,7 +796,9 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
           if (!this.current(execution)) return;
           if (operation.turnId !== execution.turnId) {
             if (!cancel)
-              yield* this.transition(execution, () => this.db.remove("command", operation.id));
+              yield* this.transition(execution, () =>
+                this.db.remove(SessionKinds.command, operation.id),
+              );
             continue;
           }
           // A cancellation's delivery outcome never matters: the native outcome is reconciled.
@@ -925,7 +830,9 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
             break;
           }
           if (delivery === "delivered" && !cancel)
-            yield* this.transition(execution, () => this.db.remove("command", operation.id));
+            yield* this.transition(execution, () =>
+              this.db.remove(SessionKinds.command, operation.id),
+            );
         }
         const current = this.current(execution);
         if (!current) return;
@@ -940,11 +847,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                 code: "invalid_runtime_cursor",
                 message: "Runtime events must be contiguous",
               });
-            next = { ...acceptRuntimeEvent(this.db, next, entry.event), cursor: entry.seq };
+            next = { ...acceptRuntimeEvent(this.tx, next, entry.event), cursor: entry.seq };
           }
           // A command accepted during poll must be delivered before sealing completion.
-          const pending =
-            !cancel && this.db.list<Command>("command", { order: "asc", limit: 1 }).data.length > 0;
+          const pending = !cancel && this.tx.commands(1).length > 0;
           if (batch.status === "completed" && !pending) next = { ...next, phase: "checkpointing" };
           this.save(next);
           return pending ? "commands" : next.phase;
@@ -992,7 +898,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
             message: "Checkpoint has an incompatible harness revision",
           });
         for (const artifact of checkpoint.artifacts ?? [])
-          this.db.put("artifact", artifact.id, {
+          this.db.put(SessionKinds.artifact, artifact.id, {
             ...artifact,
             object: "agent.session.artifact",
           } satisfies ArtifactRecord);
@@ -1030,11 +936,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     const indeterminate = status === "failed" && isIndeterminate(error);
     let after: string | undefined;
     do {
-      const page = this.db.list<Turn>(status === "completed" ? "pending_subagent_turn" : "turn", {
-        order: "asc",
-        limit: 100,
-        after,
-      });
+      const page = this.db.list(
+        status === "completed" ? SessionKinds.pendingSubagentTurn : SessionKinds.turn,
+        { order: "asc", limit: 100, after },
+      );
       for (const pending of page.data) {
         if (
           status !== "completed" &&
@@ -1050,8 +955,13 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
                 completed_at: Math.floor(Date.now() / 1000),
                 error: turnError,
               };
-        this.db.put("turn", child.id, child);
-        finishOutputItems(this.db, record, child.id, `subagent_item:${child.subagent_id}`);
+        this.tx.putTurn(child);
+        finishOutputItems(
+          this.tx,
+          record,
+          child.id,
+          SessionKinds.subagentItem(child.subagent_id ?? ""),
+        );
         this.emit({
           type: `agent.session.turn.${status}`,
           event_id: identifier("evt"),
@@ -1063,17 +973,17 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       }
       after = page.has_more ? (page.last_id ?? undefined) : undefined;
     } while (after);
-    this.db.clear("pending_subagent_turn");
+    this.db.clear(SessionKinds.pendingSubagentTurn);
     const turn: Turn = {
-      ...this.turn(record.execution.turnId),
+      ...this.tx.requireTurn(record.execution.turnId),
       status,
       completed_at: Math.floor(Date.now() / 1000),
       error: turnError,
     };
-    this.db.put("turn", turn.id, turn);
-    finishOutputItems(this.db, record, turn.id, "item");
-    this.db.clear("command");
-    this.db.clear("cancellation");
+    this.tx.putTurn(turn);
+    finishOutputItems(this.tx, record, turn.id, SessionKinds.item);
+    this.db.clear(SessionKinds.command);
+    this.db.clear(SessionKinds.cancellation);
     // A completed checkpoint now carries the inherited history natively.
     const { inheritedTranscript: _transcript, ...retained } = record;
     const next: SessionRecord = {
@@ -1104,8 +1014,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     });
     // Steer input the runtime refused was never processed: run it now. Cancellation
     // supersedes it, and an indeterminate session accepts no further input.
-    const queued = this.db.list<QueuedInput>("queued_input", { order: "asc", limit: 100 }).data;
-    this.db.clear("queued_input");
+    const queued = this.db.list(SessionKinds.queuedInput, { order: "asc", limit: 100 }).data;
+    this.db.clear(SessionKinds.queuedInput);
     if (!queued.length || status === "cancelled" || indeterminate) return;
     const input = queued.flatMap((entry) => entry.input);
     const started = this.begin(next, input);
@@ -1113,14 +1023,14 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.save(started);
   }
   async delete(): Promise<{ id: string; object: "agent.session.deleted"; deleted: true }> {
-    const stored = this.db.get<SessionRecord>("state", "session");
+    const stored = this.db.get(SessionKinds.state, "session");
     if (!stored) {
       // A purged object keeps only its tombstone, so a lost-response retry still succeeds.
-      const tombstone = this.db.get<{ id: string }>("state", "tombstone");
+      const tombstone = this.db.get(SessionKinds.tombstone, "tombstone");
       if (!tombstone) throw new SessionNotFound();
       return { id: tombstone.id, object: "agent.session.deleted", deleted: true };
     }
-    const record = this.migrate(stored);
+    const record = migrate(stored);
     if (record.execution)
       throw new ApiError(409, "active_turn", "Cancel the active turn before deleting the session");
     this.save({ ...record, deleted: true });
@@ -1129,14 +1039,14 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Drop every stored record once the catalog no longer discovers the session. Idempotent. */
   async purge(): Promise<void> {
-    const record = this.db.get<SessionRecord>("state", "session");
+    const record = this.db.get(SessionKinds.state, "session");
     if (record && !record.deleted)
       throw new ApiError(409, "not_deleted", "Delete the session before purging its storage");
-    const id = record?.session.id ?? this.db.get<{ id: string }>("state", "tombstone")?.id;
+    const id = record?.session.id ?? this.db.get(SessionKinds.tombstone, "tombstone")?.id;
     if (!id) return;
     this.db.transaction(() => {
       this.db.purge();
-      this.db.put("state", "tombstone", { id });
+      this.db.put(SessionKinds.tombstone, "tombstone", { id });
     });
     this.closeListeners();
     await this.ctx.storage.deleteAlarm();
@@ -1199,7 +1109,8 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     if (event.type === "agent.session.idle" || event.type === "agent.session.failed") return true;
     if (event.type !== "agent.session.created") return false;
     return (
-      !this.active() && this.db.list<Turn>("turn", { order: "asc", limit: 1 }).data.length === 0
+      !this.active() &&
+      this.db.list(SessionKinds.turn, { order: "asc", limit: 1 }).data.length === 0
     );
   }
   private flush(): void {
@@ -1209,7 +1120,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     try {
       for (const [listener, state] of this.listeners) {
         if ((listener.desiredSize ?? 0) <= 0) continue;
-        const entries = this.db.events<AgentSessionEvent>(state.cursor, 64);
+        const entries = this.db.events(state.cursor, 64);
         for (const { seq, event } of entries) {
           if ((listener.desiredSize ?? 0) <= 0) break;
           state.cursor = seq;

@@ -6,7 +6,7 @@ import OpenAI from "openai";
 import type { AgentSessionEvent } from "openai/resources/beta/agents/agents";
 import { afterEach, expect, it } from "vitest";
 
-import type { SessionRecord } from "../../packages/agent-api/src/session.js";
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
@@ -37,8 +37,8 @@ const replay = async (id: string) =>
   ).json<{ seq: number; event: AgentSessionEvent }[]>();
 const resetActivity = (id: string) =>
   runInDurableObject<SessionDO, void>(stub(id), (instance) => {
-    const record = instance.db.require<SessionRecord>("state", "session");
-    instance.db.put("state", "session", {
+    const record = instance.db.require(SessionKinds.state, "session");
+    instance.db.put(SessionKinds.state, "session", {
       ...record,
       session: { ...record.session, last_active_at: 0 },
     });
