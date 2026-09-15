@@ -278,6 +278,12 @@ export type RuntimeCommand = typeof commandSchema.Type;
 export type RuntimeEvent = typeof runtimeEventSchema.Type;
 export type RuntimeBatch = typeof batchSchema.Type;
 
+/** How long one poll may hold an empty answer; a driver that cannot wait ignores it. */
+export interface PollOptions {
+  /** Return at once with events after the cursor or a terminal outcome, else after this long. */
+  readonly waitMs: number;
+}
+
 /**
  * Implementations must deduplicate start/control by operationId. A missing job
  * after an acknowledged start means outcome_unknown, never permission to replay.
@@ -285,10 +291,16 @@ export type RuntimeBatch = typeof batchSchema.Type;
  * Failures are typed per method. `TransportFailure` is the only retryable one: no
  * answer, or an answer nobody can classify. Every other tag is a definite answer that
  * the reconciler acts on at once and never retries.
+ *
+ * A driver whose `poll` honors `waitMs` declares `longPoll`. The reconciler then asks
+ * each poll to wait for the rest of the alarm interval and keeps polling within that
+ * interval while events keep arriving, so streaming latency follows the runtime rather
+ * than the alarm; other drivers are polled once per alarm with `waitMs` zero.
  */
 export interface RuntimeDriver {
   readonly name: string;
   readonly revision: string;
+  readonly longPoll?: boolean;
   readonly capabilities: {
     steer: boolean;
     functions: boolean;
@@ -318,7 +330,11 @@ export interface RuntimeDriver {
     execution: Execution,
     operationId: string,
   ): Effect.Effect<void, RuntimeRejected | TransportFailure>;
-  poll(execution: Execution, after: number): Effect.Effect<RuntimeBatch, TransportFailure>;
+  poll(
+    execution: Execution,
+    after: number,
+    options?: PollOptions,
+  ): Effect.Effect<RuntimeBatch, TransportFailure>;
   control(
     execution: Execution,
     operationId: string,
@@ -342,8 +358,14 @@ export interface PromiseRuntimeDriver {
   readonly name: string;
   readonly revision: string;
   readonly capabilities: RuntimeDriver["capabilities"];
+  readonly longPoll?: boolean;
   start(execution: Execution, operationId: string, signal: AbortSignal): Promise<void>;
-  poll(execution: Execution, after: number, signal: AbortSignal): Promise<RuntimeBatch>;
+  poll(
+    execution: Execution,
+    after: number,
+    signal: AbortSignal,
+    options: PollOptions,
+  ): Promise<RuntimeBatch>;
   control(
     execution: Execution,
     operationId: string,
@@ -372,10 +394,11 @@ export const fromPromiseDriver = (driver: PromiseRuntimeDriver): RuntimeDriver =
   name: driver.name,
   revision: driver.revision,
   capabilities: driver.capabilities,
+  ...(driver.longPoll ? { longPoll: true } : {}),
   start: (execution, id) =>
     call((signal) => driver.start(execution, id, signal), rejected("runtime.start")),
-  poll: (execution, after) =>
-    call((signal) => driver.poll(execution, after, signal), transport("runtime.poll")),
+  poll: (execution, after, options = { waitMs: 0 }) =>
+    call((signal) => driver.poll(execution, after, signal, options), transport("runtime.poll")),
   control: (execution, id, command) =>
     call((signal) => driver.control(execution, id, command, signal), refused),
   checkpoint: (execution) =>

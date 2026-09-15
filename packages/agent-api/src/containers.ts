@@ -1,12 +1,11 @@
 import { Container } from "@cloudflare/containers";
 import { getSandbox, type ISandbox, Sandbox } from "@cloudflare/sandbox";
-import { Effect, Schema } from "effect";
+import { Context, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
 import { z } from "zod";
 
-import type { McpToolConfig } from "./agent-tools.js";
 import type { CatalogObject } from "./catalog.js";
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
-import { attempt, decode, io, runPromise } from "./effect.js";
+import { attempt, decode, decodeEffect, io, type ServiceError, settle } from "./effect.js";
 import type { HostedConfiguration } from "./environment-config.js";
 import { environmentMcpScript } from "./environment-mcp.js";
 import type { EnvironmentDriver } from "./environments.js";
@@ -17,18 +16,19 @@ import { proxyMcp } from "./mcp.js";
 import { fetchAssignedImage } from "./media.js";
 import { readModelBody } from "./models/body.js";
 import { constrainCodexSearch } from "./models/codex-search.js";
-import { kind } from "./persistence/kind.js";
+import type { Assignment, SandboxState } from "./persistence/harness-kinds.js";
+import {
+  type HarnessRepository,
+  type HarnessTx,
+  makeHarnessRepo,
+  makeHarnessTx,
+} from "./persistence/harness-tx.js";
+import type { Sync } from "./persistence/repo.js";
 import { discoverCapabilities } from "./portable-capabilities.js";
 import { programmaticInputSchema } from "./programmatic-contract.js";
 import { runProgrammatic } from "./programmatic.js";
 import { ApiError } from "./protocol.js";
-import type {
-  Checkpoint,
-  Execution,
-  RuntimeBatch,
-  RuntimeCommand,
-  RuntimeDriver,
-} from "./runtime.js";
+import type { Checkpoint, Execution, RuntimeCommand, RuntimeDriver } from "./runtime.js";
 import { batchSchema, commandSchema, fromPromiseDriver } from "./runtime.js";
 import { executeWorkspaceTool } from "./sandbox-tools.js";
 import { SqlStore } from "./storage.js";
@@ -46,63 +46,6 @@ export interface ContainerBindings {
   LOCAL_BACKUPS?: string;
   CATALOG: DurableObjectNamespace<CatalogObject>;
 }
-interface Assignment {
-  sessionId: string;
-  generation: number;
-  turnId: string;
-  model: string;
-  webSearchMode?: "disabled" | "cached" | "live";
-  harness: HarnessName;
-  dispatched: boolean;
-  revoked?: boolean;
-  sandbox: boolean;
-  tenant?: string;
-  vaultIds?: readonly string[];
-  mcp?: McpToolConfig[];
-  /** Worker-authoritative code tool names; MCP tools are admitted by configured server label. */
-  programmatic?: { tools: string[]; deadline: number };
-  /** SHA-256 digests of image URLs this execution may fetch; the URLs themselves stay in SQLite items. */
-  imageDigests?: string[];
-  /** Present when this turn may delegate: the parent configuration children inherit. */
-  delegation?: {
-    delegates: NonNullable<Execution["delegates"]>;
-    maxConcurrentSubagents: number;
-    agent: Execution["agent"];
-    deadline: number;
-    environmentId?: string;
-  };
-  children?: string[];
-  /** Set on a delegated child: it shares the parent's sandbox and is never checkpointed. */
-  parent?: { turnId: string; subagentId: string };
-}
-/** Durable child bookkeeping in the parent HarnessDO; the terminal batch survives child destruction. */
-interface ChildRecord {
-  execution: Execution;
-  terminal?: RuntimeBatch;
-}
-/**
- * What the live Sandbox filesystem holds. A turn reuses the running sandbox when this
- * matches the workspace it must start from; otherwise it destroys and restores. The same
- * identity is written inside the container so a replaced container cannot be mistaken
- * for the one that was provisioned.
- */
-interface SandboxState {
-  /** Backup id restored into or committed from the live filesystem; "" for a fresh workspace. */
-  workspaceId: string;
-  /** The deployment provisioning hook already ran for this workspace. */
-  provisioned: boolean;
-}
-/** Every record kind a HarnessDO stores; singletons live under the id `current`. */
-const Kinds = {
-  assignment: kind<Assignment>("assignment"),
-  sandbox: kind<SandboxState>("sandbox"),
-  /** id = subagent id. */
-  child: kind<ChildRecord>("child"),
-  /** id = generation: the checkpoint committed for that turn. */
-  checkpoint: kind<Checkpoint>("checkpoint"),
-  /** id = generation: the artifact manifest published for that turn. */
-  artifacts: kind<NonNullable<Checkpoint["artifacts"]>>("artifacts"),
-} as const;
 const SANDBOX_MARKER = "/tmp/cf-open-agents-sandbox.json";
 const IMAGE_DIGEST_LIMIT = 256;
 const spawnRequestSchema = z.object({
@@ -163,6 +106,121 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
   }
 }
 
+/** The two services a HarnessDO program needs; both are built once per object. */
+export class HarnessRepo extends Context.Tag("agent-api/HarnessRepo")<
+  HarnessRepo,
+  HarnessRepository
+>() {}
+export class HarnessBindings extends Context.Tag("agent-api/HarnessBindings")<
+  HarnessBindings,
+  ContainerBindings
+>() {}
+export type HarnessServices = HarnessRepo | HarnessBindings;
+const read = <A>(f: (tx: HarnessTx) => Sync<A>) =>
+  Effect.flatMap(HarnessRepo, (repo) => repo.read(f));
+const write = <A>(f: (tx: HarnessTx) => Sync<A>) =>
+  Effect.flatMap(HarnessRepo, (repo) => repo.transaction(f));
+const assignment = read((tx) => tx.requireAssignment());
+/** The durable execution identity moved on since `expected` was read. */
+const superseded = (
+  current: Pick<Assignment, "turnId" | "generation">,
+  expected: Pick<Assignment, "turnId" | "generation">,
+) => current.turnId !== expected.turnId || current.generation !== expected.generation;
+/** The bounded set of remote image URLs a turn may fetch, as digests; excess is an explicit error. */
+const imageDigests = (urls: readonly string[], existing: readonly string[]) =>
+  Effect.gen(function* () {
+    const digests = yield* io("assignment.images", () => Promise.all(urls.map(sha256Hex)));
+    const merged = [...new Set([...existing, ...digests])];
+    if (merged.length > IMAGE_DIGEST_LIMIT)
+      return yield* new ApiError(
+        413,
+        "image_limit",
+        `A turn may reference at most ${IMAGE_DIGEST_LIMIT} remote images`,
+      );
+    return merged;
+  });
+/** Code may call client functions, workspace tools and tools of configured MCP servers only. */
+function permittedCodeTool(current: Assignment, name: string): boolean {
+  if (!current.programmatic) return false;
+  if (current.programmatic.tools.includes(name)) return true;
+  return (current.mcp ?? []).some((tool) => name.startsWith(`mcp__${tool.server_label}__`));
+}
+/** Long-poll bound the supervisor accepts; the HarnessDO stays under its fetch timeout. */
+const LONG_POLL_MAX_MS = 25_000;
+const ARTIFACT_FILE_LIMIT = 200 * 1024 * 1024;
+const ARTIFACT_TURN_LIMIT = 500 * 1024 * 1024;
+/**
+ * Publish `/workspace/outputs` to R2 under a durable manifest: the manifest is committed
+ * before any upload, so a retry uploads the same ids, and uploads that already exist are
+ * skipped. Four files transfer at a time; each copy handles its own interruption.
+ */
+const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Execution) {
+  const env = yield* HarnessBindings;
+  const sandbox = getSandbox(env.SANDBOX, execution.sessionId);
+  if (!(yield* io("artifact.exists", () => sandbox.exists("/workspace/outputs"))).exists) return [];
+  let manifest = yield* read((tx) => tx.artifacts(execution.generation));
+  if (!manifest) {
+    const listing = yield* io("artifact.list", () =>
+      sandbox.listFiles("/workspace/outputs", { recursive: true, includeHidden: true }),
+    );
+    if (!listing.success)
+      return yield* new ApiError(503, "artifact_list_failed", "Artifact listing failed");
+    const files = listing.files.filter((file) => file.type === "file");
+    if (
+      files.some((file) => file.size > ARTIFACT_FILE_LIMIT) ||
+      files.reduce((sum, file) => sum + file.size, 0) > ARTIFACT_TURN_LIMIT
+    )
+      return yield* new ApiError(
+        413,
+        "artifact_limit",
+        "Artifacts exceed 200 MiB per file or 500 MiB per turn",
+      );
+    const created_at = Math.floor(Date.now() / 1000);
+    manifest = yield* Effect.forEach(files, (file) =>
+      Effect.map(
+        io("artifact.hash", () =>
+          crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(`${execution.turnId}\0${file.absolutePath}`),
+          ),
+        ),
+        (hash) => {
+          const id = `artifact_${Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+          return {
+            id,
+            key: `artifacts/${execution.sessionId}/${id}`,
+            path: file.absolutePath,
+            size_bytes: file.size,
+            session_id: execution.sessionId,
+            environment_id: execution.environmentId ?? "",
+            turn_id: execution.turnId,
+            created_at,
+          };
+        },
+      ),
+    );
+    const built = manifest;
+    yield* write((tx) => tx.putArtifacts(execution.generation, built));
+  }
+  yield* Effect.forEach(
+    manifest,
+    (artifact) =>
+      Effect.gen(function* () {
+        if (yield* io("artifact.head", () => env.CHECKPOINTS.head(artifact.key))) return;
+        const source = yield* io("artifact.read", () =>
+          sandbox.readFile(artifact.path, { encoding: "none" }),
+        );
+        yield* copyKnownLength(source.content, artifact.size_bytes, (stream) =>
+          env.CHECKPOINTS.put(artifact.key, stream, {
+            httpMetadata: { contentType: "application/octet-stream" },
+          }),
+        );
+      }),
+    { concurrency: 4, discard: true },
+  );
+  return manifest;
+});
+
 export class HarnessContainer<
   Env extends ContainerBindings = ContainerBindings,
 > extends Container<Env> {
@@ -173,6 +231,19 @@ export class HarnessContainer<
   private readonly workspace = Effect.unsafeMakeSemaphore(1);
   /** Assignment, child and checkpoint records carry agent configuration; SQLite rows, not KV values. */
   private readonly db = new SqlStore(this.ctx.storage);
+  /** Synchronous typed view for callbacks the runtime invokes outside a fiber. */
+  private readonly tx: HarnessTx = makeHarnessTx(this.db);
+  /**
+   * One runtime per object with the repository and the bindings; every entrypoint runs
+   * its program here and nothing below an entrypoint calls `Effect.run*`. The layers hold
+   * no resources, so an evicted object leaks nothing by never disposing it.
+   */
+  private readonly runtime = ManagedRuntime.make(
+    Layer.mergeAll(
+      Layer.succeed(HarnessRepo, makeHarnessRepo(this.db, this.ctx.storage)),
+      Layer.succeed(HarnessBindings, this.env),
+    ),
+  );
   private readonly environment = new EnvironmentWorkspace(
     this.ctx.storage,
     this.env,
@@ -182,168 +253,184 @@ export class HarnessContainer<
       ),
   );
   private readonly codeExecutions = new Set<AbortController>();
-  async mediaRequest(request: Request): Promise<Response> {
-    const assignment = await runPromise(this.assignment());
-    const url = new URL(request.url);
-    const source = url.searchParams.get("url");
-    if (
-      request.method !== "GET" ||
-      url.pathname !== "/image" ||
-      assignment.revoked ||
-      !source ||
-      !assignment.imageDigests?.includes(await sha256Hex(source))
-    )
-      return new Response("Image is not assigned to this execution", { status: 403 });
-    return fetchAssignedImage(source, request.signal);
+  /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
+  private run<A, E>(program: Effect.Effect<A, E, HarnessServices>): Promise<A> {
+    return this.runtime.runPromiseExit(program).then(settle);
   }
-  /** The bounded set of remote image URLs a turn may fetch, as digests; excess is an explicit error. */
-  private imageDigests(urls: readonly string[], existing: readonly string[]) {
-    return Effect.gen(function* () {
-      const digests = yield* io("assignment.images", () => Promise.all(urls.map(sha256Hex)));
-      const merged = [...new Set([...existing, ...digests])];
-      if (merged.length > IMAGE_DIGEST_LIMIT)
-        return yield* new ApiError(
-          413,
-          "image_limit",
-          `A turn may reference at most ${IMAGE_DIGEST_LIMIT} remote images`,
-        );
-      return merged;
-    });
+  private abortCodeExecutions(): void {
+    for (const controller of this.codeExecutions) controller.abort();
   }
-  /** Code may call client functions, workspace tools and tools of configured MCP servers only. */
-  private permittedCodeTool(assignment: Assignment, name: string): boolean {
-    if (!assignment.programmatic) return false;
-    if (assignment.programmatic.tools.includes(name)) return true;
-    return (assignment.mcp ?? []).some((tool) => name.startsWith(`mcp__${tool.server_label}__`));
+  mediaRequest(request: Request): Promise<Response> {
+    return this.run(
+      Effect.gen(function* () {
+        const current = yield* assignment;
+        const url = new URL(request.url);
+        const source = url.searchParams.get("url");
+        const refused = new Response("Image is not assigned to this execution", { status: 403 });
+        if (request.method !== "GET" || url.pathname !== "/image" || current.revoked || !source)
+          return refused;
+        const digest = yield* io("assignment.image", () => sha256Hex(source));
+        if (!current.imageDigests?.includes(digest)) return refused;
+        return yield* io("assignment.image", () => fetchAssignedImage(source, request.signal));
+      }),
+    );
   }
-  async programmaticRequest(request: Request): Promise<Response> {
-    const assignment = await runPromise(this.assignment());
-    if (
-      request.method !== "POST" ||
-      new URL(request.url).pathname !== `/${assignment.turnId}` ||
-      !assignment.programmatic ||
-      assignment.revoked ||
-      !this.env.CODE_LOADER
-    )
-      return new Response("No code runner assigned", { status: 403 });
-    const controller = new AbortController();
-    this.codeExecutions.add(controller);
-    try {
-      const input = programmaticInputSchema.parse(await request.json());
-      const invocation = z.string().uuid().parse(request.headers.get("x-cf-code-invocation"));
-      const catalog = await this.containerFetch(
-        `http://harness/jobs/${assignment.turnId}/code-tools?invocation=${invocation}`,
-      );
-      if (!catalog.ok) throw new Error("Code tool catalog is unavailable");
-      // The container proposes names; the Worker's assignment decides what code may call.
-      const tools = z
-        .array(z.string().min(1).max(256))
-        .max(2000)
-        .parse(await catalog.json())
-        .filter((name) => this.permittedCodeTool(assignment, name));
-      const value = await runProgrammatic(this.env.CODE_LOADER, {
-        input,
-        tools,
-        signal: controller.signal,
-        timeoutMs: assignment.programmatic.deadline - Date.now(),
-        call: async (name, args, signal) => {
-          const current = await runPromise(this.assignment());
-          if (
-            current.revoked ||
-            current.turnId !== assignment.turnId ||
-            current.generation !== assignment.generation
-          )
-            throw new Error("Execution was superseded");
-          if (!this.permittedCodeTool(current, name)) throw new Error("Tool is not allowed");
-          const result = await this.containerFetch(
-            new Request(`http://harness/jobs/${assignment.turnId}/code-tool`, {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ name, arguments: args, invocation }),
-              signal,
+  programmaticRequest(request: Request): Promise<Response> {
+    return this.run(
+      Effect.gen(this, function* () {
+        const current = yield* assignment;
+        const loader = this.env.CODE_LOADER;
+        if (
+          request.method !== "POST" ||
+          new URL(request.url).pathname !== `/${current.turnId}` ||
+          !current.programmatic ||
+          current.revoked ||
+          !loader
+        )
+          return new Response("No code runner assigned", { status: 403 });
+        const programmatic = current.programmatic;
+        // Other entrypoints (a newer start, a cancel, a stop) abort running code through
+        // this controller; the request's own fiber ends it when the response is built.
+        const controller = new AbortController();
+        this.codeExecutions.add(controller);
+        const execute = Effect.gen(this, function* () {
+          const input = yield* io("programmatic.input", async () =>
+            programmaticInputSchema.parse(await request.json()),
+          );
+          const invocation = yield* attempt("programmatic.invocation", () =>
+            z.string().uuid().parse(request.headers.get("x-cf-code-invocation")),
+          );
+          const catalog = yield* io("programmatic.catalog", () =>
+            this.containerFetch(
+              `http://harness/jobs/${current.turnId}/code-tools?invocation=${invocation}`,
+            ),
+          );
+          if (!catalog.ok)
+            return yield* new TransportFailure({
+              operation: "programmatic.catalog",
+              cause: "Code tool catalog is unavailable",
+            });
+          // The container proposes names; the Worker's assignment decides what code may call.
+          const tools = yield* io("programmatic.tools", async () =>
+            z
+              .array(z.string().min(1).max(256))
+              .max(2000)
+              .parse(await catalog.json())
+              .filter((name) => permittedCodeTool(current, name)),
+          );
+          return yield* io("programmatic.run", () =>
+            runProgrammatic(loader, {
+              input,
+              tools,
+              signal: controller.signal,
+              timeoutMs: programmatic.deadline - Date.now(),
+              call: async (name, args, signal) => {
+                // The runtime calls back outside any fiber: the synchronous view answers.
+                const latest = this.tx.requireAssignment();
+                if (latest.revoked || superseded(latest, current))
+                  throw new Error("Execution was superseded");
+                if (!permittedCodeTool(latest, name)) throw new Error("Tool is not allowed");
+                const result = await this.containerFetch(
+                  new Request(`http://harness/jobs/${current.turnId}/code-tool`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ name, arguments: args, invocation }),
+                    signal,
+                  }),
+                );
+                if (!result.ok) throw new Error("Programmatic tool call failed");
+                return result.json();
+              },
             }),
           );
-          if (!result.ok) throw new Error("Programmatic tool call failed");
-          return result.json();
-        },
-      });
-      return Response.json({
-        content: [{ type: "text", text: JSON.stringify(value) }],
-        isError: false,
-      });
-    } catch (error) {
-      const terminal =
-        error instanceof ApiError && error.code === "programmatic_execution_uncertain";
-      if (terminal) {
-        const current = await runPromise(this.assignment());
-        if (current.turnId === assignment.turnId && current.generation === assignment.generation) {
-          this.db.put(Kinds.assignment, "current", {
-            ...current,
-            revoked: true,
-          } satisfies Assignment);
-          // A child reports the uncertain outcome; its parent's failure destroys the shared sandbox.
-          if (assignment.sandbox && !assignment.parent) {
-            this.forgetSandbox();
-            await getSandbox(this.env.SANDBOX, assignment.sessionId).destroy();
-          }
-        }
-      }
-      return Response.json({
-        content: [
-          {
-            type: "text",
-            text: error instanceof ApiError ? error.message : "Code execution failed",
-          },
-        ],
-        isError: true,
-        terminal,
-      });
-    } finally {
-      controller.abort();
-      this.codeExecutions.delete(controller);
-    }
+        });
+        const failed = (error: ServiceError) =>
+          Effect.gen(this, function* () {
+            const cause = error._tag === "OperationError" ? error.cause : error;
+            const terminal =
+              cause instanceof ApiError && cause.code === "programmatic_execution_uncertain";
+            if (terminal) {
+              // A child reports the uncertain outcome; its parent's failure destroys the shared sandbox.
+              const revoked = yield* write((tx) => {
+                const latest = tx.requireAssignment();
+                if (superseded(latest, current)) return false;
+                tx.putAssignment({ ...latest, revoked: true });
+                if (current.sandbox && !current.parent) tx.forgetSandbox();
+                return true;
+              });
+              if (revoked && current.sandbox && !current.parent)
+                yield* io("programmatic.destroy", () =>
+                  getSandbox(this.env.SANDBOX, current.sessionId).destroy(),
+                );
+            }
+            return Response.json({
+              content: [
+                {
+                  type: "text",
+                  text: cause instanceof ApiError ? cause.message : "Code execution failed",
+                },
+              ],
+              isError: true,
+              terminal,
+            });
+          });
+        return yield* execute.pipe(
+          Effect.map((value) =>
+            Response.json({
+              content: [{ type: "text", text: JSON.stringify(value) }],
+              isError: false,
+            }),
+          ),
+          Effect.catchAll(failed),
+          Effect.ensuring(
+            Effect.sync(() => {
+              controller.abort();
+              this.codeExecutions.delete(controller);
+            }),
+          ),
+        );
+      }),
+    );
   }
   prepareEnvironment(...args: Parameters<EnvironmentDriver["prepare"]>) {
     const [spec] = args;
-    return runPromise(
+    return this.run(
       this.workspace.withPermits(1)(
         this.environment.prepare(...args).pipe(
           // Setup left the live sandbox holding exactly the committed base (plus whatever
           // setup commands wrote outside /workspace); the first turn can continue in it.
           Effect.zipRight(
-            Effect.suspend(() =>
-              this.sandboxState() || !this.environment.base()
-                ? Effect.void
-                : this.rememberSandbox(getSandbox(this.env.SANDBOX, spec.sessionId), {
-                    workspaceId: this.environment.base()?.id ?? "",
-                    provisioned: this.environment.inherited(),
-                  }),
-            ),
+            Effect.gen(this, function* () {
+              const base = this.environment.base();
+              if ((yield* read((tx) => tx.sandbox())) || !base) return;
+              yield* this.rememberSandbox(getSandbox(this.env.SANDBOX, spec.sessionId), {
+                workspaceId: base.id,
+                provisioned: this.environment.inherited(),
+              });
+            }),
           ),
         ),
       ),
     );
   }
-  private sandboxState(): SandboxState | undefined {
-    return this.db.get(Kinds.sandbox, "current");
-  }
-  private forgetSandbox(): void {
-    this.db.remove(Kinds.sandbox, "current");
-  }
   /** Record the workspace the live filesystem holds, inside the container and durably. */
   private rememberSandbox(sandbox: ISandbox, state: SandboxState) {
-    return Effect.gen(this, function* () {
+    return Effect.gen(function* () {
       const written = yield* io("sandbox.marker", () =>
         sandbox.writeFile(SANDBOX_MARKER, JSON.stringify({ workspaceId: state.workspaceId })),
       );
-      if (!written.success) return yield* Effect.fail(new Error("Sandbox marker write failed"));
-      yield* attempt("sandbox.remember", () => this.db.put(Kinds.sandbox, "current", state));
+      if (!written.success)
+        return yield* new TransportFailure({
+          operation: "sandbox.marker",
+          cause: "Sandbox marker write failed",
+        });
+      yield* write((tx) => tx.rememberSandbox(state));
     });
   }
   /** True when the running sandbox provably holds `workspaceId`; any doubt means restore. */
   private sandboxHolds(sandbox: ISandbox, sessionId: string, workspaceId: string) {
     return Effect.gen(this, function* () {
-      const state = this.sandboxState();
+      const state = yield* read((tx) => tx.sandbox());
       if (!state || state.workspaceId !== workspaceId) return false;
       const runtime = yield* io(
         "sandbox.status",
@@ -367,43 +454,35 @@ export class HarnessContainer<
     });
   }
   environmentStatus(...args: Parameters<EnvironmentDriver["status"]>) {
-    return runPromise(this.environment.status(...args));
+    return this.run(this.environment.status(...args));
   }
   async exportEnvironment(environmentId: string): Promise<ExportedEnvironment> {
     return this.environment.exported(environmentId);
   }
   uploadEnvironmentFile(...args: Parameters<EnvironmentDriver["upload"]>) {
-    return runPromise(this.workspace.withPermits(1)(this.environment.upload(...args)));
+    return this.run(this.workspace.withPermits(1)(this.environment.upload(...args)));
   }
   environmentFiles(...args: Parameters<EnvironmentDriver["files"]>) {
-    return runPromise(this.workspace.withPermits(1)(this.environment.files(...args)));
+    return this.run(this.workspace.withPermits(1)(this.environment.files(...args)));
   }
   protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
-  private assignment() {
-    return attempt("assignment", () => {
-      const assignment = this.db.get(Kinds.assignment, "current");
-      if (!assignment)
-        throw new ApiError(409, "unassigned_container", "Container has no session assignment");
-      return assignment;
-    });
-  }
   mcpRequest(request: Request): Promise<Response> {
-    return runPromise(
+    return this.run(
       Effect.gen(this, function* () {
-        const assignment = yield* this.assignment();
-        if (assignment.revoked)
+        const current = yield* assignment;
+        if (current.revoked)
           return new Response("Execution authority was revoked", { status: 409 });
-        const tool = assignment.mcp?.find(
-          (tool) => `/${tool.server_label}` === new URL(request.url).pathname,
+        const tool = current.mcp?.find(
+          (entry) => `/${entry.server_label}` === new URL(request.url).pathname,
         );
         if (!tool) return new Response(null, { status: 404 });
         if (tool.transport.type === "stdio" || tool.connection_origin === "environment") {
-          if (!assignment.sandbox || assignment.harness === "codex")
+          if (!current.sandbox || current.harness === "codex")
             return new Response(null, { status: 404 });
           const url = new URL(request.url);
           url.hostname = "environment-mcp.internal";
           return yield* io("mcp.environment", (signal) =>
-            this.env.SANDBOX.getByName(assignment.sessionId).fetch(
+            this.env.SANDBOX.getByName(current.sessionId).fetch(
               new Request(new Request(url, request), {
                 signal: AbortSignal.any([request.signal, signal]),
               }),
@@ -411,11 +490,11 @@ export class HarnessContainer<
           );
         }
         const serverURL = tool.transport.server_url;
-        const tenant = assignment.tenant;
+        const tenant = current.tenant;
         const token = tenant
           ? yield* io("mcp.credential", () =>
               this.env.CATALOG.getByName(tenant).mcpToken(
-                [...(assignment.vaultIds ?? [])],
+                [...(current.vaultIds ?? [])],
                 serverURL,
                 tool.credential_id,
               ),
@@ -426,7 +505,7 @@ export class HarnessContainer<
           request,
           tool,
           token,
-          sender ? (request) => sender.fetch(request) : fetch,
+          sender ? (outbound) => sender.fetch(outbound) : fetch,
         );
       }),
     );
@@ -439,206 +518,214 @@ export class HarnessContainer<
    * children. Children run in their own HarnessDO and Container but share the
    * parent's sandbox; the parent's assignment remains the authorization boundary.
    */
-  async delegateRequest(request: Request): Promise<Response> {
-    const assignment = await runPromise(this.assignment());
-    const url = new URL(request.url);
-    const [turnId, target, action] = url.pathname.split("/").slice(1);
-    const delegation = assignment.delegation;
-    if (assignment.revoked || turnId !== assignment.turnId || !delegation)
-      return new Response("Delegation is not available for this execution", { status: 403 });
-    if (request.method === "POST" && target === "spawn" && !action)
-      return this.spawnChild(assignment, delegation, await request.json());
-    if (!target) return new Response(null, { status: 404 });
-    const child = this.db.get(Kinds.child, target);
-    if (!child || child.execution.parent?.turnId !== turnId)
-      return new Response("Unknown subagent", { status: 404 });
-    if (request.method === "GET" && !action) {
-      if (child.terminal) return Response.json(child.terminal);
-      const after = z.coerce
-        .number()
-        .int()
-        .min(0)
-        .parse(url.searchParams.get("after") ?? "0");
-      const batch = decode(
-        batchSchema,
-        await (await this.child(target).pollExecution(child.execution, after)).json(),
-      );
-      if (batch.status !== "running" && batch.status !== "waiting") {
-        // Durable before the child Container disappears, so a lost response can be retried.
-        this.db.put(Kinds.child, target, { ...child, terminal: batch } satisfies ChildRecord);
-        await this.child(target)
-          .stopExecution(child.execution)
-          .catch((error) => console.warn("Delegated child stop failed", { error: String(error) }));
-      }
-      return Response.json(batch);
-    }
-    if (request.method === "POST" && action === "control") {
-      if (child.terminal) return new Response("Subagent has stopped", { status: 409 });
-      const body = decode(
-        Schema.Struct({ operationId: Schema.String, command: commandSchema }),
-        await request.json(),
-      );
-      await this.child(target).controlExecution(child.execution, body.operationId, body.command);
-      return new Response(null, { status: 204 });
-    }
-    return new Response(null, { status: 404 });
+  delegateRequest(request: Request): Promise<Response> {
+    return this.run(
+      Effect.gen(this, function* () {
+        const current = yield* assignment;
+        const url = new URL(request.url);
+        const [turnId, target, action] = url.pathname.split("/").slice(1);
+        const delegation = current.delegation;
+        if (current.revoked || turnId !== current.turnId || !delegation)
+          return new Response("Delegation is not available for this execution", { status: 403 });
+        if (request.method === "POST" && target === "spawn" && !action)
+          return yield* this.spawnChild(
+            current,
+            delegation,
+            yield* io("delegate.body", () => request.json()),
+          );
+        if (!target) return new Response(null, { status: 404 });
+        const child = yield* read((tx) => tx.child(target));
+        if (!child || child.execution.parent?.turnId !== turnId)
+          return new Response("Unknown subagent", { status: 404 });
+        if (request.method === "GET" && !action) {
+          if (child.terminal) return Response.json(child.terminal);
+          const after = yield* attempt("delegate.cursor", () =>
+            z.coerce
+              .number()
+              .int()
+              .min(0)
+              .parse(url.searchParams.get("after") ?? "0"),
+          );
+          const polled = yield* io("delegate.poll", () =>
+            this.child(target).pollExecution(child.execution, after),
+          );
+          const batch = yield* decodeEffect(
+            batchSchema,
+            yield* io("delegate.poll", () => polled.json()),
+          );
+          if (batch.status !== "running" && batch.status !== "waiting") {
+            // Durable before the child Container disappears, so a lost response can be retried.
+            yield* write((tx) => tx.putChild(target, { ...child, terminal: batch }));
+            yield* io("delegate.stop", () =>
+              this.child(target).stopExecution(child.execution),
+            ).pipe(
+              Effect.catchAll((error) =>
+                Effect.logWarning("Delegated child stop failed", { error: String(error) }),
+              ),
+            );
+          }
+          return Response.json(batch);
+        }
+        if (request.method === "POST" && action === "control") {
+          if (child.terminal) return new Response("Subagent has stopped", { status: 409 });
+          const body = yield* decodeEffect(
+            Schema.Struct({ operationId: Schema.String, command: commandSchema }),
+            yield* io("delegate.body", () => request.json()),
+          );
+          yield* io("delegate.control", () =>
+            this.child(target).controlExecution(child.execution, body.operationId, body.command),
+          );
+          return new Response(null, { status: 204 });
+        }
+        return new Response(null, { status: 404 });
+      }),
+    );
   }
-  private async spawnChild(
-    assignment: Assignment,
+  private spawnChild(
+    current: Assignment,
     delegation: NonNullable<Assignment["delegation"]>,
     input: unknown,
-  ): Promise<Response> {
-    const parsed = spawnRequestSchema.safeParse(input);
-    if (!parsed.success) return new Response("Invalid spawn request", { status: 400 });
-    const delegate = delegation.delegates.find((entry) => entry.alias === parsed.data.alias);
-    if (!delegate) return new Response("Unknown delegate", { status: 404 });
-    const children = assignment.children ?? [];
-    const active = children.filter((id) => !this.db.get(Kinds.child, id)?.terminal).length;
-    if (active >= delegation.maxConcurrentSubagents)
-      return new Response("Concurrent subagent limit reached", { status: 409 });
-    const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
-    const turnId = `turn_${crypto.randomUUID().replaceAll("-", "")}`;
-    const execution: Execution = {
-      sessionId: assignment.sessionId,
-      turnId,
-      generation: assignment.generation,
-      harness: delegate.harness,
-      model: delegate.model,
-      agent: {
-        model: delegate.alias,
-        instructions: delegation.agent.instructions ?? null,
-        // Children keep the parent's client, MCP and code tools; provider search follows the child runtime.
-        tools: (delegation.agent.tools ?? []).filter(
-          (tool) => tool.type !== "web_search" || delegate.harness === "codex",
-        ),
-        reasoning: delegation.agent.reasoning ?? null,
-        multi_agent: { enabled: false },
-      },
-      input: [{ role: "user", content: [{ type: "input_text", text: parsed.data.prompt }] }],
-      checkpoint: null,
-      deadline: delegation.deadline,
-      sandbox: assignment.sandbox,
-      ...(delegation.environmentId ? { environmentId: delegation.environmentId } : {}),
-      capabilityRoots: this.environment.capabilityRoots(),
-      ...(assignment.tenant ? { tenant: assignment.tenant } : {}),
-      ...(assignment.vaultIds ? { vaultIds: [...assignment.vaultIds] } : {}),
-      parent: { turnId: assignment.turnId, subagentId },
-    };
-    this.db.transaction(() => {
-      this.db.put(Kinds.child, subagentId, { execution } satisfies ChildRecord);
-      this.db.put(Kinds.assignment, "current", {
-        ...assignment,
-        children: [...children, subagentId],
-      } satisfies Assignment);
+  ) {
+    return Effect.gen(this, function* () {
+      const parsed = spawnRequestSchema.safeParse(input);
+      if (!parsed.success) return new Response("Invalid spawn request", { status: 400 });
+      const delegate = delegation.delegates.find((entry) => entry.alias === parsed.data.alias);
+      if (!delegate) return new Response("Unknown delegate", { status: 404 });
+      const children = current.children ?? [];
+      const active = yield* read((tx) => children.filter((id) => !tx.child(id)?.terminal).length);
+      if (active >= delegation.maxConcurrentSubagents)
+        return new Response("Concurrent subagent limit reached", { status: 409 });
+      const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
+      const turnId = `turn_${crypto.randomUUID().replaceAll("-", "")}`;
+      const execution: Execution = {
+        sessionId: current.sessionId,
+        turnId,
+        generation: current.generation,
+        harness: delegate.harness,
+        model: delegate.model,
+        agent: {
+          model: delegate.alias,
+          instructions: delegation.agent.instructions ?? null,
+          // Children keep the parent's client, MCP and code tools; provider search follows the child runtime.
+          tools: (delegation.agent.tools ?? []).filter(
+            (tool) => tool.type !== "web_search" || delegate.harness === "codex",
+          ),
+          reasoning: delegation.agent.reasoning ?? null,
+          multi_agent: { enabled: false },
+        },
+        input: [{ role: "user", content: [{ type: "input_text", text: parsed.data.prompt }] }],
+        checkpoint: null,
+        deadline: delegation.deadline,
+        sandbox: current.sandbox,
+        ...(delegation.environmentId ? { environmentId: delegation.environmentId } : {}),
+        capabilityRoots: this.environment.capabilityRoots(),
+        ...(current.tenant ? { tenant: current.tenant } : {}),
+        ...(current.vaultIds ? { vaultIds: [...current.vaultIds] } : {}),
+        parent: { turnId: current.turnId, subagentId },
+      };
+      yield* write((tx) => {
+        tx.putChild(subagentId, { execution });
+        tx.putAssignment({ ...current, children: [...children, subagentId] });
+      });
+      const started = yield* io("delegate.start", () =>
+        this.child(subagentId).startExecution(execution, `${turnId}:start`),
+      ).pipe(Effect.either);
+      if (started._tag === "Left") {
+        yield* Effect.logWarning("Delegated child start failed", {
+          subagentId,
+          error: String(started.left),
+        });
+        yield* write((tx) =>
+          tx.putChild(subagentId, {
+            execution,
+            terminal: { status: "failed", events: [], cursor: 0, error: "subagent_start_failed" },
+          }),
+        );
+        yield* io("delegate.stop", () => this.child(subagentId).stopExecution(execution)).pipe(
+          Effect.ignore,
+        );
+        return new Response("Subagent could not be started", { status: 502 });
+      }
+      return Response.json({ subagentId, turnId });
     });
-    try {
-      await this.child(subagentId).startExecution(execution, `${turnId}:start`);
-    } catch (error) {
-      console.warn("Delegated child start failed", { subagentId, error: String(error) });
-      this.db.put(Kinds.child, subagentId, {
-        execution,
-        terminal: { status: "failed", events: [], cursor: 0, error: "subagent_start_failed" },
-      } satisfies ChildRecord);
-      await this.child(subagentId)
-        .stopExecution(execution)
-        .catch(() => {});
-      return new Response("Subagent could not be started", { status: 502 });
-    }
-    return Response.json({ subagentId, turnId });
   }
   override async fetch(request: Request): Promise<Response> {
-    if (new URL(request.url).hostname === "sandbox.internal") return this.sandboxRequest(request);
+    if (new URL(request.url).hostname === "sandbox.internal")
+      return this.run(this.sandboxRequest(request));
     return super.fetch(request);
   }
-  private async sandboxRequest(request: Request): Promise<Response> {
-    const assignment = await runPromise(this.assignment());
-    if (assignment.revoked) return new Response("Execution authority was revoked", { status: 409 });
-    if (!assignment.sandbox) return new Response("No sandbox assigned", { status: 403 });
-    if (new URL(request.url).pathname === "/tools" && request.method === "POST") {
-      const input = await request.json();
-      const abort = new AbortController();
-      let onOutput: ((text: string) => void) | undefined;
-      const operation = () =>
-        runPromise(
-          this.workspace.withPermits(1)(
-            io("workspace.tool", async () => {
-              const current = await runPromise(this.assignment());
-              if (
-                current.revoked ||
-                current.turnId !== assignment.turnId ||
-                current.generation !== assignment.generation
-              )
-                throw new ApiError(409, "stale_generation", "Execution was superseded");
-              abort.signal.throwIfAborted();
-              return executeWorkspaceTool(
-                getSandbox(this.env.SANDBOX, assignment.sessionId),
-                input,
-                onOutput ? { onOutput, signal: abort.signal } : undefined,
-              );
-            }),
+  private sandboxRequest(request: Request) {
+    return Effect.gen(this, function* () {
+      const current = yield* assignment;
+      if (current.revoked) return new Response("Execution authority was revoked", { status: 409 });
+      if (!current.sandbox) return new Response("No sandbox assigned", { status: 403 });
+      if (new URL(request.url).pathname !== "/tools" || request.method !== "POST")
+        return yield* io("sandbox.proxy", () =>
+          this.env.SANDBOX.getByName(current.sessionId).fetch(request),
+        );
+      const input = yield* io("workspace.tool.body", () => request.json());
+      const operation = (onOutput?: (text: string) => void) =>
+        this.workspace.withPermits(1)(
+          io("workspace.tool", async (signal) => {
+            const latest = this.tx.requireAssignment();
+            if (latest.revoked || superseded(latest, current))
+              throw new ApiError(409, "stale_generation", "Execution was superseded");
+            signal.throwIfAborted();
+            return executeWorkspaceTool(
+              getSandbox(this.env.SANDBOX, current.sessionId),
+              input,
+              onOutput ? { onOutput, signal } : undefined,
+            );
+          }),
+        );
+      if (request.headers.get("accept") !== "application/x-ndjson")
+        return yield* operation().pipe(
+          Effect.map((result) => Response.json(result)),
+          Effect.orElseSucceed(() =>
+            Response.json({ error: "Workspace operation failed" }, { status: 422 }),
           ),
         );
-      if (request.headers.get("accept") === "application/x-ndjson") {
-        const encoder = new TextEncoder();
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              const send = (value: unknown) => {
-                if (!abort.signal.aborted)
-                  controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
-              };
-              onOutput = (text) => send({ type: "delta", text });
-              void operation()
-                .then(
-                  (result) => send({ type: "result", ...result }),
-                  () => send({ type: "error", message: "Workspace operation failed" }),
-                )
-                .finally(() => {
-                  // The consumer may already have closed the stream without cancelling it.
-                  try {
-                    if (!abort.signal.aborted) controller.close();
-                  } catch {
-                    abort.abort();
-                  }
-                });
-            },
-            cancel() {
-              abort.abort();
-            },
-          }),
-          { headers: { "content-type": "application/x-ndjson" } },
-        );
-      }
-      try {
-        return Response.json(await operation());
-      } catch {
-        return Response.json({ error: "Workspace operation failed" }, { status: 422 });
-      }
-    }
-    return this.env.SANDBOX.getByName(assignment.sessionId).fetch(request);
+      const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+      // The response stream owns the operation: cancelling it interrupts the fiber, which
+      // aborts the command through the signal and releases the workspace permit.
+      const lines = Stream.asyncPush<string>((emit) =>
+        Effect.forkScoped(
+          operation((text) => emit.single(line({ type: "delta", text }))).pipe(
+            Effect.match({
+              onSuccess: (result) => emit.single(line({ type: "result", ...result })),
+              onFailure: () =>
+                emit.single(line({ type: "error", message: "Workspace operation failed" })),
+            }),
+            Effect.ensuring(Effect.sync(() => emit.end())),
+          ),
+        ),
+      );
+      const body = yield* Stream.toReadableStreamEffect(lines.pipe(Stream.encodeText));
+      return new Response(body, { headers: { "content-type": "application/x-ndjson" } });
+    });
   }
   modelRequest(request: Request): Promise<Response> {
-    return runPromise(
+    return this.run(
       Effect.gen(this, function* () {
-        const assignment = yield* this.assignment();
-        if (assignment.revoked)
+        const current = yield* assignment;
+        if (current.revoked)
           return new Response("Execution authority was revoked", { status: 409 });
         const url = new URL(request.url);
-        if (request.method !== "POST" || url.pathname !== HARNESSES[assignment.harness].protocol)
+        if (request.method !== "POST" || url.pathname !== HARNESSES[current.harness].protocol)
           return new Response("Unsupported model request", { status: 403 });
         const bytes = yield* io("modelRequest", () => readModelBody(request));
         const body = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
-        if (!body || body.model !== assignment.model)
+        if (!body || body.model !== current.model)
           return new Response("Model is not assigned to this execution", { status: 403 });
-        const current = yield* this.assignment();
-        if (current.turnId !== assignment.turnId || current.generation !== assignment.generation)
+        const latest = yield* assignment;
+        if (superseded(latest, current))
           return new Response("Execution was superseded", { status: 409 });
         return yield* io("modelRequest", (signal) =>
           this.env.MODEL_GATEWAY.fetch(
             new Request(request, {
               body:
-                assignment.harness === "codex" && assignment.webSearchMode !== undefined
-                  ? JSON.stringify(constrainCodexSearch(body, assignment.webSearchMode))
+                current.harness === "codex" && current.webSearchMode !== undefined
+                  ? JSON.stringify(constrainCodexSearch(body, current.webSearchMode))
                   : bytes,
               signal: AbortSignal.any([request.signal, signal]),
             }),
@@ -648,7 +735,7 @@ export class HarnessContainer<
     );
   }
   startExecution(execution: Execution, operationId: string): Promise<void> {
-    return runPromise(
+    return this.run(
       this.lifecycle.withPermits(1)(
         this.workspace.withPermits(1)(this.startAttempt(execution, operationId)),
       ),
@@ -657,39 +744,33 @@ export class HarnessContainer<
   private startAttempt(execution: Execution, operationId: string) {
     return Effect.gen(this, function* () {
       if (!Object.hasOwn(HARNESSES, execution.harness))
-        return yield* Effect.fail(
-          new ApiError(400, "unsupported_harness", "Unknown Container harness"),
-        );
+        return yield* new ApiError(400, "unsupported_harness", "Unknown Container harness");
       const harness = execution.harness as HarnessName;
       if (
         execution.checkpoint &&
         (execution.checkpoint.driver !== harness ||
           execution.checkpoint.revision !== HARNESSES[harness].revision)
       )
-        return yield* Effect.fail(
-          new ApiError(
-            409,
-            "checkpoint_incompatible",
-            "Checkpoint belongs to another harness version",
-          ),
+        return yield* new ApiError(
+          409,
+          "checkpoint_incompatible",
+          "Checkpoint belongs to another harness version",
         );
-      const previous = yield* attempt("startAttempt", () =>
-        this.db.get(Kinds.assignment, "current"),
-      );
+      const previous = yield* read((tx) => tx.assignment());
       if (
         previous &&
         (execution.generation < previous.generation ||
           (execution.generation === previous.generation && execution.turnId !== previous.turnId))
       )
-        return yield* Effect.fail(
-          new ApiError(409, "stale_generation", "Execution was superseded"),
-        );
+        return yield* new ApiError(409, "stale_generation", "Execution was superseded");
       if (previous?.turnId === execution.turnId && previous.dispatched) return;
       if (previous && previous.sessionId !== execution.sessionId)
-        return yield* Effect.fail(
-          new ApiError(409, "assignment_conflict", "Container already belongs to another session"),
+        return yield* new ApiError(
+          409,
+          "assignment_conflict",
+          "Container already belongs to another session",
         );
-      const assignment: Assignment = {
+      const assigned: Assignment = {
         sessionId: execution.sessionId,
         generation: execution.generation,
         turnId: execution.turnId,
@@ -707,7 +788,7 @@ export class HarnessContainer<
         tenant: execution.tenant,
         vaultIds: execution.vaultIds,
         mcp: (execution.agent.tools ?? []).filter((tool) => tool.type === "mcp"),
-        imageDigests: yield* this.imageDigests(
+        imageDigests: yield* imageDigests(
           remoteImageURLs(execution.input.flatMap((message) => message.content)),
           [],
         ),
@@ -739,8 +820,8 @@ export class HarnessContainer<
           : {}),
         ...(execution.parent ? { parent: execution.parent } : {}),
       };
-      for (const controller of this.codeExecutions) controller.abort();
-      yield* attempt("startAttempt", () => this.db.put(Kinds.assignment, "current", assignment));
+      this.abortCodeExecutions();
+      yield* write((tx) => tx.putAssignment(assigned));
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const previousCheckpoint = execution.checkpoint;
       const previousWorkspace = previousCheckpoint?.workspace ?? this.environment.base();
@@ -761,7 +842,7 @@ export class HarnessContainer<
         // filesystem checkpoint: destroy, restore, and configure the fresh container.
         const reused = yield* this.sandboxHolds(sandbox, execution.sessionId, workspaceId);
         if (!reused) {
-          yield* attempt("startAttempt.forget", () => this.forgetSandbox());
+          yield* write((tx) => tx.forgetSandbox());
           yield* io("startAttempt", () => sandbox.destroy());
           if (previousWorkspace)
             yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
@@ -776,7 +857,7 @@ export class HarnessContainer<
           });
         }
         // The deployment hook runs once per fresh workspace; an inherited workspace was provisioned.
-        if (!this.sandboxState()?.provisioned) {
+        if (!(yield* read((tx) => tx.sandbox()))?.provisioned) {
           yield* io("startAttempt", () => this.prepareSandbox(sandbox, execution));
           yield* this.rememberSandbox(sandbox, { workspaceId, provisioned: true });
         }
@@ -793,7 +874,7 @@ export class HarnessContainer<
         : this.environment.capabilityRoots();
       let portableInstructions = "";
       if (harness !== "codex" && execution.sandbox) {
-        const configured = assignment.mcp ?? [];
+        const configured = assigned.mcp ?? [];
         // Plugin-derived labels are sanitized and kept distinct from configured servers, so
         // workspace content can add servers but never replace or break configured ones.
         const discovered = yield* io("capabilities.discover", () =>
@@ -807,8 +888,8 @@ export class HarnessContainer<
           }),
         );
         portableInstructions = discovered.instructions;
-        assignment.mcp = [...configured, ...discovered.mcp];
-        const environmentServers = assignment.mcp.filter(
+        assigned.mcp = [...configured, ...discovered.mcp];
+        const environmentServers = assigned.mcp.filter(
           (tool) => tool.transport.type === "stdio" || tool.connection_origin === "environment",
         );
         if (environmentServers.length && !(yield* listening(4501))) {
@@ -837,9 +918,7 @@ export class HarnessContainer<
           this.env.CHECKPOINTS.get(previousCheckpoint.native),
         );
         if (!object)
-          return yield* Effect.fail(
-            new ApiError(409, "checkpoint_missing", "Native checkpoint is missing"),
-          );
+          return yield* new ApiError(409, "checkpoint_missing", "Native checkpoint is missing");
         checkpoint = yield* io("startAttempt", () => object.json());
       }
       yield* io("startAttempt", (signal) =>
@@ -849,9 +928,7 @@ export class HarnessContainer<
       // marker and the dispatch it describes are one uninterruptible step: an interrupt
       // between them, or mid-request, would leave a marker for a job that never started.
       const result = yield* Effect.uninterruptible(
-        attempt("startAttempt", () =>
-          this.db.put(Kinds.assignment, "current", { ...assignment, dispatched: true }),
-        ).pipe(
+        write((tx) => tx.putAssignment({ ...assigned, dispatched: true })).pipe(
           Effect.zipRight(
             io("startAttempt", () =>
               this.containerFetch("http://harness/jobs", {
@@ -868,7 +945,7 @@ export class HarnessContainer<
                         .join("\n\n"),
                       tools: [
                         ...(execution.agent.tools ?? []).filter((tool) => tool.type !== "mcp"),
-                        ...(assignment.mcp ?? []),
+                        ...(assigned.mcp ?? []),
                       ].map((tool) =>
                         tool.type === "mcp" &&
                         (harness !== "codex" ||
@@ -903,19 +980,26 @@ export class HarnessContainer<
         });
     });
   }
-  pollExecution(execution: Execution, after: number): Promise<Response> {
-    return runPromise(
+  /**
+   * Events after `after`. With `waitMs` above zero and a dispatched, unrevoked assignment,
+   * the supervisor holds an empty answer up to that long for the next event or terminal
+   * outcome; the reconciler stays under its alarm interval, and this stays under 25 s.
+   */
+  pollExecution(execution: Execution, after: number, waitMs = 0): Promise<Response> {
+    return this.run(
       Effect.gen(this, function* () {
-        const assignment = yield* this.assignment();
-        if (
-          assignment.turnId !== execution.turnId ||
-          assignment.generation !== execution.generation
-        )
+        const current = yield* assignment;
+        if (superseded(current, execution))
           return Response.json({ status: "missing", events: [], cursor: 0 });
+        const wait =
+          current.dispatched && !current.revoked
+            ? Math.min(Math.max(0, Math.floor(waitMs)), LONG_POLL_MAX_MS)
+            : 0;
         return yield* io("pollExecution", (signal) =>
-          this.containerFetch(`http://harness/jobs/${execution.turnId}?after=${after}`, {
-            signal,
-          }),
+          this.containerFetch(
+            `http://harness/jobs/${execution.turnId}?after=${after}${wait > 0 ? `&wait=${wait}` : ""}`,
+            { signal },
+          ),
         );
       }),
     );
@@ -925,31 +1009,16 @@ export class HarnessContainer<
     operationId: string,
     command: RuntimeCommand,
   ): Promise<void> {
-    return runPromise(
+    return this.run(
       Effect.gen(this, function* () {
-        const assignment = yield* this.assignment();
-        if (
-          assignment.turnId !== execution.turnId ||
-          assignment.generation !== execution.generation
-        )
-          return yield* Effect.fail(
-            new ApiError(409, "stale_generation", "Execution was superseded"),
-          );
-        const parts =
-          command.type === "steer"
-            ? command.input.flatMap((message) => message.content)
-            : command.type === "tool_result" && Array.isArray(command.output)
-              ? command.output
-              : [];
+        const current = yield* assignment;
+        if (superseded(current, execution))
+          return yield* new ApiError(409, "stale_generation", "Execution was superseded");
+        const parts = commandParts(command);
         const allowedImages = remoteImageURLs(parts);
         if (allowedImages.length) {
-          const imageDigests = yield* this.imageDigests(
-            allowedImages,
-            assignment.imageDigests ?? [],
-          );
-          yield* attempt("controlExecution.images", () =>
-            this.db.put(Kinds.assignment, "current", { ...assignment, imageDigests }),
-          );
+          const digests = yield* imageDigests(allowedImages, current.imageDigests ?? []);
+          yield* write((tx) => tx.putAssignment({ ...current, imageDigests: digests }));
         }
         // Interruptible: the supervisor deduplicates control by operationId, so an aborted
         // delivery is retried by the next alarm without applying the command twice.
@@ -961,8 +1030,7 @@ export class HarnessContainer<
             signal,
           }),
         );
-        if (command.type === "cancel")
-          for (const controller of this.codeExecutions) controller.abort();
+        if (command.type === "cancel") this.abortCodeExecutions();
         if (!result.ok) {
           // A definite rejection is an API error the session can act on; anything else is retried.
           const body = yield* io(
@@ -972,12 +1040,7 @@ export class HarnessContainer<
                 .json<{ code?: unknown; message?: unknown; error?: unknown }>()
                 .catch(() => ({})),
           );
-          const message =
-            typeof body.message === "string"
-              ? body.message
-              : typeof body.error === "string"
-                ? body.error
-                : `Harness rejected control (${result.status})`;
+          const message = rejectionMessage(body, result.status);
           if (result.status === 409)
             return yield* new CommandRejected({ code: "command_rejected", message });
           if (result.status === 404) return yield* new ExecutionMissing({ message });
@@ -987,25 +1050,23 @@ export class HarnessContainer<
     );
   }
   checkpointExecution(execution: Execution): Promise<Checkpoint> {
-    return runPromise(
+    return this.run(
       this.lifecycle.withPermits(1)(this.workspace.withPermits(1)(this.snapshot(execution))),
     );
   }
   private snapshot(execution: Execution) {
     return Effect.gen(this, function* () {
-      const assignment = yield* this.assignment();
-      if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
-        return yield* Effect.fail(
-          new ApiError(409, "stale_generation", "Execution was superseded"),
-        );
-      if (assignment.parent)
-        return yield* Effect.fail(
-          new ApiError(409, "invalid_checkpoint", "Delegated children are not checkpointed"),
+      const current = yield* assignment;
+      if (superseded(current, execution))
+        return yield* new ApiError(409, "stale_generation", "Execution was superseded");
+      if (current.parent)
+        return yield* new ApiError(
+          409,
+          "invalid_checkpoint",
+          "Delegated children are not checkpointed",
         );
       const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
-      const committed = yield* attempt("snapshot", () =>
-        this.db.get(Kinds.checkpoint, String(execution.generation)),
-      );
+      const committed = yield* read((tx) => tx.checkpoint(execution.generation));
       if (committed) return committed;
       const response = yield* io("snapshot", (signal) =>
         this.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`, { signal }),
@@ -1032,111 +1093,36 @@ export class HarnessContainer<
       // The live filesystem now equals the committed workspace; the next turn may continue in it.
       if (workspace)
         yield* this.rememberSandbox(sandbox, { workspaceId: workspace.id, provisioned: true }).pipe(
-          Effect.catchAll(() => attempt("snapshot.forget", () => this.forgetSandbox())),
+          Effect.catchAll(() => write((tx) => tx.forgetSandbox())),
         );
       const artifacts =
-        execution.sandbox && execution.environmentId ? yield* this.publishArtifacts(execution) : [];
+        execution.sandbox && execution.environmentId ? yield* publishArtifacts(execution) : [];
       const checkpoint: Checkpoint = {
         version: 1,
-        driver: assignment.harness,
-        revision: HARNESSES[assignment.harness].revision,
+        driver: current.harness,
+        revision: HARNESSES[current.harness].revision,
         native: key,
         ...(workspace ? { workspace } : {}),
         artifacts,
         environmentFileVersion: this.environment.fileVersion(),
       };
-      yield* attempt("snapshot", () =>
-        this.db.put(Kinds.checkpoint, String(execution.generation), checkpoint),
-      );
+      yield* write((tx) => tx.putCheckpoint(execution.generation, checkpoint));
       return checkpoint;
     });
   }
-  private publishArtifacts(execution: Execution) {
-    return Effect.gen(this, function* () {
-      const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
-      if (!(yield* io("artifact.exists", () => sandbox.exists("/workspace/outputs"))).exists)
-        return [];
-      const manifestKey = String(execution.generation);
-      let manifest = yield* attempt("artifact.manifest.get", () =>
-        this.db.get(Kinds.artifacts, manifestKey),
-      );
-      if (!manifest) {
-        const listing = yield* io("artifact.list", () =>
-          sandbox.listFiles("/workspace/outputs", { recursive: true, includeHidden: true }),
-        );
-        if (!listing.success)
-          return yield* new ApiError(503, "artifact_list_failed", "Artifact listing failed");
-        const files = listing.files.filter((file) => file.type === "file");
-        if (
-          files.some((file) => file.size > 200 * 1024 * 1024) ||
-          files.reduce((sum, file) => sum + file.size, 0) > 500 * 1024 * 1024
-        )
-          return yield* new ApiError(
-            413,
-            "artifact_limit",
-            "Artifacts exceed 200 MiB per file or 500 MiB per turn",
-          );
-        manifest = yield* Effect.forEach(files, (file) =>
-          Effect.gen(function* () {
-            const hash = yield* io("artifact.hash", () =>
-              crypto.subtle.digest(
-                "SHA-256",
-                new TextEncoder().encode(`${execution.turnId}\0${file.absolutePath}`),
-              ),
-            );
-            const id = `artifact_${Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-            return {
-              id,
-              key: `artifacts/${execution.sessionId}/${id}`,
-              path: file.absolutePath,
-              size_bytes: file.size,
-              session_id: execution.sessionId,
-              environment_id: execution.environmentId ?? "",
-              turn_id: execution.turnId,
-              created_at: Math.floor(Date.now() / 1000),
-            };
-          }),
-        );
-        const built = manifest;
-        yield* attempt("artifact.manifest.commit", () =>
-          this.db.put(Kinds.artifacts, manifestKey, built),
-        );
-      }
-      yield* Effect.forEach(
-        manifest,
-        (artifact) =>
-          Effect.gen(this, function* () {
-            if (yield* io("artifact.head", () => this.env.CHECKPOINTS.head(artifact.key))) return;
-            const source = yield* io("artifact.read", () =>
-              sandbox.readFile(artifact.path, { encoding: "none" }),
-            );
-            yield* copyKnownLength(source.content, artifact.size_bytes, (stream) =>
-              this.env.CHECKPOINTS.put(artifact.key, stream, {
-                httpMetadata: { contentType: "application/octet-stream" },
-              }),
-            );
-          }),
-        { discard: true },
-      );
-      return manifest;
-    });
-  }
   stopExecution(execution: Execution): Promise<void> {
-    return runPromise(
+    return this.run(
       this.lifecycle.withPermits(1)(this.workspace.withPermits(1)(this.stopAttempt(execution))),
     );
   }
   private stopAttempt(execution: Execution) {
     return Effect.gen(this, function* () {
-      const assignment = yield* this.assignment();
-      if (assignment.turnId !== execution.turnId || assignment.generation !== execution.generation)
-        return;
-      for (const controller of this.codeExecutions) controller.abort();
-      yield* attempt("stopAttempt.revoke", () =>
-        this.db.put(Kinds.assignment, "current", { ...assignment, revoked: true }),
-      );
+      const current = yield* assignment;
+      if (superseded(current, execution)) return;
+      this.abortCodeExecutions();
+      yield* write((tx) => tx.putAssignment({ ...current, revoked: true }));
       // Native stderr is lost with the Container; keep a bounded tail in Worker logs.
-      if (assignment.dispatched)
+      if (current.dispatched)
         yield* io("stopAttempt.diagnostics", async (signal) => {
           const response = await this.containerFetch("http://harness/diagnostics", {
             signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
@@ -1151,21 +1137,38 @@ export class HarnessContainer<
             });
         }).pipe(Effect.ignore);
       // Children stop before the parent releases the sandbox they share.
-      for (const subagentId of assignment.children ?? []) {
-        const child = this.db.get(Kinds.child, subagentId);
-        if (child && !child.terminal)
-          yield* io("stopAttempt.child", () =>
-            this.child(subagentId).stopExecution(child.execution),
-          ).pipe(Effect.ignore);
-      }
+      const children = yield* read((tx) =>
+        (current.children ?? []).flatMap((subagentId) => {
+          const child = tx.child(subagentId);
+          return child && !child.terminal ? [{ subagentId, execution: child.execution }] : [];
+        }),
+      );
+      for (const child of children)
+        yield* io("stopAttempt.child", () =>
+          this.child(child.subagentId).stopExecution(child.execution),
+        ).pipe(Effect.ignore);
       yield* io("stopAttempt", () => this.destroy());
-      if (assignment.sandbox && !assignment.parent) {
+      if (current.sandbox && !current.parent) {
         // Uncommitted workspace state is discarded; the next turn restores the last checkpoint.
-        yield* attempt("stopAttempt.forget", () => this.forgetSandbox());
+        yield* write((tx) => tx.forgetSandbox());
         yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
       }
     });
   }
+}
+/** Image-bearing parts of a command, for the digest allow-list. */
+function commandParts(command: RuntimeCommand): readonly { type: string; image_url?: string }[] {
+  if (command.type === "steer") return command.input.flatMap((message) => message.content);
+  if (command.type === "tool_result" && Array.isArray(command.output)) return command.output;
+  return [];
+}
+function rejectionMessage(
+  body: { code?: unknown; message?: unknown; error?: unknown },
+  status: number,
+): string {
+  if (typeof body.message === "string") return body.message;
+  if (typeof body.error === "string") return body.error;
+  return `Harness rejected control (${status})`;
 }
 
 export function containerEnvironments(env: ContainerBindings): EnvironmentDriver {
@@ -1258,8 +1261,13 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
     start: async (execution, operationId) => {
       await stub(execution).startExecution(execution, operationId);
     },
-    poll: async (execution, after) =>
-      decode(batchSchema, await (await stub(execution).pollExecution(execution, after)).json()),
+    // The supervisor holds an empty answer for `waitMs`; see `HarnessContainer.pollExecution`.
+    longPoll: true,
+    poll: async (execution, after, _signal, options) =>
+      decode(
+        batchSchema,
+        await (await stub(execution).pollExecution(execution, after, options.waitMs)).json(),
+      ),
     control: async (execution, operationId, command) => {
       await stub(execution).controlExecution(execution, operationId, command);
     },

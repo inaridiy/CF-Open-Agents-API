@@ -1,13 +1,31 @@
 import { DurableObject } from "cloudflare:workers";
-import { type Context, Effect, Option, Schema } from "effect";
+import {
+  Clock,
+  type Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  FiberId,
+  Option,
+  PubSub,
+  Queue,
+  Schedule,
+  Schema,
+  Stream,
+} from "effect";
 import type { AgentSessionEnvironmentState, Subagent } from "openai/resources/beta/agents/agents";
 
 import { attempt, runSync, settle } from "./effect.js";
 import type { EnvironmentSpec } from "./environments.js";
-import { encodeRpc, rpcEnvelope } from "./errors.js";
+import { encodeRpc, rpcEnvelope, type StorageFailure } from "./errors.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import { type ArtifactRecord, migrate, type SessionRecord } from "./persistence/session-record.js";
-import { makeSessionRepo, type SessionRepo } from "./persistence/session-repo.js";
+import {
+  makeSessionRepo,
+  type SessionRepo,
+  type SessionTxError,
+} from "./persistence/session-repo.js";
 import { makeSessionTx, type SessionTx } from "./persistence/session-tx.js";
 import type {
   AgentConfig,
@@ -159,18 +177,39 @@ const submitProgram = (events: InputEvent[], key: string) =>
     );
     return null;
   });
-interface Listener {
-  cursor: number;
-  /** A creation stream ends once the initial turn settles or when there is no input. */
-  initial: boolean;
-}
+/** Live SSE listeners per session object; the 65th request is refused with `stream_limit`. */
+const LISTENER_LIMIT = 64;
+/** Events a listener reads from SQLite per pull; the ReadableStream queue bounds the bytes. */
+const EVENT_PAGE = 64;
+const SSE_HEADERS = {
+  "content-type": "text/event-stream",
+  "cache-control": "no-cache",
+  "x-accel-buffering": "no",
+};
+const frame = ({ seq, event }: { seq: number; event: AgentSessionEvent }) =>
+  `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+const KEEPALIVE = ": keepalive\n\n";
+/**
+ * Every commit through the repository wakes the live streams. The wake is a sliding
+ * `PubSub` of capacity one: publishing never suspends, and a listener that lagged sees at
+ * most one pending tick, which is enough because it reads events from SQLite by cursor.
+ */
+const wakeAfterCommit = (repo: SessionRepo, wake: PubSub.PubSub<void>): SessionRepo => ({
+  transaction: (f) => repo.transaction(f).pipe(Effect.tap(() => PubSub.publish(wake, void 0))),
+  read: repo.read,
+});
 export class SessionObject<Env = unknown> extends DurableObject<Env> {
   /** The durable store; tests read it through `SessionKinds`. */
   readonly db = new SqlStore(this.ctx.storage);
   /** Synchronous typed view for the plain RPC reads. */
   private readonly tx: SessionTx = makeSessionTx(this.db);
-  /** Effect edge of the seam: one `transactionSync` per `transaction`. */
-  private readonly repo: SessionRepo = makeSessionRepo(this.db, this.ctx.storage);
+  /** Post-commit wake for live streams; see `wakeAfterCommit`. */
+  private readonly wake = runSync(PubSub.sliding<void>(1), "session.wake");
+  /** Effect edge of the seam: one `transactionSync` per `transaction`, then a wake. */
+  private readonly repo: SessionRepo = wakeAfterCommit(
+    makeSessionRepo(this.db, this.ctx.storage),
+    this.wake,
+  );
   /**
    * One runtime per object with exactly three services; every asynchronous entrypoint
    * runs its program here and nothing below an entrypoint calls `Effect.run*`.
@@ -181,9 +220,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     drivers: driversFrom(() => this.dependencies()),
   });
   private readonly reconciliation = Effect.unsafeMakeSemaphore(1);
-  private readonly listeners = new Map<ReadableStreamDefaultController<Uint8Array>, Listener>();
-  private keepalive: ReturnType<typeof setInterval> | undefined;
-  private flushing = false;
+  /** One permit per live stream, held by the stream's scope until it ends or is cancelled. */
+  private readonly listeners = Effect.unsafeMakeSemaphore(LISTENER_LIMIT);
+  /** Completed by `delete` and `purge`: every live stream ends, as the listeners did before. */
+  private readonly closed = Deferred.unsafeMake<void>(FiberId.none);
   protected dependencies(): SessionDependencies {
     throw new Error("SessionObject must be configured through createAgentService");
   }
@@ -191,9 +231,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   private run<A, E>(program: Effect.Effect<A, E, SessionServices>): Promise<A> {
     return this.runtime.runPromiseExit(program).then(settle);
   }
-  /** Push newly durable events to live streams; runs once an entrypoint's writes commit. */
-  private readonly wake = Effect.sync(() => this.flush());
-  private readonly close = Effect.sync(() => this.closeListeners());
+  private readonly close = Deferred.done(this.closed, Exit.void);
   initialize(record: SessionRecord): AgentSession {
     const existing = this.db.get(SessionKinds.state, "session");
     if (existing) return existing.session;
@@ -207,6 +245,9 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
         session: migrated.session,
       });
     });
+    // The one synchronous wake: this entrypoint is plain, and publishing to a sliding
+    // PubSub never suspends, so `runSync` cannot leave a fiber behind.
+    runSync(PubSub.publish(this.wake, void 0), "session.wake");
     return migrated.session;
   }
   private record(): SessionRecord {
@@ -223,9 +264,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   environmentStatus(status: AgentSessionEnvironmentState["status"]): Promise<void> {
     return this.run(
-      Effect.flatMap(Repo, (repo) =>
-        repo.transaction((tx) => applyEnvironmentStatus(tx, status)),
-      ).pipe(Effect.zipRight(this.wake)),
+      Effect.flatMap(Repo, (repo) => repo.transaction((tx) => applyEnvironmentStatus(tx, status))),
     );
   }
   update(metadata: Record<string, string>): AgentSession {
@@ -335,9 +374,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
 
   submit(events: InputEvent[], key: string): Promise<typeof SubmitResult.Encoded> {
-    return this.run(
-      encodeRpc(SubmitResult, submitProgram(events, key).pipe(Effect.zipLeft(this.wake))),
-    );
+    return this.run(encodeRpc(SubmitResult, submitProgram(events, key)));
   }
   private active(): boolean {
     return !!this.db.get(SessionKinds.state, "session")?.execution;
@@ -348,20 +385,24 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   /**
    * The platform clears a fired alarm. While a turn is active, re-arm before the permit
    * check so a busy reconciler cannot consume the only wake-up; the tick then runs under
-   * the object's single permit and re-arms again once it settles.
+   * the object's single permit and re-arms once it settles, for one interval after this
+   * alarm fired, or at once when the tick (a long poll, a slow start) outlasted it.
    */
   private alarmProgram() {
     return Effect.gen(this, function* () {
       const alarm = yield* Alarm;
       const drivers = yield* Drivers;
-      const arm = Effect.suspend(() =>
-        this.active() ? alarm.arm(drivers.pollIntervalMs).pipe(Effect.orDie) : Effect.void,
+      const started = yield* Clock.currentTimeMillis;
+      const arm = (inMs: number) =>
+        Effect.suspend(() => (this.active() ? alarm.arm(inMs).pipe(Effect.orDie) : Effect.void));
+      const rearm = Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => arm(Math.max(0, started + drivers.pollIntervalMs - now))),
       );
       const tick = reconcileTick().pipe(
         Effect.catchAllCause((cause) => Effect.logError("Session reconciliation failed", cause)),
-        Effect.ensuring(this.wake.pipe(Effect.zipRight(arm))),
+        Effect.ensuring(rearm),
       );
-      yield* arm;
+      yield* arm(drivers.pollIntervalMs);
       yield* this.reconciliation.withPermitsIfAvailable(1)(tick);
     }).pipe(Effect.asVoid);
   }
@@ -382,92 +423,82 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       }),
     );
   }
+  /**
+   * Server-sent events from `after` (default: the current tail) as a `Stream` run by the
+   * object's runtime. The ReadableStream owns the fiber: back-pressure is its 64 KiB
+   * queue, and cancelling it (the client went away) interrupts the fiber, which releases
+   * the listener permit and the wake subscription through their scope.
+   */
   stream(after?: number, options: { initial?: boolean } = {}): Response {
     this.record();
-    if (this.listeners.size >= 64)
+    // The cap is checked here, synchronously, and the permit is held by the stream's scope.
+    // RPC serializes calls to this object, so the stream's fiber (which starts on the next
+    // task) takes the permit the probe saw. The probe takes and releases without suspending.
+    const free = runSync(this.listeners.withPermitsIfAvailable(1)(Effect.void), "session.stream");
+    if (Option.isNone(free))
       throw new ApiError(429, "stream_limit", "Too many live streams for this session");
-    const cursor = after ?? this.db.lastEvent();
-    let controller: ReadableStreamDefaultController<Uint8Array>;
-    const stream = new ReadableStream<Uint8Array>(
-      {
-        start: (value) => {
-          controller = value;
-          this.listeners.set(value, { cursor, initial: options.initial ?? false });
-          this.watch();
-          this.flush();
-        },
-        pull: () => this.flush(),
-        cancel: () => this.detach(controller),
-      },
-      { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength },
+    // The stream's fiber starts on the object's runtime; obtaining it is synchronous once
+    // the layers are built, and they hold no resources.
+    const runtime = this.runtime.runSync(this.runtime.runtimeEffect);
+    const body = Stream.toReadableStreamRuntime(
+      this.events(after ?? this.db.lastEvent(), !!options.initial),
+      runtime,
+      { strategy: { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength } },
     );
-    return new Response(stream, {
-      headers: {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        "x-accel-buffering": "no",
-      },
-    });
+    return new Response(body, { headers: SSE_HEADERS });
   }
-  /** Keepalive comments keep idle proxies from closing a stream while a turn is quiet. */
-  private watch(): void {
-    if (this.keepalive || !this.listeners.size) return;
-    const encoded = new TextEncoder().encode(": keepalive\n\n");
-    this.keepalive = setInterval(() => {
-      for (const listener of this.listeners.keys())
-        if ((listener.desiredSize ?? 0) > 0) listener.enqueue(encoded);
-    }, this.dependencies().keepaliveMs ?? 15_000);
-  }
-  private detach(controller: ReadableStreamDefaultController<Uint8Array>): void {
-    this.listeners.delete(controller);
-    if (this.listeners.size || !this.keepalive) return;
-    clearInterval(this.keepalive);
-    this.keepalive = undefined;
-  }
-  private closeListener(controller: ReadableStreamDefaultController<Uint8Array>): void {
-    try {
-      controller.close();
-    } catch {
-      // The consumer already went away; nothing is left to close.
-    }
-    this.detach(controller);
-  }
-  private closeListeners(): void {
-    for (const listener of this.listeners.keys()) this.closeListener(listener);
+  /**
+   * One listener: pages of events read from SQLite by cursor, pulled on demand and woken
+   * by commits, merged with a keepalive comment while the turn is quiet. A creation
+   * stream ends when the initial turn settles, or right after `created` without input.
+   */
+  private events(
+    cursor: number,
+    initial: boolean,
+  ): Stream.Stream<Uint8Array, SessionTxError | StorageFailure, Drivers> {
+    return Stream.unwrapScoped(
+      Effect.gen(this, function* () {
+        yield* Effect.acquireRelease(this.listeners.take(1), () => this.listeners.release(1));
+        const drivers = yield* Drivers;
+        // Subscribed before the first read: a commit between a read and the wait is not missed.
+        const ticks = yield* PubSub.subscribe(this.wake);
+        const page = (after: number) =>
+          Effect.gen(this, function* () {
+            let rows = yield* this.repo.read((tx) => tx.store.events(after, EVENT_PAGE));
+            while (rows.length === 0) {
+              yield* Queue.take(ticks);
+              rows = yield* this.repo.read((tx) => tx.store.events(after, EVENT_PAGE));
+            }
+            return [rows, Option.some(rows.at(-1)?.seq ?? after)] as const;
+          });
+        const events = Stream.paginateEffect(cursor, page).pipe(
+          Stream.flattenIterables,
+          Stream.takeUntilEffect(({ event }) =>
+            initial ? this.initialSettled(event) : Effect.succeed(false),
+          ),
+          Stream.map(frame),
+        );
+        const keepalive = Stream.fromSchedule(
+          Schedule.spaced(Duration.millis(drivers.keepaliveMs)),
+        ).pipe(Stream.as(KEEPALIVE));
+        return Stream.merge(events, keepalive, { haltStrategy: "left" }).pipe(
+          Stream.interruptWhen(Deferred.await(this.closed)),
+          // One event per chunk, so the queue's byte budget is checked before each one.
+          Stream.rechunk(1),
+          Stream.encodeText,
+        );
+      }),
+    );
   }
   /** A creation stream covers the initial turn only, or nothing when no input was given. */
-  private initialSettled(event: AgentSessionEvent): boolean {
-    if (event.type === "agent.session.idle" || event.type === "agent.session.failed") return true;
-    if (event.type !== "agent.session.created") return false;
-    return (
-      !this.active() &&
-      this.db.list(SessionKinds.turn, { order: "asc", limit: 1 }).data.length === 0
+  private initialSettled(event: AgentSessionEvent) {
+    if (event.type === "agent.session.idle" || event.type === "agent.session.failed")
+      return Effect.succeed(true);
+    if (event.type !== "agent.session.created") return Effect.succeed(false);
+    return this.repo.read(
+      (tx) =>
+        !tx.store.get(SessionKinds.state, "session")?.execution &&
+        tx.store.list(SessionKinds.turn, { order: "asc", limit: 1 }).data.length === 0,
     );
-  }
-  private flush(): void {
-    // enqueue() can call pull() synchronously; a nested flush must not re-read events.
-    if (this.flushing) return;
-    this.flushing = true;
-    try {
-      for (const [listener, state] of this.listeners) {
-        if ((listener.desiredSize ?? 0) <= 0) continue;
-        const entries = this.db.events(state.cursor, 64);
-        for (const { seq, event } of entries) {
-          if ((listener.desiredSize ?? 0) <= 0) break;
-          state.cursor = seq;
-          listener.enqueue(
-            new TextEncoder().encode(
-              `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
-            ),
-          );
-          if (state.initial && this.initialSettled(event)) {
-            this.closeListener(listener);
-            break;
-          }
-        }
-      }
-    } finally {
-      this.flushing = false;
-    }
   }
 }

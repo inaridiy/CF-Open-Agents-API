@@ -3,23 +3,28 @@ import { Effect } from "effect";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { HostedSkill } from "openai/resources/beta/agents/agents";
-import { z } from "zod";
 
 import { sessionTools } from "./agent-tools.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource, ReservationResult, ReserveResult } from "./catalog.js";
 import { attempt, io, runPromise } from "./effect.js";
 import {
-  environmentFileSchema,
   hostedConfigurationSchema,
   publicHostedConfiguration,
   type TemplateConfiguration,
-  templateSchema,
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
-import { environmentFilePageSchema, mergeEnvironment } from "./environments.js";
+import { mergeEnvironment } from "./environments.js";
 import { decodeRpc, projectApiError, toApiError } from "./errors.js";
-import { INPUT_FILE_LIMIT, type ResolvedInputFile, uploadInputFile } from "./files.js";
+import { INPUT_FILE_LIMIT, type ResolvedInputFile } from "./files.js";
+import { registerAgentRoutes } from "./http/agents.js";
+import { registerCapabilityRoutes } from "./http/capabilities.js";
+import type { RouteEnv, WorkerAccess } from "./http/context.js";
+import { registerEnvironmentRoutes } from "./http/environments.js";
+import { registerFileRoutes } from "./http/files.js";
+import { registerSessionRoutes } from "./http/sessions.js";
+import { registerSkillRoutes } from "./http/skills.js";
+import { registerVaultRoutes } from "./http/vaults.js";
 import type {
   Agent,
   AgentConfig,
@@ -36,31 +41,22 @@ import {
   ApiError,
   agentConfigSchema,
   assertImageLimit,
-  COMPATIBILITY,
   canonicalJSON,
   createSessionSchema,
   eventsSchema,
   forkSessionSchema,
   identifier,
   inputMessages,
-  metadataSchema,
   pageSchema,
   parse,
   remoteImageURLs,
   reservedDelegationName,
-  savedAgentSchema,
   sessionPageSchema,
 } from "./protocol.js";
-import type { AgentRegistration, RuntimeDriver, ServiceOptions } from "./runtime.js";
+import type { ServiceOptions } from "./runtime.js";
 import type { SessionRecord } from "./session.js";
 import { ForkSourceResult, SessionObject, SubmitResult } from "./session.js";
-import { type ResolvedSkill, readSkillUpload, SKILL_UPLOAD_LIMIT } from "./skills.js";
-import {
-  credentialSchema,
-  rotateCredentialSchema,
-  vaultPageSchema,
-  vaultSchema,
-} from "./vaults.js";
+import { type ResolvedSkill, SKILL_UPLOAD_LIMIT } from "./skills.js";
 
 export interface AgentBindings {
   SESSIONS: DurableObjectNamespace<SessionObject>;
@@ -101,21 +97,6 @@ export interface AgentServiceClasses<Env> {
   AgentWorker: new (ctx: ExecutionContext, env: Env) => WorkerEntrypoint<Env> & AgentRPC;
   SessionDO: new (ctx: DurableObjectState, env: Env) => SessionObject<Env>;
 }
-/** The per-request view route handlers use; it keeps private helpers off the RPC surface. */
-interface WorkerAccess<Env> extends AgentRPC {
-  env: Env;
-  catalog(tenant: string): DurableObjectStub<CatalogObject>;
-  session(tenant: string, id: string): Promise<DurableObjectStub<SessionObject>>;
-  validateModel(
-    model: string,
-    agent: {
-      tools?: readonly { type: string; defer_loading?: boolean; enabled?: boolean }[] | null;
-      multi_agent?: { enabled: boolean } | null;
-    },
-    sandbox: boolean,
-  ): { registration: AgentRegistration; driver: RuntimeDriver };
-}
-type RouteEnv<Env> = { Bindings: WorkerAccess<Env>; Variables: { tenant: string } };
 
 /** One composition root configures both the API and the authoritative SessionDO. */
 export function createAgentService<Env extends AgentBindings>(
@@ -127,7 +108,7 @@ export function createAgentService<Env extends AgentBindings>(
         drivers: options.harnesses(this.env),
         agents: options.agents,
         maxTurnMs: options.maxTurnMs ?? 15 * 60_000,
-        pollIntervalMs: options.pollIntervalMs ?? 1_000,
+        pollIntervalMs: options.pollIntervalMs ?? 5_000,
       };
     }
   }
@@ -145,7 +126,7 @@ export function createAgentService<Env extends AgentBindings>(
       return runPromise(
         Effect.gen(this, function* () {
           if (!(yield* io("api.session", () => this.catalog(tenant).owns(id))))
-            return yield* Effect.fail(new ApiError(404, "not_found", "Session not found"));
+            return yield* new ApiError(404, "not_found", "Session not found");
           return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
         }),
       );
@@ -737,7 +718,7 @@ export function createAgentService<Env extends AgentBindings>(
               io("api.retrieveSession", () => this.retrieveSession(tenant, id)).pipe(
                 Effect.catchIf(
                   (error) => error._tag !== "OperationError" && toApiError(error).status === 404,
-                  () => Effect.succeed(undefined),
+                  () => Effect.void,
                 ),
               ),
             { concurrency: 8 },
@@ -878,498 +859,13 @@ export function createAgentService<Env extends AgentBindings>(
         response.headers.set("x-should-retry", "false");
       return response;
     });
-    app.get("/cf/v1/capabilities", (c) =>
-      Response.json({
-        ...COMPATIBILITY,
-        agents: options.agents,
-        harnesses: Object.fromEntries(
-          Object.values(options.harnesses(c.env.env)).map((driver) => [
-            driver.name,
-            { revision: driver.revision, ...driver.capabilities },
-          ]),
-        ),
-        extensions: ["event_replay"],
-        hosted_environment_provider: "cloudflare",
-      }),
-    );
-    const objects = (worker: WorkerAccess<Env>) => {
-      const bucket = options.objects?.(worker.env);
-      if (!bucket)
-        throw new ApiError(503, "storage_unavailable", "Object storage is not configured");
-      return bucket;
-    };
-    const uploadSkill = async (
-      worker: WorkerAccess<Env>,
-      request: Request,
-      tenant: string,
-      skillId?: string,
-    ) => {
-      const catalog = worker.catalog(tenant);
-      const bucket = objects(worker);
-      let form: FormData;
-      try {
-        form = await request.formData();
-      } catch {
-        throw new ApiError(400, "invalid_skill", "Provide multipart skill files or a ZIP archive");
-      }
-      const { bundle, makeDefault, ...metadata } = await readSkillUpload(form);
-      const hash = Array.from(
-        new Uint8Array(await crypto.subtle.digest("SHA-256", bundle)),
-        (byte) => byte.toString(16).padStart(2, "0"),
-      ).join("");
-      const operation = {
-        hash,
-        skillId,
-        makeDefault,
-        operationId: request.headers.get("Idempotency-Key") ?? identifier("key"),
-      };
-      const { key, resource } = await catalog.prepareSkill(operation);
-      if (resource) return resource;
-      await bucket.put(key, bundle, { httpMetadata: { contentType: "application/zip" } });
-      return catalog.addSkill({
-        ...metadata,
-        key,
-        ...operation,
-      });
-    };
-    const skillContent = async (
-      worker: WorkerAccess<Env>,
-      tenant: string,
-      id: string,
-      selector?: string,
-    ) => {
-      const version = await worker.catalog(tenant).skillVersion(id, selector);
-      const object = await objects(worker).get(version.key);
-      if (!object) throw new ApiError(404, "not_found", "Skill content not found");
-      return new Response(object.body, {
-        headers: {
-          "content-type": "application/zip",
-          "content-length": String(object.size),
-          "content-disposition": "attachment",
-        },
-      });
-    };
-    app.post("/v1/skills", async (c) =>
-      Response.json(await uploadSkill(c.env, c.req.raw, c.get("tenant"))),
-    );
-    app.get("/v1/skills", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).skills(parse(pageSchema, c.req.query()))),
-    );
-    app.get("/v1/skills/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).skill(c.req.param("id"))),
-    );
-    app.post("/v1/skills/:id", async (c) =>
-      Response.json(
-        await c.env.catalog(c.get("tenant")).updateSkill(c.req.param("id"), await jsonBody(c)),
-      ),
-    );
-    app.delete("/v1/skills/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).deleteSkill(c.req.param("id"))),
-    );
-    app.get("/v1/skills/:id/content", (c) =>
-      skillContent(c.env, c.get("tenant"), c.req.param("id")),
-    );
-    app.post("/v1/skills/:id/versions", async (c) =>
-      Response.json(await uploadSkill(c.env, c.req.raw, c.get("tenant"), c.req.param("id"))),
-    );
-    app.get("/v1/skills/:id/versions", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .skillVersions(c.req.param("id"), parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/skills/:id/versions/:version", async (c) =>
-      Response.json(
-        (
-          await c.env
-            .catalog(c.get("tenant"))
-            .skillVersion(c.req.param("id"), c.req.param("version"))
-        ).resource,
-      ),
-    );
-    app.delete("/v1/skills/:id/versions/:version", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .deleteSkillVersion(c.req.param("id"), c.req.param("version")),
-      ),
-    );
-    app.get("/v1/skills/:id/versions/:version/content", (c) =>
-      skillContent(c.env, c.get("tenant"), c.req.param("id"), c.req.param("version")),
-    );
-    app.post("/v1/files", async (c) => {
-      const record = await runPromise(uploadInputFile(objects(c.env), await c.req.formData()));
-      await c.env.catalog(c.get("tenant")).saveFile(record);
-      return Response.json(record.resource);
-    });
-    app.get("/v1/files", async (c) => {
-      const { purpose, ...page } = parse(
-        pageSchema.extend({ purpose: z.string().max(64).optional() }),
-        c.req.query(),
-      );
-      return Response.json(await c.env.catalog(c.get("tenant")).files(page, purpose));
-    });
-    app.get("/v1/files/:id", async (c) =>
-      Response.json((await c.env.catalog(c.get("tenant")).file(c.req.param("id"))).resource),
-    );
-    app.get("/v1/files/:id/content", async (c) => {
-      const record = await c.env.catalog(c.get("tenant")).file(c.req.param("id"));
-      const object = await objects(c.env).get(record.key);
-      if (!object) throw new ApiError(404, "not_found", "File content not found");
-      return new Response(object.body, {
-        headers: {
-          "content-type": "application/octet-stream",
-          "content-length": String(object.size),
-          "content-disposition": "attachment",
-        },
-      });
-    });
-    app.delete("/v1/files/:id", async (c) => {
-      const catalog = c.env.catalog(c.get("tenant"));
-      const record = await catalog.file(c.req.param("id"));
-      await objects(c.env).delete(record.key);
-      await catalog.deleteFile(record.resource.id);
-      return Response.json({ id: record.resource.id, object: "file", deleted: true });
-    });
-    app.post("/v1/agents/sessions", async (c) => {
-      const input = parse(createSessionSchema, await jsonBody(c));
-      const session = await c.env.createSession(
-        c.get("tenant"),
-        input,
-        c.req.header("Idempotency-Key"),
-      );
-      // A creation stream covers the initial turn, then ends; live streams use /events.
-      return input.stream
-        ? await (await c.env.session(c.get("tenant"), session.id)).stream(0, { initial: true })
-        : Response.json(session);
-    });
-    app.get("/v1/agents/sessions", async (c) =>
-      Response.json(
-        await c.env.listSessions(c.get("tenant"), parse(sessionPageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id", async (c) =>
-      Response.json(await c.env.retrieveSession(c.get("tenant"), c.req.param("id"))),
-    );
-    app.post("/v1/agents/sessions/:id", async (c) => {
-      const input = parse(z.strictObject({ metadata: metadataSchema }), await jsonBody(c));
-      const stub = await c.env.session(c.get("tenant"), c.req.param("id"));
-      return Response.json(
-        input.metadata === undefined
-          ? await stub.retrieve()
-          : await stub.update(input.metadata ?? {}),
-      );
-    });
-    app.delete("/v1/agents/sessions/:id", async (c) =>
-      Response.json(await c.env.deleteSession(c.get("tenant"), c.req.param("id"))),
-    );
-    app.post("/v1/agents/sessions/:id/events", async (c) => {
-      const input = parse(eventsSchema, await jsonBody(c));
-      await c.env.submitEvents(
-        c.get("tenant"),
-        c.req.param("id"),
-        input.events,
-        c.req.header("Idempotency-Key"),
-      );
-      return c.body(null, 204);
-    });
-    app.get(
-      "/v1/agents/sessions/:id/events",
-      async (c) => await (await c.env.session(c.get("tenant"), c.req.param("id"))).stream(),
-    );
-    app.post("/cf/v1/sessions/:id/fork", async (c) => {
-      // A fork needs no body; an empty or absent one means "same configuration".
-      const body = await c.req.text();
-      return Response.json(
-        await c.env.forkSession(
-          c.get("tenant"),
-          c.req.param("id"),
-          parse(forkSessionSchema, body.trim() ? JSON.parse(body) : {}),
-          c.req.header("Idempotency-Key"),
-        ),
-      );
-    });
-    app.get("/cf/v1/sessions/:id/events", async (c) => {
-      const after = parse(z.coerce.number().int().min(0), c.req.query("after") ?? "0");
-      return Response.json(
-        await (await c.env.session(c.get("tenant"), c.req.param("id"))).replay(after),
-      );
-    });
-    app.get("/v1/agents/sessions/:id/items", async (c) =>
-      Response.json(
-        await c.env.listItems(c.get("tenant"), c.req.param("id"), parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/turns", async (c) =>
-      Response.json(
-        await c.env.listTurns(c.get("tenant"), c.req.param("id"), parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/turns/:turn", async (c) =>
-      Response.json(
-        await c.env.retrieveTurn(c.get("tenant"), c.req.param("id"), c.req.param("turn")),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagents(parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents/:subagent", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagent(c.req.param("subagent")),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents/:subagent/items", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagentItems(c.req.param("subagent"), parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents/:subagent/turns", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagentTurns(c.req.param("subagent"), parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents/:subagent/turns/:turn", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagentTurn(c.req.param("subagent"), c.req.param("turn")),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/subagents/:subagent/turns/:turn/items", async (c) =>
-      Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).subagentItems(
-          c.req.param("subagent"),
-          parse(pageSchema, c.req.query()),
-          c.req.param("turn"),
-        ),
-      ),
-    );
-    app.get("/v1/agents/sessions/:id/artifacts", async (c) => {
-      const query = parse(
-        pageSchema.extend({ environment_id: z.string().nullable().optional() }),
-        c.req.query(),
-      );
-      const { environment_id, ...page } = query;
-      return Response.json(
-        await (
-          await c.env.session(c.get("tenant"), c.req.param("id"))
-        ).artifacts(page, environment_id ?? undefined),
-      );
-    });
-    app.get("/v1/agents/sessions/:id/artifacts/:artifact", async (c) => {
-      const { key: _key, ...resource } = await (
-        await c.env.session(c.get("tenant"), c.req.param("id"))
-      ).artifact(c.req.param("artifact"));
-      return Response.json(resource);
-    });
-    app.get("/v1/agents/sessions/:id/artifacts/:artifact/content", async (c) => {
-      const artifact = await (
-        await c.env.session(c.get("tenant"), c.req.param("id"))
-      ).artifact(c.req.param("artifact"));
-      const object = await options.objects?.(c.env.env).get(artifact.key);
-      if (!object) throw new ApiError(404, "not_found", "Artifact content not found");
-      return new Response(object.body, {
-        headers: {
-          "content-type": "application/octet-stream",
-          "content-length": String(object.size),
-          "content-disposition": "attachment",
-          etag: object.httpEtag,
-        },
-      });
-    });
-    app.delete("/v1/agents/sessions/:id/artifacts/:artifact", async (c) => {
-      const stub = await c.env.session(c.get("tenant"), c.req.param("id"));
-      const artifact = await stub.artifact(c.req.param("artifact"));
-      await options.objects?.(c.env.env).delete(artifact.key);
-      await stub.deleteArtifact(artifact.id);
-      return Response.json({
-        id: artifact.id,
-        object: "agent.session.artifact.deleted",
-        deleted: true,
-      });
-    });
-    app.post("/v1/agents", async (c) => {
-      const input = parse(savedAgentSchema, await jsonBody(c));
-      c.env.validateModel(input.model, input, false);
-      return Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .saveAgent(agentResource(input), c.req.header("Idempotency-Key") ?? identifier("key")),
-      );
-    });
-    app.get("/v1/agents", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).agents(parse(pageSchema, c.req.query()))),
-    );
-    app.get("/v1/agents/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).agent(c.req.param("id"))),
-    );
-    app.post("/v1/agents/:id", async (c) => {
-      const input = parse(savedAgentSchema.partial(), await jsonBody(c));
-      const catalog = c.env.catalog(c.get("tenant"));
-      const previous = await catalog.agent(c.req.param("id"));
-      c.env.validateModel(
-        input.model ?? previous.model,
-        {
-          tools: input.tools === undefined ? previous.tools : input.tools,
-          multi_agent:
-            input.multi_agent === undefined
-              ? { enabled: previous.multi_agent.enabled }
-              : input.multi_agent,
-        },
-        false,
-      );
-      return Response.json(await catalog.updateAgent(c.req.param("id"), input));
-    });
-    app.delete("/v1/agents/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).deleteAgent(c.req.param("id"))),
-    );
-    app.post("/v1/agents/environments/templates", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .createTemplate(parse(templateSchema, await jsonBody(c))),
-      ),
-    );
-    app.get("/v1/agents/environments/templates", async (c) =>
-      Response.json(
-        await c.env.catalog(c.get("tenant")).templates(parse(pageSchema, c.req.query())),
-      ),
-    );
-    app.get("/v1/agents/environments/templates/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).template(c.req.param("id"))),
-    );
-    app.post("/v1/agents/environments/templates/:id", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .updateTemplate(c.req.param("id"), parse(templateSchema, await jsonBody(c))),
-      ),
-    );
-    app.delete("/v1/agents/environments/templates/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).deleteTemplate(c.req.param("id"))),
-    );
-    app.get("/v1/agents/environments/:id", async (c) => {
-      const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
-      const stub = await c.env.session(c.get("tenant"), spec.sessionId);
-      const session = await stub.retrieve();
-      if (session.environment.type !== "openai_hosted")
-        throw new ApiError(404, "not_found", "Environment not found");
-      const { files, plugins, skills } = session.environment;
-      const status = await runPromise(
-        options.environments?.(c.env.env).status(spec) ?? Effect.succeed("failed"),
-      );
-      // A sandbox that went away, or came back after a restore, is reflected as a session event.
-      if (status === "disconnected" || status === "connected") await stub.environmentStatus(status);
-      return Response.json({
-        id: spec.id,
-        object: "agent.environment",
-        type: "openai_hosted",
-        files,
-        plugins,
-        skills,
-        status,
-      });
-    });
-    app.post("/v1/agents/environments/:id/files", async (c) => {
-      const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
-      await c.env.session(c.get("tenant"), spec.sessionId);
-      const driver = options.environments?.(c.env.env);
-      if (!driver)
-        throw new ApiError(503, "environment_unavailable", "Environment driver is unavailable");
-      const input = parse(environmentFileSchema, await jsonBody(c));
-      if (input.type === "file_id") {
-        const file = await c.env.catalog(c.get("tenant")).file(input.file_id);
-        spec.inputFiles = {
-          ...spec.inputFiles,
-          [input.file_id]: { key: file.key, size: file.resource.bytes },
-        };
-      }
-      return Response.json(await runPromise(driver.upload(spec, input)));
-    });
-    app.get("/v1/agents/environments/:id/files", async (c) => {
-      const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
-      await c.env.session(c.get("tenant"), spec.sessionId);
-      const driver = options.environments?.(c.env.env);
-      if (!driver)
-        throw new ApiError(503, "environment_unavailable", "Environment driver is unavailable");
-      return Response.json(
-        await runPromise(driver.files(spec, parse(environmentFilePageSchema, c.req.query()))),
-      );
-    });
-    app.post("/v1/vaults", async (c) =>
-      Response.json(
-        await c.env.catalog(c.get("tenant")).createVault(parse(vaultSchema, await jsonBody(c))),
-      ),
-    );
-    const vaultQuery = (url: string) => {
-      const query = new URL(url).searchParams;
-      const statuses = query.getAll("status[]");
-      const input = Object.fromEntries(query);
-      delete input["status[]"];
-      return parse(vaultPageSchema, {
-        ...input,
-        ...(statuses.length ? { status: statuses } : {}),
-      });
-    };
-    app.get("/v1/vaults", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).vaults(vaultQuery(c.req.url))),
-    );
-    app.get("/v1/vaults/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).vault(c.req.param("id"))),
-    );
-    app.delete("/v1/vaults/:id", async (c) =>
-      Response.json(await c.env.catalog(c.get("tenant")).deleteVault(c.req.param("id"))),
-    );
-    app.post("/v1/vaults/:id/credentials", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .createCredential(c.req.param("id"), parse(credentialSchema, await jsonBody(c))),
-      ),
-    );
-    app.get("/v1/vaults/:id/credentials", async (c) =>
-      Response.json(
-        await c.env.catalog(c.get("tenant")).credentials(c.req.param("id"), vaultQuery(c.req.url)),
-      ),
-    );
-    app.get("/v1/vaults/:id/credentials/:credential", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .credential(c.req.param("id"), c.req.param("credential")),
-      ),
-    );
-    app.post("/v1/vaults/:id/credentials/:credential", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .rotateCredential(
-            c.req.param("id"),
-            c.req.param("credential"),
-            parse(rotateCredentialSchema, await jsonBody(c)),
-          ),
-      ),
-    );
-    app.delete("/v1/vaults/:id/credentials/:credential", async (c) =>
-      Response.json(
-        await c.env
-          .catalog(c.get("tenant"))
-          .deleteCredential(c.req.param("id"), c.req.param("credential")),
-      ),
-    );
+    registerCapabilityRoutes(app, options);
+    registerSkillRoutes(app, options);
+    registerFileRoutes(app, options);
+    registerSessionRoutes(app, options);
+    registerAgentRoutes(app);
+    registerEnvironmentRoutes(app, options);
+    registerVaultRoutes(app);
     app.notFound(() =>
       Response.json(
         {
@@ -1404,15 +900,6 @@ const PERMANENT_CONFLICTS = new Set([
 function assertInputImages(input: CreateSession["input"]): void {
   if (Array.isArray(input))
     assertImageLimit(remoteImageURLs(input.flatMap((message) => message.content)));
-}
-/**
- * The official SDK sends no body when every parameter of an update or create call is
- * omitted; an absent or empty body means "no changes", not malformed JSON.
- */
-async function jsonBody(c: { req: { raw: Request; text(): Promise<string> } }): Promise<unknown> {
-  if (!c.req.raw.body) return {};
-  const text = await c.req.text();
-  return text.trim() ? JSON.parse(text) : {};
 }
 
 /** OpenAI's error envelope categorizes by status; the SDK selects error classes by status too. */

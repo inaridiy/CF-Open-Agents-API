@@ -29,15 +29,56 @@ export interface TestEnv extends AgentBindings {
 
 /** Protocol fixture only. Never exported by the production package or example. */
 export class ScriptedHarness extends DurableObject {
+  /** Long-poll waiters of the `long-poll` script, woken by `push`. */
+  private readonly waiters = new Set<() => void>();
   async start(execution: Execution): Promise<void> {
     if (await this.ctx.storage.get("execution")) return;
     await this.ctx.storage.put({ execution, status: "running", starts: 1, commands: [] });
   }
-  async poll(): Promise<Response> {
+  /** `long-poll` script: append an event, or `null` to complete; wake every waiting poll. */
+  async push(event: RuntimeEvent | null): Promise<void> {
+    if (event === null) await this.ctx.storage.put("done", true);
+    else
+      await this.ctx.storage.put("pushed", [
+        ...((await this.ctx.storage.get<RuntimeEvent[]>("pushed")) ?? []),
+        event,
+      ]);
+    for (const wake of this.waiters) wake();
+    this.waiters.clear();
+  }
+  /**
+   * The supervisor's contract: answer at once with news after the cursor or a terminal
+   * outcome, otherwise hold the answer up to `waitMs` for the next push.
+   */
+  private async longPoll(after: number, waitMs: number): Promise<Response> {
+    const state = async () => ({
+      pushed: (await this.ctx.storage.get<RuntimeEvent[]>("pushed")) ?? [],
+      done: (await this.ctx.storage.get<boolean>("done")) ?? false,
+    });
+    let { pushed, done } = await state();
+    if (pushed.length <= after && !done && waitMs > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        this.waiters.add(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      ({ pushed, done } = await state());
+    }
+    const events = pushed.slice(after).map((event, i) => ({ seq: after + i + 1, event }));
+    return Response.json({
+      status: done ? "completed" : "running",
+      cursor: after + events.length,
+      events,
+    });
+  }
+  async poll(after = 0, waitMs = 0): Promise<Response> {
     const execution = await this.ctx.storage.get<Execution>("execution");
     if (!execution) return Response.json({ status: "missing", events: [], cursor: 0 });
     const part = execution.input[0]?.content[0];
     const text = part?.type === "input_text" ? part.text : undefined;
+    if (text === "long-poll") return this.longPoll(after, waitMs);
     const status = await this.ctx.storage.get<string>("status");
     if (text === "hold" || status === "cancelled")
       return Response.json({
@@ -184,16 +225,18 @@ export class ScriptedHarness extends DurableObject {
     await this.ctx.storage.put("checkpointed", true);
   }
 }
-function fixture(env: TestEnv, name = "fixture"): RuntimeDriver {
+function fixture(env: TestEnv, name = "fixture", longPoll = false): RuntimeDriver {
   const stub = (execution: Execution) => env.SCRIPTED.getByName(execution.turnId);
   return fromPromiseDriver({
     name,
     revision: "test-v1",
     capabilities: { steer: true, functions: true, sandbox: false },
+    ...(longPoll ? { longPoll } : {}),
     start: async (execution) => {
       await stub(execution).start(execution);
     },
-    poll: async (execution) => (await stub(execution).poll()).json<RuntimeBatch>(),
+    poll: async (execution, after, _signal, options) =>
+      (await stub(execution).poll(after, options.waitMs)).json<RuntimeBatch>(),
     control: async (execution, id, command) => {
       await stub(execution).control(id, command);
     },
@@ -239,6 +282,8 @@ const service = createAgentService<TestEnv>({
     "test-search": { harness: "fixture-search", model: "fixture-model", webSearch: true },
     "test-search-unflagged": { harness: "fixture-search", model: "fixture-model" },
     "test-hosted": { harness: "fixture-hosted", model: "fixture-model" },
+    // A runtime whose poll waits for news, like the Container supervisor.
+    "test-longpoll": { harness: "fixture-longpoll", model: "fixture-model" },
     // Cross-runtime delegation is deployment configuration, not a runtime capability.
     "test-lead": { harness: "fixture", model: "fixture-model", delegates: ["test-tools"] },
     "test-misconfigured": { harness: "fixture", model: "fixture-model", delegates: ["absent"] },
@@ -266,6 +311,7 @@ const service = createAgentService<TestEnv>({
       ...fixture(env, "fixture-hosted"),
       capabilities: { ...fixture(env).capabilities, sandbox: true },
     },
+    "fixture-longpoll": fixture(env, "fixture-longpoll", true),
   }),
   authenticate: async (request) =>
     request.headers.get("authorization")?.replace("Bearer ", "") ?? null,
