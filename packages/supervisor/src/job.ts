@@ -636,34 +636,8 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       return this.executeCode(args);
     if (DELEGATION_TOOLS.has(name) && this.delegations.enabled)
       return this.perform(this.delegations.call(name, args));
-    if (name === "cf_tool_search") {
-      const { query } = z.object({ query: z.string().min(1).max(1000) }).parse(args);
-      const terms = query.toLowerCase().split(/\s+/);
-      const tools = (this.execution.agent.tools ?? [])
-        .filter(
-          (tool) =>
-            tool.type === "function" &&
-            tool.defer_loading &&
-            terms.some((term) => `${tool.name} ${tool.description}`.toLowerCase().includes(term)),
-        )
-        .slice(0, 20);
-      for (const tool of tools) if (tool.type === "function") this.discovered.add(tool.name);
-      return { content: [{ type: "text" as const, text: JSON.stringify(tools) }], isError: false };
-    }
-    if (name === "cf_call_tool") {
-      const input = z.object({ name: z.string(), arguments: z.json() }).parse(args);
-      const tool = this.execution.agent.tools?.find(
-        (candidate) => candidate.type === "function" && candidate.name === input.name,
-      );
-      if (tool?.type !== "function" || !this.discovered.has(tool.name))
-        throw new DeferredToolNotDiscovered({ name: input.name });
-      return this.externalTool(
-        tool.name,
-        z.fromJSONSchema(tool.parameters).parse(input.arguments),
-        undefined,
-        scope,
-      );
-    }
+    if (name === "cf_tool_search") return this.searchTools(args);
+    if (name === "cf_call_tool") return this.callDiscovered(args, scope);
     if (Object.hasOwn(workspaceTools, name)) {
       const result = await this.runWorkspace(name as WorkspaceToolName, args, scope);
       return {
@@ -675,6 +649,40 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       return CallToolResultSchema.parse(
         await this.perform(this.remoteTools.call(name, args, scope)),
       );
+    return this.callFunction(name, args, scope);
+  }
+  /** `cf_tool_search`: deferred functions matching any term become callable through `cf_call_tool`. */
+  private searchTools(args: unknown): ToolResult {
+    const { query } = z.object({ query: z.string().min(1).max(1000) }).parse(args);
+    const terms = query.toLowerCase().split(/\s+/);
+    const tools = (this.execution.agent.tools ?? [])
+      .filter(
+        (tool) =>
+          tool.type === "function" &&
+          tool.defer_loading &&
+          terms.some((term) => `${tool.name} ${tool.description}`.toLowerCase().includes(term)),
+      )
+      .slice(0, 20);
+    for (const tool of tools) if (tool.type === "function") this.discovered.add(tool.name);
+    return { content: [{ type: "text" as const, text: JSON.stringify(tools) }], isError: false };
+  }
+  /** `cf_call_tool`: a deferred function the model discovered in this turn. */
+  private callDiscovered(args: unknown, scope?: ToolScope): Promise<ToolResult> {
+    const input = z.object({ name: z.string(), arguments: z.json() }).parse(args);
+    const tool = this.execution.agent.tools?.find(
+      (candidate) => candidate.type === "function" && candidate.name === input.name,
+    );
+    if (tool?.type !== "function" || !this.discovered.has(tool.name))
+      throw new DeferredToolNotDiscovered({ name: input.name });
+    return this.externalTool(
+      tool.name,
+      z.fromJSONSchema(tool.parameters).parse(input.arguments),
+      undefined,
+      scope,
+    );
+  }
+  /** `function_N`: the eagerly loaded client function at that index of the agent's tools. */
+  private callFunction(name: string, args: unknown, scope?: ToolScope): Promise<ToolResult> {
     const index = /^function_(\d+)$/.exec(name)?.[1];
     const tool = index === undefined ? undefined : this.execution.agent.tools?.[Number(index)];
     if (tool?.type !== "function" || tool.defer_loading) throw new UnknownFunctionTool({ name });

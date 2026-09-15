@@ -66,6 +66,17 @@ interface RunningTool {
   readonly input: string;
 }
 
+/** The public code for a provider HTTP status OpenCode gave up on; no status means the connection failed. */
+function statusCode(status: number | undefined): TurnErrorCode {
+  if (status === undefined) return "connection_failed";
+  if (status === 429) return "rate_limit_exceeded";
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 404) return "resource_not_found";
+  if (status === 408) return "request_timeout";
+  if (status === 503 || status === 529) return "server_overloaded";
+  if (status >= 500) return "server_error";
+  return status >= 400 ? "invalid_request" : "server_error";
+}
 /** Maps a native OpenCode failure to the public turn error code; detail stays in diagnostics. */
 export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>): {
   code: TurnErrorCode;
@@ -94,25 +105,7 @@ export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>)
       // OpenCode retries retryable statuses (429, 5xx, connection failures) up to five
       // times, honoring retry-after headers, before this error reaches the message.
       const status = typeof data.statusCode === "number" ? data.statusCode : undefined;
-      const code: TurnErrorCode =
-        status === undefined
-          ? "connection_failed"
-          : status === 429
-            ? "rate_limit_exceeded"
-            : status === 401 || status === 403
-              ? "authentication_error"
-              : status === 404
-                ? "resource_not_found"
-                : status === 408
-                  ? "request_timeout"
-                  : status === 503 || status === 529
-                    ? "server_overloaded"
-                    : status >= 500
-                      ? "server_error"
-                      : status >= 400
-                        ? "invalid_request"
-                        : "server_error";
-      return { code, detail: `${status ?? "network"}: ${message}` };
+      return { code: statusCode(status), detail: `${status ?? "network"}: ${message}` };
     }
     default:
       return { code: "internal_error", detail: message };
@@ -483,6 +476,96 @@ export class OpenCodeJob extends ToolJob {
           // A step that ends with tool calls makes its text commentary; a final step answers.
           if (part.type === "step-finish") flushText(part.messageID, phaseOf(part.reason));
         };
+        const onAssistantMessage = (info: AssistantMessage) => {
+          const scope = scopeOf(info.sessionID);
+          if (info.sessionID === this.sessionId) {
+            this.answered.add(info.parentID);
+            if (record(info)) publishUsage(usage.values());
+          } else if (scope) {
+            const list = childUsage.get(info.sessionID) ?? new Map<string, AssistantMessage>();
+            list.set(info.id, info);
+            childUsage.set(info.sessionID, list);
+            publishUsage(list.values(), scope);
+          }
+          if (
+            (info.sessionID === this.sessionId || scope) &&
+            info.finish &&
+            pendingText.has(info.id)
+          )
+            flushText(info.id, phaseOf(info.finish));
+        };
+        const onTextDelta = (sessionID: string, partID: string, delta: string) => {
+          const scope = scopeOf(sessionID);
+          if (sessionID !== this.sessionId && !scope) return;
+          if (parts.get(partID) === "reasoning")
+            this.emit({
+              type: "reasoning_delta",
+              id: partID,
+              summaryIndex: 0,
+              text: delta,
+              ...scope,
+            });
+          else this.emit({ type: "delta", id: partID, text: delta, ...scope });
+        };
+        const onSessionUpdated = (info: Session) => {
+          openChild(info);
+          if (info.id !== this.sessionId) return;
+          const token = info.metadata?.cf_sync;
+          const barrier = typeof token === "string" ? this.barriers.get(token) : undefined;
+          if (barrier) Deferred.unsafeDone(barrier, Effect.void);
+        };
+        const onEvent = (event: Event) => {
+          if (process.env.CF_OPENCODE_TRACE)
+            this.options.diagnostics(`opencode-event ${trace(event)}`);
+          switch (event.type) {
+            case "session.created":
+              openChild(event.properties.info);
+              return;
+            case "session.updated":
+              onSessionUpdated(event.properties.info);
+              return;
+            case "message.updated":
+              if (event.properties.info.role === "assistant")
+                onAssistantMessage(event.properties.info);
+              return;
+            case "message.part.updated":
+              collectPart(event.properties.part);
+              return;
+            case "message.part.delta":
+              if (event.properties.field === "text")
+                onTextDelta(
+                  event.properties.sessionID,
+                  event.properties.partID,
+                  event.properties.delta,
+                );
+              return;
+            case "session.status": {
+              if (event.properties.status.type !== "retry") return;
+              const { attempt, message, next } = event.properties.status;
+              this.options.diagnostics(
+                `opencode retry session=${event.properties.sessionID} attempt=${attempt} next_in_ms=${Math.max(0, next - Date.now())}: ${message}`,
+              );
+              return;
+            }
+            case "session.idle": {
+              const child = this.children.get(event.properties.sessionID);
+              if (child) closeChild(child, "completed");
+              if (event.properties.sessionID === this.sessionId) this.idle.notify();
+              return;
+            }
+            case "session.error": {
+              const child = this.children.get(event.properties.sessionID ?? "");
+              if (child) closeChild(child, "failed");
+              if (event.properties.error)
+                this.options.diagnostics(
+                  `opencode session.error session=${event.properties.sessionID ?? "none"}: ${event.properties.error.name}`,
+                );
+              return;
+            }
+            default:
+              return;
+          }
+        };
         let streamError: unknown;
         const subscribed = yield* Deferred.make<void>();
         // Subscribing and reading share one `io`, so the fiber's signal ends the SSE
@@ -490,76 +573,7 @@ export class OpenCodeJob extends ToolJob {
         const consume = async (signal: AbortSignal) => {
           const events = await client.event.subscribe({}, { signal });
           Deferred.unsafeDone(subscribed, Effect.void);
-          for await (const event of events.stream as AsyncIterable<Event>) {
-            if (process.env.CF_OPENCODE_TRACE)
-              this.options.diagnostics(`opencode-event ${trace(event)}`);
-            if (event.type === "session.created" || event.type === "session.updated")
-              openChild(event.properties.info);
-            if (event.type === "session.updated" && event.properties.info.id === this.sessionId) {
-              const token = event.properties.info.metadata?.cf_sync;
-              const barrier = typeof token === "string" ? this.barriers.get(token) : undefined;
-              if (barrier) Deferred.unsafeDone(barrier, Effect.void);
-            }
-            if (event.type === "message.updated" && event.properties.info.role === "assistant") {
-              const info = event.properties.info;
-              const scope = scopeOf(info.sessionID);
-              if (info.sessionID === this.sessionId) {
-                this.answered.add(info.parentID);
-                if (record(info)) publishUsage(usage.values());
-              } else if (scope) {
-                const list = childUsage.get(info.sessionID) ?? new Map<string, AssistantMessage>();
-                list.set(info.id, info);
-                childUsage.set(info.sessionID, list);
-                publishUsage(list.values(), scope);
-              }
-              if (
-                (info.sessionID === this.sessionId || scope) &&
-                info.finish &&
-                pendingText.has(info.id)
-              )
-                flushText(info.id, phaseOf(info.finish));
-            }
-            if (event.type === "message.part.updated") collectPart(event.properties.part);
-            if (event.type === "message.part.delta" && event.properties.field === "text") {
-              const scope = scopeOf(event.properties.sessionID);
-              if (event.properties.sessionID === this.sessionId || scope)
-                this.emit(
-                  parts.get(event.properties.partID) === "reasoning"
-                    ? {
-                        type: "reasoning_delta",
-                        id: event.properties.partID,
-                        summaryIndex: 0,
-                        text: event.properties.delta,
-                        ...scope,
-                      }
-                    : {
-                        type: "delta",
-                        id: event.properties.partID,
-                        text: event.properties.delta,
-                        ...scope,
-                      },
-                );
-            }
-            if (event.type === "session.status" && event.properties.status.type === "retry") {
-              const { attempt, message, next } = event.properties.status;
-              this.options.diagnostics(
-                `opencode retry session=${event.properties.sessionID} attempt=${attempt} next_in_ms=${Math.max(0, next - Date.now())}: ${message}`,
-              );
-            }
-            if (event.type === "session.idle") {
-              const child = this.children.get(event.properties.sessionID);
-              if (child) closeChild(child, "completed");
-              if (event.properties.sessionID === this.sessionId) this.idle.notify();
-            }
-            if (event.type === "session.error") {
-              const child = this.children.get(event.properties.sessionID ?? "");
-              if (child) closeChild(child, "failed");
-              if (event.properties.error)
-                this.options.diagnostics(
-                  `opencode session.error session=${event.properties.sessionID ?? "none"}: ${event.properties.error.name}`,
-                );
-            }
-          }
+          for await (const event of events.stream as AsyncIterable<Event>) onEvent(event);
         };
         yield* io("opencode.events", consume).pipe(
           Effect.catchAll((error) =>
