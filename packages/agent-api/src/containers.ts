@@ -1261,8 +1261,13 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
     start: async (execution, operationId) => {
       await stub(execution).startExecution(execution, operationId);
     },
-    poll: async (execution, after) =>
-      decode(batchSchema, await (await stub(execution).pollExecution(execution, after)).json()),
+    // The supervisor holds an empty answer for `waitMs`; see `HarnessContainer.pollExecution`.
+    longPoll: true,
+    poll: async (execution, after, _signal, options) =>
+      decode(
+        batchSchema,
+        await (await stub(execution).pollExecution(execution, after, options.waitMs)).json(),
+      ),
     control: async (execution, operationId, command) => {
       await stub(execution).controlExecution(execution, operationId, command);
     },

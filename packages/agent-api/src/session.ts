@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  Clock,
   type Context,
   Deferred,
   Duration,
@@ -384,20 +385,24 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   /**
    * The platform clears a fired alarm. While a turn is active, re-arm before the permit
    * check so a busy reconciler cannot consume the only wake-up; the tick then runs under
-   * the object's single permit and re-arms again once it settles.
+   * the object's single permit and re-arms once it settles, for one interval after this
+   * alarm fired, or at once when the tick (a long poll, a slow start) outlasted it.
    */
   private alarmProgram() {
     return Effect.gen(this, function* () {
       const alarm = yield* Alarm;
       const drivers = yield* Drivers;
-      const arm = Effect.suspend(() =>
-        this.active() ? alarm.arm(drivers.pollIntervalMs).pipe(Effect.orDie) : Effect.void,
+      const started = yield* Clock.currentTimeMillis;
+      const arm = (inMs: number) =>
+        Effect.suspend(() => (this.active() ? alarm.arm(inMs).pipe(Effect.orDie) : Effect.void));
+      const rearm = Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => arm(Math.max(0, started + drivers.pollIntervalMs - now))),
       );
       const tick = reconcileTick().pipe(
         Effect.catchAllCause((cause) => Effect.logError("Session reconciliation failed", cause)),
-        Effect.ensuring(arm),
+        Effect.ensuring(rearm),
       );
-      yield* arm;
+      yield* arm(drivers.pollIntervalMs);
       yield* this.reconciliation.withPermitsIfAvailable(1)(tick);
     }).pipe(Effect.asVoid);
   }

@@ -29,9 +29,28 @@ interface Tick {
   readonly config: TurnConfig;
   readonly driver: RuntimeDriver;
   readonly execution: Execution;
+  /** When this alarm's budget ends: the time it fired plus the poll interval. */
+  readonly budgetEnd: number;
 }
 /** Bound on how many command-and-poll rounds one alarm runs; the next alarm continues. */
 const ROUNDS_PER_TICK = 16;
+/** A long-polling driver is bounded by the tick's time budget; this only guards a tight loop. */
+const LONG_POLL_ROUNDS_PER_TICK = 1_000;
+/** A poll returns this much before the tick's budget ends, so the next alarm finds the permit free. */
+const LONG_POLL_MARGIN_MS = 500;
+/** What the supervisor accepts for one wait; a poll never blocks the alarm longer. */
+const LONG_POLL_MAX_MS = 25_000;
+/**
+ * How long the next poll may wait: the rest of this tick's budget, bounded by the turn's
+ * deadline, less the margin. Zero for a driver that cannot wait, and zero while the
+ * session waits on the client for a tool result, when nothing can arrive from the runtime
+ * and the next input arms the alarm itself.
+ */
+const pollWait = (tick: Tick, record: ActiveSession, now: number): number => {
+  if (!tick.driver.longPoll || record.session.status === "requires_action") return 0;
+  const remaining = Math.min(tick.budgetEnd, tick.execution.deadline) - now - LONG_POLL_MARGIN_MS;
+  return Math.max(0, Math.min(remaining, LONG_POLL_MAX_MS));
+};
 
 const fenced = <A>(tick: Tick, f: (record: ActiveSession, tx: SessionTx) => Sync<A>) =>
   tick.repo.transaction((tx) => f(tx.fenced(tick.execution), tx));
@@ -144,8 +163,9 @@ const round = Effect.fn("session.round")(function* (tick: Tick) {
       break;
     }
   }
-  const cursor = yield* tick.repo.read((tx) => tx.fenced(tick.execution).cursor);
-  const batch = yield* tick.driver.poll(tick.execution, cursor);
+  const before = yield* tick.repo.read((tx) => tx.fenced(tick.execution));
+  const waitMs = pollWait(tick, before, yield* Clock.currentTimeMillis);
+  const batch = yield* tick.driver.poll(tick.execution, before.cursor, { waitMs });
   // A protocol violation rolls the whole batch back and fails the turn with its code.
   const phase = yield* fenced(tick, (record, tx) => acceptBatch(tx, record, batch, cancel));
   if (phase === "checkpointing") {
@@ -164,7 +184,15 @@ const round = Effect.fn("session.round")(function* (tick: Tick) {
     yield* finish(tick, "cancelled");
     return "done" as const;
   }
-  return phase === "commands" && !retryDelivery ? ("again" as const) : ("done" as const);
+  if (phase === "commands" && !retryDelivery) return "again" as const;
+  // A long poll that answered early with news: keep polling while this tick has budget.
+  const advanced = batch.events.some((entry) => entry.seq > before.cursor);
+  if (waitMs > 0 && advanced && batch.status === "running") {
+    const now = yield* Clock.currentTimeMillis;
+    if (now < Math.min(tick.budgetEnd, tick.execution.deadline) - LONG_POLL_MARGIN_MS)
+      return "again" as const;
+  }
+  return "done" as const;
 });
 
 const reconcileTurn = Effect.fn("session.turn")(function* (tick: Tick, initial: ActiveSession) {
@@ -186,7 +214,10 @@ const reconcileTurn = Effect.fn("session.turn")(function* (tick: Tick, initial: 
     yield* fenced(tick, (record, tx) => markRunning(tx, record));
   }
   yield* round(tick).pipe(
-    Effect.repeat({ while: (outcome) => outcome === "again", times: ROUNDS_PER_TICK }),
+    Effect.repeat({
+      while: (outcome) => outcome === "again",
+      times: tick.driver.longPoll ? LONG_POLL_ROUNDS_PER_TICK : ROUNDS_PER_TICK,
+    }),
   );
 });
 
@@ -203,6 +234,7 @@ export const reconcileTick = Effect.fn("session.reconcile")(
     const initial = yield* repo.read((tx) => tx.session());
     if (!initial?.execution || initial.deleted) return;
     const execution = initial.execution;
+    const started = yield* Clock.currentTimeMillis;
     yield* alarm.arm(drivers.pollIntervalMs);
     const config: TurnConfig = { maxTurnMs: drivers.maxTurnMs, agents: drivers.agents };
     const driver = Option.getOrUndefined(drivers.get(initial.driver));
@@ -214,7 +246,13 @@ export const reconcileTick = Effect.fn("session.reconcile")(
       );
       return;
     }
-    const tick: Tick = { repo, config, driver, execution };
+    const tick: Tick = {
+      repo,
+      config,
+      driver,
+      execution,
+      budgetEnd: started + drivers.pollIntervalMs,
+    };
     yield* reconcileTurn(tick, initial).pipe(
       Effect.catchTags({
         RuntimeRejected: (error) => stopAndFail(tick, error.code),
