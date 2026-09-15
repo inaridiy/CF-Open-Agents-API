@@ -1,7 +1,8 @@
 import type { FilePart, ModelMessage, ToolResultPart, UserContent } from "ai";
 import { z } from "zod";
 
-import { ApiError, canonicalJSON } from "../protocol.js";
+import { ModelInputUnsupported } from "../errors.js";
+import { canonicalJSON } from "../protocol.js";
 
 export interface ModelInput {
   protocol: "responses" | "anthropic" | "chat-completions";
@@ -36,12 +37,7 @@ const effortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh"
 
 const object = z.record(z.string(), z.unknown());
 const list = z.array(object);
-const unsupported = () =>
-  new ApiError(
-    400,
-    "unsupported_model_input",
-    "Unsupported translated model input; use a native model preset for provider-specific content",
-  );
+const unsupported = () => new ModelInputUnsupported();
 const string = (value: unknown) => z.string().parse(value);
 function text(content: unknown): string {
   if (typeof content === "string") return content;

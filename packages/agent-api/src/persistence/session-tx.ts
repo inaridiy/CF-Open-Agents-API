@@ -27,7 +27,7 @@ export interface SessionTx {
   save(record: SessionRecord): void;
   emit(event: AgentSessionEvent): void;
   turn(id: string): Turn | undefined;
-  /** Throws the 404 `ApiError` the public turn endpoints answer with. */
+  /** Throws `RecordNotFound` for a turn this session never recorded. */
   requireTurn(id: string): Turn;
   putTurn(turn: Turn): void;
   /** Queued deliveries in acceptance order, at most `limit`. */

@@ -30,10 +30,13 @@ it("publishes immutable skills and grants reads only through the deployment allo
   };
   expect(await reader.call({ name: "typescript" }, context)).toBe("Use strict types.");
   await expect(reader.call({ name: "other" }, context)).rejects.toMatchObject({
-    code: "skill_missing",
+    _tag: "SkillMissing",
+    name: "AgentApiError:404:skill_missing",
   });
   await env.ASSETS.put(reference.key, JSON.stringify({ ...input, description: "tampered" }));
-  await expect(loadSkill(env.ASSETS, reference)).rejects.toMatchObject({ code: "skill_integrity" });
+  await expect(loadSkill(env.ASSETS, reference)).rejects.toMatchObject({
+    _tag: "SkillIntegrityMismatch",
+  });
 });
 it("rejects traversal before publishing any skill files", async () => {
   await expect(
@@ -42,6 +45,6 @@ it("rejects traversal before publishing any skill files", async () => {
       description: "bad paths",
       files: { "SKILL.md": "...", "../escape": "bad" },
     }),
-  ).rejects.toMatchObject({ code: "invalid_skill_path" });
+  ).rejects.toMatchObject({ _tag: "SkillPathInvalid", path: "../escape" });
   expect((await env.ASSETS.list()).objects).toHaveLength(0);
 });

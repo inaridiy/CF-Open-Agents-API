@@ -1,7 +1,14 @@
 import { Effect, JSONSchema, Schema } from "effect";
 
 import { decode, decodeEffect, io, runPromise, type ServiceError } from "./effect.js";
-import { ApiError } from "./protocol.js";
+import {
+  SkillFileMissing,
+  SkillIntegrityMismatch,
+  SkillManifestMissing,
+  SkillMissing,
+  SkillPathInvalid,
+  SkillTooLarge,
+} from "./errors.js";
 
 export interface ToolContext {
   tenantId: string;
@@ -115,11 +122,10 @@ function serializeSkill(input: unknown) {
       path.includes("\0") ||
       path.split("/").some((part) => !part || part === "." || part === "..")
     ) {
-      throw new ApiError(400, "invalid_skill_path", `Invalid skill path: ${path}`);
+      throw new SkillPathInvalid({ path });
     }
   }
-  if (!("SKILL.md" in manifest.files))
-    throw new ApiError(400, "missing_skill", "A bundle must contain SKILL.md");
+  if (!("SKILL.md" in manifest.files)) throw new SkillManifestMissing();
   const data = JSON.stringify({
     ...manifest,
     files: Object.fromEntries(
@@ -127,7 +133,7 @@ function serializeSkill(input: unknown) {
     ),
   });
   if (new TextEncoder().encode(data).length > 4_000_000)
-    throw new ApiError(413, "skill_too_large", "Skill bundles are limited to 4 MB");
+    throw new SkillTooLarge({ limit: "bundle" });
   return { manifest, data };
 }
 
@@ -140,14 +146,14 @@ async function digest(data: string): Promise<string> {
 
 export async function loadSkill(bucket: R2Bucket, reference: SkillReference) {
   const object = await bucket.get(reference.key);
-  if (!object) throw new ApiError(404, "skill_missing", "Skill bundle not found");
-  if (object.size > 4_000_000) throw new ApiError(413, "skill_too_large", "Invalid skill size");
+  if (!object) throw new SkillMissing({ reason: "bundle" });
+  if (object.size > 4_000_000) throw new SkillTooLarge({ limit: "stored" });
   const { manifest, data } = serializeSkill(await object.json());
   if (
     (await digest(data)) !== reference.sha256 ||
     reference.key !== `skills/${manifest.name}/${reference.sha256}.json`
   )
-    throw new ApiError(409, "skill_integrity", "Skill content does not match its reference");
+    throw new SkillIntegrityMismatch();
   return manifest;
 }
 
@@ -166,10 +172,9 @@ export function skillReader(bucket: R2Bucket, allowed: Record<string, SkillRefer
     execute: ({ name, path }) =>
       Effect.gen(function* () {
         const reference = Object.hasOwn(allowed, name) ? allowed[name] : undefined;
-        if (!reference) return yield* new ApiError(404, "skill_missing", "Skill is not installed");
+        if (!reference) return yield* new SkillMissing({ reason: "not_installed" });
         const manifest = yield* io("skill.load", () => loadSkill(bucket, reference));
-        if (!Object.hasOwn(manifest.files, path))
-          return yield* new ApiError(404, "skill_file_missing", "Skill file not found");
+        if (!Object.hasOwn(manifest.files, path)) return yield* new SkillFileMissing({ path });
         return manifest.files[path] as string;
       }),
   });

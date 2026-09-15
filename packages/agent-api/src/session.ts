@@ -18,7 +18,15 @@ import type { AgentSessionEnvironmentState, Subagent } from "openai/resources/be
 
 import { attempt, runSync, settle } from "./effect.js";
 import type { EnvironmentSpec } from "./environments.js";
-import { encodeRpc, rpcEnvelope, type StorageFailure } from "./errors.js";
+import {
+  encodeRpc,
+  ExecutorVersionIncompatible,
+  rpcEnvelope,
+  type StorageFailure,
+  StreamLimitExceeded,
+  SubagentTurnMismatch,
+  TurnActive,
+} from "./errors.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import { type ArtifactRecord, migrate, type SessionRecord } from "./persistence/session-record.js";
 import {
@@ -36,7 +44,7 @@ import type {
   PageQuery,
   Turn,
 } from "./protocol.js";
-import { ApiError, identifier } from "./protocol.js";
+import { identifier } from "./protocol.js";
 import type { Checkpoint, RuntimeDriver } from "./runtime.js";
 import { reconcileTick } from "./session-reconcile.js";
 import {
@@ -157,11 +165,7 @@ function requireDriver(
 ): RuntimeDriver {
   const driver = Option.getOrUndefined(drivers.get(record.driver));
   if (!driver || driver.revision !== record.revision)
-    throw new ApiError(
-      503,
-      "executor_version_incompatible",
-      "Session requires its original harness revision",
-    );
+    throw new ExecutorVersionIncompatible({ harness: record.driver, revision: record.revision });
   return driver;
 }
 /** Persist the wakeup first; the synchronous input transaction then cannot be orphaned. */
@@ -312,7 +316,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   subagentTurn(id: string, turnId: string): Turn {
     this.subagent(id);
     const turn = this.turn(turnId);
-    if (turn.subagent_id !== id) throw new ApiError(404, "not_found", "Subagent turn not found");
+    if (turn.subagent_id !== id) throw new SubagentTurnMismatch({ subagentId: id, turnId });
     return turn;
   }
   artifacts(query: PageQuery, environmentId?: string) {
@@ -349,8 +353,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   private source(): ForkSource {
     const record = this.record();
-    if (record.execution)
-      throw new ApiError(409, "active_turn", "Wait for the current turn to stop before forking");
+    if (record.execution) throw new TurnActive({ action: "fork" });
     // Pages are folded into the bounded transcript as they are read, never held together.
     const transcript = new TranscriptBuilder();
     let after: string | undefined;
@@ -435,8 +438,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     // RPC serializes calls to this object, so the stream's fiber (which starts on the next
     // task) takes the permit the probe saw. The probe takes and releases without suspending.
     const free = runSync(this.listeners.withPermitsIfAvailable(1)(Effect.void), "session.stream");
-    if (Option.isNone(free))
-      throw new ApiError(429, "stream_limit", "Too many live streams for this session");
+    if (Option.isNone(free)) throw new StreamLimitExceeded({ limit: LISTENER_LIMIT });
     // The stream's fiber starts on the object's runtime; obtaining it is synchronous once
     // the layers are built, and they hold no resources.
     const runtime = this.runtime.runSync(this.runtime.runtimeEffect);

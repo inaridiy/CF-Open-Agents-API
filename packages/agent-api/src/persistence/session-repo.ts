@@ -1,17 +1,23 @@
 import {
+  CapabilityUnsupported,
   CheckpointIncompatible,
+  ExecutorVersionIncompatible,
   IdempotencyConflict,
+  ImageLimitExceeded,
   InvalidCursor,
   InvalidRuntimeEvent,
   InvalidSessionState,
+  RecordNotFound,
   RecordTooLarge,
   SessionFailed,
+  SessionNotDeleted,
   SessionNotFound,
+  SteeringUnsupported,
   Superseded,
+  TurnActive,
   TurnCheckpointing,
   UnknownToolCall,
 } from "../errors.js";
-import { ApiError } from "../protocol.js";
 import type { RecordStore, Transactional } from "./record-store.js";
 import { makeRepo, type Repo } from "./repo.js";
 import { makeSessionTx, type SessionTx } from "./session-tx.js";
@@ -19,26 +25,14 @@ import { makeSessionTx, type SessionTx } from "./session-tx.js";
 export type { Sync } from "./repo.js";
 
 /**
- * Everything a session transaction may throw on purpose. `ApiError` is the HTTP
- * projection input validation raises inside `submit`; it stays a typed failure until the
- * RPC envelope. Anything else thrown inside the seam is a `StorageFailure`: an unknown
+ * Everything a session transaction may throw on purpose: the persistence failures of
+ * the store and the state machine's own rules. Each stays a typed failure until the RPC
+ * envelope. Anything else thrown inside the seam is a `StorageFailure`: an unknown
  * outcome, never a definite answer.
  */
-export type SessionTxError =
-  | RecordTooLarge
-  | InvalidCursor
-  | SessionNotFound
-  | InvalidSessionState
-  | Superseded
-  | IdempotencyConflict
-  | SessionFailed
-  | TurnCheckpointing
-  | UnknownToolCall
-  | InvalidRuntimeEvent
-  | CheckpointIncompatible
-  | ApiError;
 const TX_ERRORS = [
   RecordTooLarge,
+  RecordNotFound,
   InvalidCursor,
   SessionNotFound,
   InvalidSessionState,
@@ -46,11 +40,17 @@ const TX_ERRORS = [
   IdempotencyConflict,
   SessionFailed,
   TurnCheckpointing,
+  TurnActive,
+  SessionNotDeleted,
+  SteeringUnsupported,
   UnknownToolCall,
+  ExecutorVersionIncompatible,
+  CapabilityUnsupported,
+  ImageLimitExceeded,
   InvalidRuntimeEvent,
   CheckpointIncompatible,
-  ApiError,
 ] as const;
+export type SessionTxError = InstanceType<(typeof TX_ERRORS)[number]>;
 export const isSessionTxError = (value: unknown): value is SessionTxError =>
   TX_ERRORS.some((cls) => value instanceof cls);
 

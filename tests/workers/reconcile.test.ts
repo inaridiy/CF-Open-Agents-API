@@ -8,12 +8,12 @@ import { SessionKinds } from "../../packages/agent-api/src/persistence/session-k
 import type { SessionRecord } from "../../packages/agent-api/src/persistence/session-record.js";
 import { makeSessionRepo } from "../../packages/agent-api/src/persistence/session-repo.js";
 import { makeSessionTx } from "../../packages/agent-api/src/persistence/session-tx.js";
-import type { AgentSession } from "../../packages/agent-api/src/protocol.js";
+import { type AgentSession, ApiError } from "../../packages/agent-api/src/protocol.js";
 import type { PromiseRuntimeDriver, RuntimeBatch } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import { reconcileTick } from "../../packages/agent-api/src/session-reconcile.js";
 import { Alarm, Drivers, Repo } from "../../packages/agent-api/src/session-services.js";
-import { addInput, begin } from "../../packages/agent-api/src/session-state.js";
+import { addInput, begin, enqueue } from "../../packages/agent-api/src/session-state.js";
 
 /**
  * Reconciler policy without a Durable Object: the three services are substituted, the
@@ -216,4 +216,69 @@ it("an unregistered executor fails the turn without a driver to stop", async () 
     error: "executor_unavailable",
     turns: ["failed"],
   });
+});
+
+/** A steer queued for the active turn, exactly as `submit` leaves it. */
+function queueSteer(store: MemoryStore) {
+  const tx = makeSessionTx(store);
+  const input = [
+    { role: "user" as const, content: [{ type: "input_text" as const, text: "more" }] },
+  ];
+  store.transactionSync(() => {
+    const record = tx.fenced(
+      tx.requireSession().execution as NonNullable<SessionRecord["execution"]>,
+    );
+    enqueue(tx, record, { type: "steer", input }, addInput(tx, record, input));
+  });
+}
+const queued = (store: MemoryStore) =>
+  store.list(SessionKinds.command, { order: "asc", limit: 10 }).data.length;
+
+it.each([
+  ["CommandRejected", new ApiError(409, "command_rejected", "Turn is no longer active")],
+  ["ExecutionMissing", new ApiError(404, "execution_missing", "No such job")],
+] as const)(
+  "a definite %s drops the command: the steer becomes the next turn and the tick completes",
+  async (_tag, answer) => {
+    const { store } = starting();
+    queueSteer(store);
+    const driver = fixture({
+      control: async () => {
+        throw answer;
+      },
+    });
+    const { run } = harness(store, { fixture: driver });
+    await run(reconcileTick());
+    expect({ ...summary(store), queued: queued(store) }).toMatchObject({
+      queued: 0,
+      status: "in_progress",
+      turns: ["completed", "queued"],
+      checkpoint: "x",
+    });
+  },
+);
+
+it("a TransportFailure keeps the command for the next tick instead of dropping it", async () => {
+  const { store } = starting();
+  queueSteer(store);
+  let reachable = false;
+  const delivered: string[] = [];
+  const driver = fixture({
+    control: async (_execution, _id, command) => {
+      if (!reachable) throw new Error("connection reset");
+      delivered.push(command.type);
+    },
+    poll: async () => ({ status: "running", cursor: 0, events: [] }),
+  });
+  const { run } = harness(store, { fixture: driver });
+  await run(reconcileTick());
+  expect({ ...summary(store), queued: queued(store), delivered }).toMatchObject({
+    queued: 1,
+    delivered: [],
+    phase: "running",
+    turns: ["in_progress"],
+  });
+  reachable = true;
+  await run(reconcileTick());
+  expect({ queued: queued(store), delivered }).toEqual({ queued: 0, delivered: ["steer"] });
 });

@@ -28,7 +28,7 @@ export interface ListFilter {
  */
 export interface RecordStore {
   get<A>(kind: Kind<A>, id: string): A | undefined;
-  /** Throws a 404 `ApiError` naming the kind. */
+  /** Throws `RecordNotFound` naming the kind. */
   require<A>(kind: Kind<A>, id: string): A;
   /** Throws `RecordTooLarge` past the row budget. */
   put<A>(kind: Kind<A>, id: string, value: NoInfer<A>, seq?: number): void;

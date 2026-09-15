@@ -1,6 +1,11 @@
 import { Clock, Effect, Option } from "effect";
 
-import { type StorageFailure, toApiError, type TransportFailure } from "./errors.js";
+import {
+  type DomainError,
+  type StorageFailure,
+  toApiError,
+  type TransportFailure,
+} from "./errors.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import type { ActiveSession, Command } from "./persistence/session-record.js";
 import type { SessionRepo, Sync } from "./persistence/session-repo.js";
@@ -121,25 +126,29 @@ const deliver = Effect.fn("session.deliver")(function* (
   return delivery;
 });
 
+/** A definite failure seals the turn with the code it projects to. */
+const sealWith = (tick: Tick) => (error: DomainError) => stopAndFail(tick, toApiError(error).code);
 /** Recover the checkpoint once completion is durable, even if compute vanished. */
 const checkpoint = (tick: Tick) => {
-  const seal = (code: string) => stopAndFail(tick, code);
+  const seal = sealWith(tick);
   // A checkpoint is attempted even after the deadline: an already committed result can
   // still be recovered. Only a failure to answer is bounded by the deadline.
   const unavailable = (error: TransportFailure | StorageFailure) =>
     expired(tick.execution).pipe(
-      Effect.flatMap((late) => (late ? seal("checkpoint_unavailable") : Effect.fail(error))),
+      Effect.flatMap((late) =>
+        late ? stopAndFail(tick, "checkpoint_unavailable") : Effect.fail(error),
+      ),
     );
   return tick.driver.checkpoint(tick.execution).pipe(
     Effect.flatMap((result) =>
       fenced(tick, (record, tx) => commitCheckpoint(tx, tick.config, record, result)),
     ),
     Effect.catchTags({
-      RuntimeRejected: (error) => seal(error.code),
-      CheckpointIncompatible: (error) => seal(toApiError(error).code),
-      RecordTooLarge: (error) => seal(toApiError(error).code),
-      InvalidSessionState: (error) => seal(toApiError(error).code),
-      ApiError: (error) => seal(error.code),
+      RuntimeRejected: seal,
+      CheckpointIncompatible: seal,
+      RecordTooLarge: seal,
+      RecordNotFound: seal,
+      InvalidSessionState: seal,
       TransportFailure: unavailable,
       StorageFailure: unavailable,
     }),
@@ -253,12 +262,13 @@ export const reconcileTick = Effect.fn("session.reconcile")(
       execution,
       budgetEnd: started + drivers.pollIntervalMs,
     };
+    const seal = sealWith(tick);
     yield* reconcileTurn(tick, initial).pipe(
       Effect.catchTags({
-        RuntimeRejected: (error) => stopAndFail(tick, error.code),
-        InvalidRuntimeEvent: (error) => stopAndFail(tick, error.code),
-        RecordTooLarge: (error) => stopAndFail(tick, toApiError(error).code),
-        InvalidSessionState: (error) => stopAndFail(tick, toApiError(error).code),
+        RuntimeRejected: seal,
+        InvalidRuntimeEvent: seal,
+        RecordTooLarge: seal,
+        InvalidSessionState: seal,
       }),
     );
   },

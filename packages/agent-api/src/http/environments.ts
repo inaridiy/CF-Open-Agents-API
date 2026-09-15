@@ -3,7 +3,8 @@ import { Effect } from "effect";
 import { runPromise } from "../effect.js";
 import { environmentFileSchema, templateSchema } from "../environment-config.js";
 import { environmentFilePageSchema } from "../environments.js";
-import { ApiError, pageSchema, parse } from "../protocol.js";
+import { EnvironmentDriverUnavailable, EnvironmentNotFound } from "../errors.js";
+import { pageSchema, parse } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
 import { jsonBody, type RouteApp } from "./context.js";
 
@@ -34,7 +35,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
     const stub = await c.env.session(c.get("tenant"), spec.sessionId);
     const session = await stub.retrieve();
     if (session.environment.type !== "openai_hosted")
-      throw new ApiError(404, "not_found", "Environment not found");
+      throw new EnvironmentNotFound({ environmentId: spec.id });
     const { files, plugins, skills } = session.environment;
     const status = await runPromise(
       options.environments?.(c.env.env).status(spec) ?? Effect.succeed("failed"),
@@ -55,8 +56,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
     const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
     await c.env.session(c.get("tenant"), spec.sessionId);
     const driver = options.environments?.(c.env.env);
-    if (!driver)
-      throw new ApiError(503, "environment_unavailable", "Environment driver is unavailable");
+    if (!driver) throw new EnvironmentDriverUnavailable();
     const input = parse(environmentFileSchema, await jsonBody(c));
     if (input.type === "file_id") {
       const file = await c.env.catalog(c.get("tenant")).file(input.file_id);
@@ -71,8 +71,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
     const spec = await c.env.catalog(c.get("tenant")).environment(c.req.param("id"));
     await c.env.session(c.get("tenant"), spec.sessionId);
     const driver = options.environments?.(c.env.env);
-    if (!driver)
-      throw new ApiError(503, "environment_unavailable", "Environment driver is unavailable");
+    if (!driver) throw new EnvironmentDriverUnavailable();
     return Response.json(
       await runPromise(driver.files(spec, parse(environmentFilePageSchema, c.req.query()))),
     );

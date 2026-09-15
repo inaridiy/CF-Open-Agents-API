@@ -9,7 +9,21 @@ import { attempt, decode, decodeEffect, io, type ServiceError, settle } from "./
 import type { HostedConfiguration } from "./environment-config.js";
 import { environmentMcpScript } from "./environment-mcp.js";
 import type { EnvironmentDriver } from "./environments.js";
-import { CommandRejected, ExecutionMissing, TransportFailure } from "./errors.js";
+import {
+  ArtifactLimitExceeded,
+  ArtifactListFailed,
+  AssignmentConflict,
+  CheckpointHarnessMismatch,
+  CheckpointIncompatible,
+  CheckpointMissing,
+  CommandRejected,
+  ExecutionMissing,
+  HarnessUnknown,
+  ImageLimitExceeded,
+  NetworkPolicyConflict,
+  Superseded,
+  TransportFailure,
+} from "./errors.js";
 import { copyKnownLength } from "./files.js";
 import { HARNESSES, type HarnessName } from "./harnesses.js";
 import { proxyMcp } from "./mcp.js";
@@ -27,7 +41,6 @@ import type { Sync } from "./persistence/repo.js";
 import { discoverCapabilities } from "./portable-capabilities.js";
 import { programmaticInputSchema } from "./programmatic-contract.js";
 import { runProgrammatic } from "./programmatic.js";
-import { ApiError } from "./protocol.js";
 import type { Checkpoint, Execution, RuntimeCommand, RuntimeDriver } from "./runtime.js";
 import { batchSchema, commandSchema, fromPromiseDriver } from "./runtime.js";
 import { executeWorkspaceTool } from "./sandbox-tools.js";
@@ -81,11 +94,7 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
     const access = network?.access ?? "enabled";
     const enabled = access === "enabled";
     if (this.ctx.container?.running && this.enableInternet !== enabled)
-      throw new ApiError(
-        409,
-        "network_policy_conflict",
-        "Network access must be configured before the environment starts",
-      );
+      throw new NetworkPolicyConflict();
     await this.ctx.storage.put("environment_internet", enabled);
     this.enableInternet = enabled;
     await this.setAllowedHosts(
@@ -132,11 +141,7 @@ const imageDigests = (urls: readonly string[], existing: readonly string[]) =>
     const digests = yield* io("assignment.images", () => Promise.all(urls.map(sha256Hex)));
     const merged = [...new Set([...existing, ...digests])];
     if (merged.length > IMAGE_DIGEST_LIMIT)
-      return yield* new ApiError(
-        413,
-        "image_limit",
-        `A turn may reference at most ${IMAGE_DIGEST_LIMIT} remote images`,
-      );
+      return yield* new ImageLimitExceeded({ limit: IMAGE_DIGEST_LIMIT, scope: "turn" });
     return merged;
   });
 /** Code may call client functions, workspace tools and tools of configured MCP servers only. */
@@ -163,18 +168,13 @@ const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Ex
     const listing = yield* io("artifact.list", () =>
       sandbox.listFiles("/workspace/outputs", { recursive: true, includeHidden: true }),
     );
-    if (!listing.success)
-      return yield* new ApiError(503, "artifact_list_failed", "Artifact listing failed");
+    if (!listing.success) return yield* new ArtifactListFailed();
     const files = listing.files.filter((file) => file.type === "file");
     if (
       files.some((file) => file.size > ARTIFACT_FILE_LIMIT) ||
       files.reduce((sum, file) => sum + file.size, 0) > ARTIFACT_TURN_LIMIT
     )
-      return yield* new ApiError(
-        413,
-        "artifact_limit",
-        "Artifacts exceed 200 MiB per file or 500 MiB per turn",
-      );
+      return yield* new ArtifactLimitExceeded();
     const created_at = Math.floor(Date.now() / 1000);
     manifest = yield* Effect.forEach(files, (file) =>
       Effect.map(
@@ -346,9 +346,8 @@ export class HarnessContainer<
         });
         const failed = (error: ServiceError) =>
           Effect.gen(this, function* () {
-            const cause = error._tag === "OperationError" ? error.cause : error;
-            const terminal =
-              cause instanceof ApiError && cause.code === "programmatic_execution_uncertain";
+            // A tool call ended without a confirmed result: the code may have had effects.
+            const terminal = error._tag === "ProgrammaticOutcomeUncertain";
             if (terminal) {
               // A child reports the uncertain outcome; its parent's failure destroys the shared sandbox.
               const revoked = yield* write((tx) => {
@@ -364,12 +363,7 @@ export class HarnessContainer<
                 );
             }
             return Response.json({
-              content: [
-                {
-                  type: "text",
-                  text: cause instanceof ApiError ? cause.message : "Code execution failed",
-                },
-              ],
+              content: [{ type: "text", text: programmaticFailureText(error) }],
               isError: true,
               terminal,
             });
@@ -664,18 +658,26 @@ export class HarnessContainer<
           this.env.SANDBOX.getByName(current.sessionId).fetch(request),
         );
       const input = yield* io("workspace.tool.body", () => request.json());
+      // The assignment is re-read under the workspace permit, right before the tool runs.
       const operation = (onOutput?: (text: string) => void) =>
         this.workspace.withPermits(1)(
-          io("workspace.tool", async (signal) => {
-            const latest = this.tx.requireAssignment();
-            if (latest.revoked || superseded(latest, current))
-              throw new ApiError(409, "stale_generation", "Execution was superseded");
-            signal.throwIfAborted();
-            return executeWorkspaceTool(
-              getSandbox(this.env.SANDBOX, current.sessionId),
-              input,
-              onOutput ? { onOutput, signal } : undefined,
+          Effect.gen(this, function* () {
+            const latest = yield* attempt("workspace.assignment", () =>
+              this.tx.requireAssignment(),
             );
+            if (latest.revoked || superseded(latest, current))
+              return yield* new Superseded({
+                turnId: current.turnId,
+                generation: current.generation,
+              });
+            return yield* io("workspace.tool", async (signal) => {
+              signal.throwIfAborted();
+              return executeWorkspaceTool(
+                getSandbox(this.env.SANDBOX, current.sessionId),
+                input,
+                onOutput ? { onOutput, signal } : undefined,
+              );
+            });
           }),
         );
       if (request.headers.get("accept") !== "application/x-ndjson")
@@ -748,32 +750,30 @@ export class HarnessContainer<
   private startAttempt(execution: Execution, operationId: string) {
     return Effect.gen(this, function* () {
       if (!Object.hasOwn(HARNESSES, execution.harness))
-        return yield* new ApiError(400, "unsupported_harness", "Unknown Container harness");
+        return yield* new HarnessUnknown({ harness: execution.harness });
       const harness = execution.harness as HarnessName;
       if (
         execution.checkpoint &&
         (execution.checkpoint.driver !== harness ||
           execution.checkpoint.revision !== HARNESSES[harness].revision)
       )
-        return yield* new ApiError(
-          409,
-          "checkpoint_incompatible",
-          "Checkpoint belongs to another harness version",
-        );
+        return yield* new CheckpointHarnessMismatch({
+          harness: execution.checkpoint.driver,
+          revision: execution.checkpoint.revision,
+        });
       const previous = yield* read((tx) => tx.assignment());
       if (
         previous &&
         (execution.generation < previous.generation ||
           (execution.generation === previous.generation && execution.turnId !== previous.turnId))
       )
-        return yield* new ApiError(409, "stale_generation", "Execution was superseded");
+        return yield* new Superseded({
+          turnId: execution.turnId,
+          generation: execution.generation,
+        });
       if (previous?.turnId === execution.turnId && previous.dispatched) return;
       if (previous && previous.sessionId !== execution.sessionId)
-        return yield* new ApiError(
-          409,
-          "assignment_conflict",
-          "Container already belongs to another session",
-        );
+        return yield* new AssignmentConflict({ sessionId: previous.sessionId });
       const assigned: Assignment = {
         sessionId: execution.sessionId,
         generation: execution.generation,
@@ -921,8 +921,7 @@ export class HarnessContainer<
         const object = yield* io("startAttempt", () =>
           this.env.CHECKPOINTS.get(previousCheckpoint.native),
         );
-        if (!object)
-          return yield* new ApiError(409, "checkpoint_missing", "Native checkpoint is missing");
+        if (!object) return yield* new CheckpointMissing({ key: previousCheckpoint.native });
         checkpoint = yield* io("startAttempt", () => object.json());
       }
       yield* io("startAttempt", (signal) =>
@@ -1017,7 +1016,10 @@ export class HarnessContainer<
       Effect.gen(this, function* () {
         const current = yield* assignment;
         if (superseded(current, execution))
-          return yield* new ApiError(409, "stale_generation", "Execution was superseded");
+          return yield* new Superseded({
+            turnId: execution.turnId,
+            generation: execution.generation,
+          });
         const parts = commandParts(command);
         const allowedImages = remoteImageURLs(parts);
         if (allowedImages.length) {
@@ -1062,13 +1064,14 @@ export class HarnessContainer<
     return Effect.gen(this, function* () {
       const current = yield* assignment;
       if (superseded(current, execution))
-        return yield* new ApiError(409, "stale_generation", "Execution was superseded");
+        return yield* new Superseded({
+          turnId: execution.turnId,
+          generation: execution.generation,
+        });
       if (current.parent)
-        return yield* new ApiError(
-          409,
-          "invalid_checkpoint",
-          "Delegated children are not checkpointed",
-        );
+        return yield* new CheckpointIncompatible({
+          message: "Delegated children are not checkpointed",
+        });
       const key = `sessions/${execution.sessionId}/${execution.generation}/native.json`;
       const committed = yield* read((tx) => tx.checkpoint(execution.generation));
       if (committed) return committed;
@@ -1158,6 +1161,17 @@ export class HarnessContainer<
         yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
       }
     });
+  }
+}
+/** What generated code sees of its failure: its own error text, or nothing about the platform. */
+function programmaticFailureText(error: ServiceError): string {
+  switch (error._tag) {
+    case "ProgrammaticExecutionFailed":
+    case "ProgrammaticOutcomeUncertain":
+    case "ProgrammaticInputTooLarge":
+      return error.message;
+    default:
+      return "Code execution failed";
   }
 }
 /** Image-bearing parts of a command, for the digest allow-list. */

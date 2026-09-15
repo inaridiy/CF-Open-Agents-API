@@ -1,5 +1,4 @@
-import { RecordTooLarge } from "../errors.js";
-import { ApiError } from "../protocol.js";
+import { ContainerUnassigned, RecordTooLarge } from "../errors.js";
 import type { Checkpoint } from "../runtime.js";
 import {
   type ArtifactManifest,
@@ -20,7 +19,7 @@ export interface HarnessTx {
   /** Escape hatch for kinds without a dedicated accessor. */
   readonly store: RecordStore;
   assignment(): Assignment | undefined;
-  /** Throws the 409 `ApiError` an unassigned container answers with. */
+  /** Throws `ContainerUnassigned` before any session was assigned. */
   requireAssignment(): Assignment;
   putAssignment(assignment: Assignment): void;
   sandbox(): SandboxState | undefined;
@@ -39,8 +38,7 @@ export const makeHarnessTx = (store: RecordStore): HarnessTx => ({
   assignment: () => store.get(HarnessKinds.assignment, CURRENT),
   requireAssignment: () => {
     const assignment = store.get(HarnessKinds.assignment, CURRENT);
-    if (!assignment)
-      throw new ApiError(409, "unassigned_container", "Container has no session assignment");
+    if (!assignment) throw new ContainerUnassigned();
     return assignment;
   },
   putAssignment: (assignment) => store.put(HarnessKinds.assignment, CURRENT, assignment),
@@ -58,9 +56,9 @@ export const makeHarnessTx = (store: RecordStore): HarnessTx => ({
 });
 
 /** Everything a harness transaction may throw on purpose; the rest is a `StorageFailure`. */
-export type HarnessTxError = RecordTooLarge | ApiError;
+export type HarnessTxError = RecordTooLarge | ContainerUnassigned;
 export const isHarnessTxError = (value: unknown): value is HarnessTxError =>
-  value instanceof RecordTooLarge || value instanceof ApiError;
+  value instanceof RecordTooLarge || value instanceof ContainerUnassigned;
 /** The outside edge of the seam for a HarnessDO: see `Repo`. */
 export type HarnessRepository = Repo<HarnessTx, HarnessTxError>;
 export const makeHarnessRepo = (

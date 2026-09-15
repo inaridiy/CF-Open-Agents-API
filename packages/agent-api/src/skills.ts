@@ -4,8 +4,14 @@ import type { SkillVersion } from "openai/resources/skills/versions/versions";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 
+import {
+  IdempotencyConflict,
+  SkillInvalid,
+  SkillTooLarge,
+  SkillVersionIsDefault,
+} from "./errors.js";
 import { kind } from "./persistence/kind.js";
-import { ApiError, canonicalJSON, identifier, type PageQuery, parse } from "./protocol.js";
+import { canonicalJSON, identifier, type PageQuery, parse } from "./protocol.js";
 import { readSkillZip } from "./skill-zip.js";
 import type { SqlStore } from "./storage.js";
 
@@ -47,7 +53,7 @@ const Kinds = {
   /** Version number to version id. */
   skillVersionNumber: (skillId: string) => kind<string>(`skill_version_number:${skillId}`),
 } as const;
-const invalid = (message: string) => new ApiError(400, "invalid_skill", message);
+const invalid = (reason: string) => new SkillInvalid({ reason });
 function validPath(path: string): void {
   if (
     !path ||
@@ -74,7 +80,7 @@ export async function readSkillUpload(
   if (defaultValue !== null && defaultValue !== "true" && defaultValue !== "false")
     throw invalid("default must be a boolean");
   if (uploads.reduce((sum, file) => sum + file.size, 0) > SKILL_UPLOAD_LIMIT)
-    throw new ApiError(413, "skill_too_large", "Skill upload exceeds 16 MiB");
+    throw new SkillTooLarge({ limit: "upload" });
   const entries = Object.create(null) as Record<string, Uint8Array>;
   const executable = new Set<string>();
   if (uploads.length === 1 && uploads[0]?.name.toLowerCase().endsWith(".zip")) {
@@ -112,8 +118,7 @@ export async function readSkillUpload(
     const relative = path.slice(root.length);
     validPath(relative);
     total += bytes.length;
-    if (total > expandedLimit)
-      throw new ApiError(413, "skill_too_large", "Expanded skill exceeds 32 MiB");
+    if (total > expandedLimit) throw new SkillTooLarge({ limit: "expanded" });
     normalized[relative] = bytes;
   }
   const content = normalized["SKILL.md"];
@@ -127,7 +132,7 @@ export async function readSkillUpload(
     if (document.errors.length) throw invalid("Invalid SKILL.md frontmatter");
     metadata = metadataSchema.parse(document.toJS({ maxAliasCount: 0 }));
   } catch (error) {
-    if (error instanceof ApiError) throw error;
+    if (error instanceof SkillInvalid) throw error;
     throw invalid("SKILL.md requires valid UTF-8 and string name/description fields");
   }
   // Repack as regular files: archive symlink/device attributes never reach the Sandbox.
@@ -163,11 +168,10 @@ export class SkillRepository {
     const previous = this.db.get(Kinds.skillOperation, input.operationId);
     if (previous) {
       if (previous.fingerprint !== fingerprint)
-        throw new ApiError(
-          409,
-          "idempotency_conflict",
-          "Skill upload key was reused with different input",
-        );
+        throw new IdempotencyConflict({
+          subject: "skill upload",
+          reason: "Skill upload key was reused with different input",
+        });
       return previous;
     }
     if (input.skillId) this.retrieve(input.skillId);
@@ -207,7 +211,10 @@ export class SkillRepository {
       const operation = this.prepare(input);
       if (operation.resource) return operation.resource;
       if (operation.key !== input.key)
-        throw new ApiError(409, "idempotency_conflict", "Skill upload reservation changed");
+        throw new IdempotencyConflict({
+          subject: "skill upload",
+          reason: "Skill upload reservation changed",
+        });
       const skill = input.skillId ? this.retrieve(input.skillId) : undefined;
       const skillId = skill?.id ?? identifier("skill");
       const next = (this.db.get(Kinds.skillCounter, skillId) ?? 0) + 1;
@@ -262,11 +269,7 @@ export class SkillRepository {
       const skill = this.retrieve(skillId);
       const version = this.version(skillId, selector).resource;
       if (version.version === skill.default_version)
-        throw new ApiError(
-          409,
-          "default_skill_version",
-          "Select another default version or delete the entire skill",
-        );
+        throw new SkillVersionIsDefault({ version: version.version });
       this.db.remove(Kinds.skillVersion(skillId), version.id);
       this.db.remove(Kinds.skillVersionNumber(skillId), version.version);
       const latest = this.versions(skillId, { order: "desc", limit: 1 }).data[0];

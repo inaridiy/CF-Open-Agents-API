@@ -4,16 +4,19 @@ import type { Vault } from "openai/resources/beta/agents/vaults/vaults";
 import { z } from "zod";
 
 import { attempt, io } from "./effect.js";
+import {
+  CredentialAmbiguous,
+  CredentialChanged,
+  CredentialExpired,
+  CredentialNotFound,
+  CredentialRefreshFailed,
+  CredentialRefreshIndeterminate,
+  CredentialRefreshRejected,
+  CredentialRotationInvalid,
+} from "./errors.js";
 import { requestWithoutRedirect } from "./http.js";
 import { kind } from "./persistence/kind.js";
-import {
-  ApiError,
-  canonicalJSON,
-  identifier,
-  metadataSchema,
-  pageSchema,
-  parse,
-} from "./protocol.js";
+import { canonicalJSON, identifier, metadataSchema, pageSchema, parse } from "./protocol.js";
 import type { SqlStore } from "./storage.js";
 
 const secret = z.string().min(1).max(128_000);
@@ -155,30 +158,20 @@ export class VaultRepository {
         after = page.has_more ? (page.last_id ?? undefined) : undefined;
       } while (after);
     }
-    if (matches.length > 1)
-      throw new ApiError(400, "ambiguous_credential", "Select one matching MCP credential");
-    if (!matches[0] && credentialId)
-      throw new ApiError(404, "not_found", "Matching attached credential not found");
+    if (matches.length > 1) throw new CredentialAmbiguous({ reason: "multiple_matches" });
+    if (!matches[0] && credentialId) throw new CredentialNotFound();
     return matches[0];
   }
   private usableToken(record: CredentialRecord): string | undefined {
     const auth = record.auth;
     if (auth.type === "static_bearer") return auth.token;
     if (this.db.get(Kinds.credentialRefreshRejected, record.resource.id))
-      throw new ApiError(
-        422,
-        "credential_refresh_rejected",
-        "The token endpoint rejected the OAuth refresh; rotate the credential",
-      );
+      throw new CredentialRefreshRejected();
     if (!auth.expires_at || Date.parse(auth.expires_at) > Date.now() + 30_000)
       return auth.access_token;
     if (!auth.refresh) {
       if (Date.parse(auth.expires_at) > Date.now()) return auth.access_token;
-      throw new ApiError(
-        422,
-        "credential_expired",
-        "MCP credential expired; rotate the credential",
-      );
+      throw new CredentialExpired({ reason: "expired" });
     }
     return undefined;
   }
@@ -206,22 +199,13 @@ export class VaultRepository {
     return Effect.gen(this, function* () {
       const auth = record.auth;
       if (auth.type !== "mcp_oauth" || !auth.refresh)
-        return yield* new ApiError(
-          422,
-          "credential_expired",
-          "Missing OAuth refresh configuration",
-        );
+        return yield* new CredentialExpired({ reason: "refresh_missing" });
       const id = record.resource.id;
       const fingerprint = canonicalJSON(auth);
       const operationId = identifier("refresh");
       yield* attempt("vault.refresh.reserve", () =>
         this.db.transaction(() => {
-          if (this.db.get(Kinds.credentialRefresh, id))
-            throw new ApiError(
-              409,
-              "outcome_unknown",
-              "OAuth refresh outcome is unknown; rotate the credential",
-            );
+          if (this.db.get(Kinds.credentialRefresh, id)) throw new CredentialRefreshIndeterminate();
           this.db.put(Kinds.credentialRefresh, id, { version: 1, fingerprint, operationId });
         }),
       );
@@ -281,17 +265,13 @@ export class VaultRepository {
           // A 2xx body that cannot be decoded may still have rotated the token: unknown.
           return yield* io("vault.refresh.body", () => response.json()).pipe(
             Effect.flatMap((value) => Schema.decodeUnknown(tokenSchema)(value)),
-            Effect.mapError(
-              () =>
-                new ApiError(422, "credential_refresh_failed", "Invalid OAuth refresh response"),
-            ),
+            Effect.mapError(() => new CredentialRefreshFailed({ reason: "response" })),
           );
         }),
       ).pipe(
         Effect.timeoutFail({
           duration: "30 seconds",
-          onTimeout: () =>
-            new ApiError(422, "credential_refresh_failed", "OAuth refresh timed out"),
+          onTimeout: () => new CredentialRefreshFailed({ reason: "timeout" }),
         }),
       );
       const outcome = yield* exchange.pipe(Effect.either);
@@ -305,36 +285,25 @@ export class VaultRepository {
             // The endpoint answered (or refused a redirect before any credential was sent):
             // nothing was consumed, so the reservation is released. A 4xx grant rejection is
             // final until rotation; a 5xx may be retried. No answer at all stays unknown.
-            const definite =
-              failure instanceof RefreshRejected ||
-              (failure instanceof ApiError && failure.code === "upstream_redirect");
-            if (definite) {
-              const rejected = failure instanceof RefreshRejected && failure.rejected;
-              yield* attempt("vault.refresh.release", () =>
-                this.db.transaction(() => {
-                  if (this.db.get(Kinds.credentialRefresh, id)?.operationId === operationId)
-                    this.db.remove(Kinds.credentialRefresh, id);
-                  if (rejected)
-                    this.db.put(Kinds.credentialRefreshRejected, id, {
-                      version: 1,
-                      status: failure.status,
-                      at: Math.floor(Date.now() / 1000),
-                    });
-                }),
-              );
-              return yield* new ApiError(
-                422,
-                rejected ? "credential_refresh_rejected" : "credential_refresh_failed",
-                rejected
-                  ? "The token endpoint rejected the OAuth refresh; rotate the credential"
-                  : "The token endpoint failed; retry later",
-              );
-            }
-            return yield* new ApiError(
-              422,
-              "credential_refresh_failed",
-              "OAuth refresh outcome is unknown; rotate the credential before retrying",
+            if (failure._tag !== "RefreshRejected" && failure._tag !== "UpstreamRedirect")
+              return yield* new CredentialRefreshFailed({ reason: "unknown" });
+            const rejection =
+              failure._tag === "RefreshRejected" && failure.rejected ? failure : undefined;
+            yield* attempt("vault.refresh.release", () =>
+              this.db.transaction(() => {
+                if (this.db.get(Kinds.credentialRefresh, id)?.operationId === operationId)
+                  this.db.remove(Kinds.credentialRefresh, id);
+                if (rejection)
+                  this.db.put(Kinds.credentialRefreshRejected, id, {
+                    version: 1,
+                    status: rejection.status,
+                    at: Math.floor(Date.now() / 1000),
+                  });
+              }),
             );
+            return yield* rejection
+              ? new CredentialRefreshRejected()
+              : new CredentialRefreshFailed({ reason: "endpoint" });
           }
           const result = outcome.right;
           return yield* attempt("vault.refresh.commit", () =>
@@ -344,11 +313,7 @@ export class VaultRepository {
                 canonicalJSON(current.auth) !== fingerprint ||
                 this.db.get(Kinds.credentialRefresh, id)?.operationId !== operationId
               )
-                throw new ApiError(
-                  409,
-                  "credential_changed",
-                  "Credential was rotated during refresh",
-                );
+                throw new CredentialChanged();
               const updated: Auth = {
                 ...auth,
                 access_token: result.access_token,
@@ -459,8 +424,7 @@ export class VaultRepository {
       const update = parse(rotateCredentialSchema, parameters).auth;
       const record = this.db.require(Kinds.credential(vaultId), id);
       const auth = record.auth;
-      if (auth.type !== update.type)
-        throw new ApiError(400, "invalid_request", "Credential authentication type cannot change");
+      if (auth.type !== update.type) throw new CredentialRotationInvalid({ rule: "auth_type" });
       if (auth.type === "static_bearer" && update.type === "static_bearer")
         auth.token = update.token;
       if (auth.type === "mcp_oauth" && update.type === "mcp_oauth") {
@@ -470,19 +434,14 @@ export class VaultRepository {
         }
         if (update.expires_at !== undefined) auth.expires_at = update.expires_at;
         if (update.refresh) {
-          if (!auth.refresh)
-            throw new ApiError(400, "invalid_request", "Credential has no refresh configuration");
+          if (!auth.refresh) throw new CredentialRotationInvalid({ rule: "refresh_missing" });
           if (update.refresh.refresh_token != null)
             auth.refresh.refresh_token = update.refresh.refresh_token;
           if (update.refresh.scope !== undefined) auth.refresh.scope = update.refresh.scope;
           const replacement = update.refresh.token_endpoint_auth;
           if (replacement) {
             if (auth.refresh.token_endpoint_auth.type !== replacement.type)
-              throw new ApiError(
-                400,
-                "invalid_request",
-                "OAuth authentication method cannot change",
-              );
+              throw new CredentialRotationInvalid({ rule: "auth_method" });
             if (replacement.client_secret != null)
               auth.refresh.token_endpoint_auth = {
                 type: replacement.type,

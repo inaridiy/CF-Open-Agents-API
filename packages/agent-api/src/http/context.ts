@@ -1,7 +1,14 @@
+import type { Effect } from "effect";
 import type { Hono } from "hono";
 
 import type { CatalogObject } from "../catalog.js";
-import { ApiError } from "../protocol.js";
+import {
+  type CapabilityUnsupported,
+  type DelegateUnavailable,
+  type ModelNotRegistered,
+  ObjectStorageUnavailable,
+  type ReservedToolName,
+} from "../errors.js";
 import type { AgentRegistration, RuntimeDriver, ServiceOptions } from "../runtime.js";
 import type { AgentRPC } from "../service.js";
 import type { SessionObject } from "../session.js";
@@ -18,7 +25,10 @@ export interface WorkerAccess<Env> extends AgentRPC {
       multi_agent?: { enabled: boolean } | null;
     },
     sandbox: boolean,
-  ): { registration: AgentRegistration; driver: RuntimeDriver };
+  ): Effect.Effect<
+    { registration: AgentRegistration; driver: RuntimeDriver },
+    ModelNotRegistered | CapabilityUnsupported | ReservedToolName | DelegateUnavailable
+  >;
 }
 export type RouteEnv<Env> = { Bindings: WorkerAccess<Env>; Variables: { tenant: string } };
 /** The one Hono app of a service; every route module registers on it in order. */
@@ -37,6 +47,6 @@ export async function jsonBody(c: RouteContext): Promise<unknown> {
 /** The deployment's object storage, or the 503 a route without one answers with. */
 export function objects<Env>(options: ServiceOptions<Env>, worker: WorkerAccess<Env>): R2Bucket {
   const bucket = options.objects?.(worker.env);
-  if (!bucket) throw new ApiError(503, "storage_unavailable", "Object storage is not configured");
+  if (!bucket) throw new ObjectStorageUnavailable();
   return bucket;
 }

@@ -3,7 +3,8 @@ import type { FileObject } from "openai/resources/files";
 import { z } from "zod";
 
 import { attempt, io } from "./effect.js";
-import { ApiError, identifier, parse } from "./protocol.js";
+import { FileTooLarge, InputFileInvalid } from "./errors.js";
+import { identifier, parseEffect } from "./protocol.js";
 
 export const INPUT_FILE_LIMIT = 50 * 1024 * 1024;
 /** `FilePurpose` of openai@7.15.0; every value is accepted and stored as opaque metadata. */
@@ -29,24 +30,16 @@ export interface ResolvedInputFile {
 export function uploadInputFile(bucket: R2Bucket, form: FormData) {
   return Effect.gen(function* () {
     const file = form.get("file");
-    if (!(file instanceof File))
-      return yield* new ApiError(400, "invalid_file", "Expected a multipart file");
-    const purpose = yield* attempt("file.purpose", () =>
-      parse(z.enum(FILE_PURPOSES), form.get("purpose")),
-    );
-    if (file.size > INPUT_FILE_LIMIT)
-      return yield* new ApiError(413, "file_too_large", "Environment input files exceed 50 MiB");
+    if (!(file instanceof File)) return yield* new InputFileInvalid();
+    const purpose = yield* parseEffect(z.enum(FILE_PURPOSES), form.get("purpose"));
+    if (file.size > INPUT_FILE_LIMIT) return yield* new FileTooLarge({ kind: "input" });
     const expires = form.get("expires_after[seconds]");
     const lifetime =
       expires === null
         ? undefined
-        : yield* attempt("file.expiry", () =>
-            parse(z.coerce.number().int().min(3600).max(2592000), expires),
-          );
+        : yield* parseEffect(z.coerce.number().int().min(3600).max(2592000), expires);
     if (lifetime !== undefined)
-      yield* attempt("file.anchor", () =>
-        parse(z.literal("created_at"), form.get("expires_after[anchor]")),
-      );
+      yield* parseEffect(z.literal("created_at"), form.get("expires_after[anchor]"));
     const id = identifier("file");
     const created_at = Math.floor(Date.now() / 1000);
     const record: StoredInputFile = {

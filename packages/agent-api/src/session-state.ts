@@ -4,11 +4,15 @@ import type {
 } from "openai/resources/beta/agents/agents";
 
 import {
+  CapabilityUnsupported,
   CheckpointIncompatible,
   IdempotencyConflict,
   InvalidRuntimeEvent,
   SessionFailed,
+  SessionNotDeleted,
   SessionNotFound,
+  SteeringUnsupported,
+  TurnActive,
   TurnCheckpointing,
   UnknownToolCall,
 } from "./errors.js";
@@ -23,13 +27,7 @@ import {
 } from "./persistence/session-record.js";
 import type { SessionTx } from "./persistence/session-tx.js";
 import type { InputEvent, InputMessage, Turn } from "./protocol.js";
-import {
-  ApiError,
-  assertImageLimit,
-  canonicalJSON,
-  identifier,
-  remoteImageURLs,
-} from "./protocol.js";
+import { assertImageLimit, canonicalJSON, identifier, remoteImageURLs } from "./protocol.js";
 import type {
   AgentRegistration,
   Checkpoint,
@@ -395,9 +393,6 @@ export function complete(
 
 // --- Input ----------------------------------------------------------------------------
 
-function unsupported(message: string): ApiError {
-  return new ApiError(422, "unsupported_capability", message);
-}
 function acceptMessage(
   tx: SessionTx,
   config: TurnConfig,
@@ -409,14 +404,9 @@ function acceptMessage(
     !driver.capabilities.images &&
     input.some((message) => message.content.some((part) => part.type === "input_image"))
   )
-    throw unsupported("The selected harness does not support image input");
+    throw new CapabilityUnsupported({ capability: "image_input", harness: driver.name });
   if (record.execution) {
-    if (!driver.capabilities.steer)
-      throw new ApiError(
-        409,
-        "active_turn_not_steerable",
-        "This harness cannot steer an active turn",
-      );
+    if (!driver.capabilities.steer) throw new SteeringUnsupported({ harness: driver.name });
     const itemIds = addInput(tx, record, input);
     enqueue(tx, record, { type: "steer", input }, itemIds);
     return record;
@@ -436,7 +426,7 @@ function acceptToolResult(
     Array.isArray(event.output) &&
     event.output.some((part) => part.type === "input_image")
   )
-    throw unsupported("The selected harness does not support image function results");
+    throw new CapabilityUnsupported({ capability: "image_function_results", harness: driver.name });
   const action = record.session.required_actions.find(
     (candidate) =>
       candidate.type === "function_call" &&
@@ -593,16 +583,14 @@ export function markDeleted(tx: SessionTx): Deleted {
     return { id: tombstone.id, object: "agent.session.deleted", deleted: true };
   }
   const record = migrate(stored);
-  if (record.execution)
-    throw new ApiError(409, "active_turn", "Cancel the active turn before deleting the session");
+  if (record.execution) throw new TurnActive({ action: "delete" });
   tx.save({ ...record, deleted: true });
   return { id: record.session.id, object: "agent.session.deleted", deleted: true };
 }
 /** Drop every record once the catalog no longer discovers the session. Idempotent. */
 export function purgeRecords(tx: SessionTx): boolean {
   const record = tx.store.get(SessionKinds.state, "session");
-  if (record && !record.deleted)
-    throw new ApiError(409, "not_deleted", "Delete the session before purging its storage");
+  if (record && !record.deleted) throw new SessionNotDeleted();
   const id = record?.session.id ?? tx.store.get(SessionKinds.tombstone, "tombstone")?.id;
   if (!id) return false;
   tx.store.purge();

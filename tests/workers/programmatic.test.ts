@@ -34,17 +34,17 @@ it("denies egress, unavailable tools and global state from preceding invocations
   expect(await run("globalThis.proof = 'private'; return 1;")).toBe(1);
   expect(await run("return globalThis.proof ?? null;")).toBeNull();
   await expect(run("return await fetch('https://example.com');")).rejects.toMatchObject({
-    code: "programmatic_execution_failed",
+    _tag: "ProgrammaticExecutionFailed",
   });
   await expect(run("return await tools.secret({});")).rejects.toMatchObject({
-    code: "programmatic_execution_failed",
+    _tag: "ProgrammaticExecutionFailed",
   });
   expect(await run("return typeof process === 'undefined' ? {} : process.env;")).toEqual({});
   await expect(run("return 'x'.repeat(256001);")).rejects.toMatchObject({
-    code: "programmatic_execution_failed",
+    _tag: "ProgrammaticExecutionFailed",
   });
   await expect(run("return '界'.repeat(90000);")).rejects.toMatchObject({
-    code: "programmatic_execution_failed",
+    _tag: "ProgrammaticExecutionFailed",
   });
 });
 
@@ -59,7 +59,7 @@ it("bounds calls and revokes a bridge after timeout", async () => {
         return null;
       },
     }),
-  ).rejects.toMatchObject({ code: "programmatic_execution_failed" });
+  ).rejects.toMatchObject({ _tag: "ProgrammaticExecutionFailed" });
   expect(count).toBe(64);
   let stopped = false;
   await expect(
@@ -79,7 +79,10 @@ it("bounds calls and revokes a bridge after timeout", async () => {
           );
         }),
     }),
-  ).rejects.toMatchObject({ code: "programmatic_execution_uncertain" });
+  ).rejects.toMatchObject({
+    _tag: "ProgrammaticOutcomeUncertain",
+    name: "AgentApiError:422:programmatic_execution_uncertain",
+  });
   expect(stopped).toBe(true);
 });
 
@@ -92,5 +95,5 @@ it("rejects swallowed callback failures because execution outcome is unknown", a
         throw new Error("Response lost after write");
       },
     }),
-  ).rejects.toMatchObject({ code: "programmatic_execution_uncertain" });
+  ).rejects.toMatchObject({ _tag: "ProgrammaticOutcomeUncertain" });
 });
