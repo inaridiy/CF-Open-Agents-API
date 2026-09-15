@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
+import { Effect } from "effect";
 import { expect, it } from "vitest";
 
 import {
@@ -57,7 +58,9 @@ class ProbeJob extends ToolJob {
   protected override async open() {
     this.sessionId = "native";
   }
-  protected override async closeRuntime() {}
+  protected override closeRuntime() {
+    return Effect.void;
+  }
   delegate(prompt: string) {
     return this.perform(this.delegations.call("cf_delegate", { model: "helper", prompt }));
   }

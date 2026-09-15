@@ -1,6 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { Effect } from "effect";
 import { expect, it } from "vitest";
 
 import {
@@ -50,7 +54,9 @@ class ProbeJob extends ToolJob {
   protected override async open() {
     this.sessionId = "native";
   }
-  protected override async closeRuntime() {}
+  protected override closeRuntime() {
+    return Effect.void;
+  }
   call() {
     return this.externalTool("lookup", {});
   }
@@ -72,9 +78,31 @@ class StubbornJob extends ToolJob {
     // The signal handler must be installed before the stop sequence sends SIGTERM.
     await new Promise<void>((resolve) => child.stdout?.once("data", () => resolve()));
     await this.own(child, "200 millis");
-    this.run(() => new Promise<void>(() => {}));
+    this.run(Effect.never);
   }
-  protected override async closeRuntime() {}
+  protected override closeRuntime() {
+    return Effect.void;
+  }
+}
+/** A job whose only runtime is the shared remote-tool bridge. */
+class RemoteToolJob extends ToolJob {
+  constructor(
+    spec: Execution,
+    config: NativeOptions,
+    readonly home: string,
+  ) {
+    super(spec, config);
+  }
+  protected override async open(bundle?: unknown) {
+    await this.prepare(bundle);
+    this.sessionId = "native";
+  }
+  protected override closeRuntime() {
+    return Effect.void;
+  }
+  remote(name: string) {
+    return this.perform(this.remoteTools.call(name, {}));
+  }
 }
 const read = (url: string, query: string) =>
   fetch(`${url}/jobs/${execution.turnId}?${query}`).then(async (response) =>
@@ -142,4 +170,77 @@ it("stopping a running job terminates the native process it owns and interrupts 
   expect(child.signalCode).toBe("SIGKILL");
   expect(job.status).toBe("cancelled");
   await expect(runPromise(job.start())).rejects.toThrow();
+});
+
+it("stopping a job with an unanswered MCP call closes the connection within the bound", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cf-job-scope-"));
+  let held = 0;
+  const released = Promise.withResolvers<void>();
+  // Answers the handshake and the catalog; a tool call is held open until the client goes away.
+  const mcp = await serveFetch(async (request) => {
+    if (request.method !== "POST") return new Response(null, { status: 405 });
+    const message = (await request.json()) as { id?: number; method: string };
+    if (message.id === undefined) return new Response(null, { status: 202 });
+    if (message.method === "tools/call") {
+      held++;
+      request.signal.addEventListener("abort", () => released.resolve(), { once: true });
+      await released.promise;
+      return new Response(null, { status: 499 });
+    }
+    return Response.json({
+      jsonrpc: "2.0",
+      id: message.id,
+      result:
+        message.method === "initialize"
+          ? {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "1" },
+            }
+          : { tools: [{ name: "hang", description: "hang", inputSchema: { type: "object" } }] },
+    });
+  });
+  const job = new RemoteToolJob(
+    {
+      ...execution,
+      agent: {
+        model: "fixture",
+        tools: [
+          {
+            type: "mcp",
+            server_label: "fixture",
+            transport: { type: "http", server_url: mcp.url },
+            required: true,
+          },
+        ],
+      },
+    },
+    options,
+    join(directory, "home"),
+  );
+  try {
+    await runPromise(job.start());
+    const pending = job.remote("remote_0__hang");
+    // `rejects` attaches the handler before the stop settles the call.
+    const rejection = expect(pending).rejects.toThrow();
+    for (let attempt = 0; held === 0 && attempt < 500; attempt++) await delay(10);
+    expect(held).toBe(1);
+    const began = Date.now();
+    await runPromise(job.stop());
+    // Neither the 120 s call bound nor the SDK's own request timer held the stop.
+    expect(Date.now() - began).toBeLessThan(5_000);
+    expect(job.status).toBe("cancelled");
+    await rejection;
+    // Closing the job's Scope closed the client: the server saw its held request end.
+    await Promise.race([
+      released.promise,
+      delay(3_000).then(() => {
+        throw new Error("The MCP request outlived the job");
+      }),
+    ]);
+  } finally {
+    await runPromise(job.stop());
+    await mcp.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -182,8 +182,10 @@ class WaitingJob extends ToolJob {
     await this.release.promise;
     this.sessionId = "native";
   }
-  protected async closeRuntime() {
-    this.closes++;
+  protected closeRuntime() {
+    return Effect.sync(() => {
+      this.closes++;
+    });
   }
   call() {
     return this.externalTool("lookup", {});

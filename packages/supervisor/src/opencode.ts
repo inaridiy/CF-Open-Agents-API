@@ -15,11 +15,19 @@ import type {
   Session,
   ToolPart,
 } from "@opencode-ai/sdk/v2/types";
-import { ApiError, type Execution, type InputMessage, type RuntimeEvent } from "cf-open-agents-api";
+import {
+  ApiError,
+  type Execution,
+  type InputMessage,
+  io,
+  type RuntimeEvent,
+} from "cf-open-agents-api";
+import { Data, Deferred, Effect, Option } from "effect";
 
 import { type NativeOptions, ToolJob } from "./job.js";
-import { describeFailure, type TurnErrorCode } from "./lifecycle.js";
+import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
 import { imageContent } from "./media.js";
+import { awaitReady } from "./process.js";
 
 type Client = ReturnType<typeof createOpencodeClient>;
 type PromptRequest = Parameters<Client["session"]["prompt"]>[0];
@@ -36,6 +44,15 @@ const SUBAGENT = "cf-subagent";
 const WORKSPACE_PREFIX = "workspace_";
 /** The synthetic tool OpenCode adds for json_schema output; the wildcard deny must not strip it. */
 const STRUCTURED_OUTPUT = "StructuredOutput";
+/** Time allowed for the server to report that it is listening. */
+const STARTUP_BOUND = "30 seconds";
+/** Time allowed for the event feed to echo a barrier before the turn goes on without it. */
+const BARRIER_BOUND = "10 seconds";
+
+/** The native turn cannot continue; the message names the OpenCode condition. */
+class OpenCodeTurnFailed extends Data.TaggedError("OpenCodeTurnFailed")<{
+  readonly message: string;
+}> {}
 
 interface ChildState {
   readonly sessionId: string;
@@ -114,17 +131,20 @@ export class OpenCodeJob extends ToolJob {
   /** Steered user messages stored in the session, keyed by their OpenCode message ID. */
   private readonly steered = new Map<string, PromptParts>();
   /** Serializes steer admission against the turn's settlement check. */
-  private gate: Promise<unknown> = Promise.resolve();
+  private readonly gate = Effect.unsafeMakeSemaphore(1);
   private settling = false;
   /** User messages of this session that an assistant message answers, per the event feed. */
   private readonly answered = new Set<string>();
   /** Feed barrier tokens awaiting their `session.updated` echo. */
-  private readonly barriers = new Map<string, () => void>();
+  private readonly barriers = new Map<string, Deferred.Deferred<void>>();
   private readonly children = new Map<string, ChildState>();
   /** Tool parts currently executing, keyed by OpenCode call ID; used to scope child function calls. */
   private readonly runningTools = new Map<string, RunningTool>();
   private readonly toolScope = new AsyncLocalStorage<EventScope>();
-  private idle?: () => void;
+  /** Fires when the feed reports the parent session idle. */
+  private readonly idle = new Wake();
+  /** Fires whenever a tool part changes state. */
+  private readonly toolsChanged = new Wake();
   constructor(execution: Execution, options: NativeOptions) {
     super(execution, options);
     this.home = join(options.directory, "opencode");
@@ -278,37 +298,32 @@ export class OpenCodeJob extends ToolJob {
       if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
         this.failStart(new Error("OpenCode exited"));
     });
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("OpenCode startup timed out")), 30_000);
-      let output = "";
-      child.stdout?.on("data", (data) => {
-        output = (output + String(data)).slice(-4096);
-        if (output.includes("opencode server listening")) {
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
-      child.once("error", (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      });
-      child.once("exit", () => {
-        clearTimeout(timeout);
-        reject(new Error("OpenCode exited during startup"));
-      });
-    });
+    await this.perform(
+      awaitReady(
+        child,
+        (tail) => tail.includes("opencode server listening"),
+        STARTUP_BOUND,
+        "OpenCode",
+      ),
+    );
     const client = createOpencodeClient({
       baseUrl: `http://127.0.0.1:${address.port}`,
       headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` },
       throwOnError: true,
     });
     this.client = client;
+    const signal = this.abort.signal;
     const sessionId =
-      previous ?? (await client.session.create({ title: this.execution.sessionId })).data?.id;
+      previous ??
+      (await client.session.create({ title: this.execution.sessionId }, { signal })).data?.id;
     if (!sessionId) throw new Error("OpenCode did not create a session");
     this.sessionId = sessionId;
-    if (previous) await client.session.get({ sessionID: previous });
-    this.run(() => this.turn(client));
+    if (previous) await client.session.get({ sessionID: previous }, { signal });
+    this.run(this.turn(client));
+  }
+  /** The job's abort ends a request before the fiber's own interruption reaches it. */
+  private signals(signal: AbortSignal): AbortSignal {
+    return AbortSignal.any([this.abort.signal, signal]);
   }
   /** Every prompt of a turn shares the model, instructions, output format and variant. */
   private promptRequest(parts: PromptParts): PromptRequest {
@@ -322,326 +337,342 @@ export class OpenCodeJob extends ToolJob {
       ...(this.variant ? { variant: this.variant } : {}),
     };
   }
-  /** Runs the whole public turn: the initial prompt, admitted steers and their reruns. */
-  private async turn(client: Client): Promise<void> {
-    const usage = new Map<string, AssistantMessage>();
-    const started = Date.now();
-    const record = (info: AssistantMessage) => {
-      if (info.sessionID !== this.sessionId || info.time.created < started) return false;
-      usage.set(info.id, info);
-      return true;
-    };
-    const publishUsage = (messages: Iterable<AssistantMessage>, scope?: EventScope) => {
-      const list = [...messages];
-      const input = list.reduce(
-        (sum, message) =>
-          sum + message.tokens.input + message.tokens.cache.read + message.tokens.cache.write,
-        0,
-      );
-      const output = list.reduce(
-        (sum, message) => sum + message.tokens.output + message.tokens.reasoning,
-        0,
-      );
-      this.emit({
-        type: "usage",
-        id: `usage:${scope?.turnId ?? this.execution.turnId}`,
-        usage: {
-          input_tokens: input,
-          output_tokens: output,
-          total_tokens: input + output,
-          input_tokens_details: {
-            cached_tokens: list.reduce((sum, message) => sum + message.tokens.cache.read, 0),
-          },
-          output_tokens_details: {
-            reasoning_tokens: list.reduce((sum, message) => sum + message.tokens.reasoning, 0),
-          },
-        },
-        ...scope,
-      });
-    };
-    const childUsage = new Map<string, Map<string, AssistantMessage>>();
-    const parts = new Map<string, Part["type"]>();
-    /** Completed text parts wait for their step to finish so their phase is known. */
-    const pendingText = new Map<string, { id: string; text: string; scope?: EventScope }[]>();
-    const emittedText = new Set<string>();
-    const flushText = (messageId: string, phase: "commentary" | "final_answer") => {
-      for (const entry of pendingText.get(messageId) ?? []) {
-        if (emittedText.has(entry.id)) continue;
-        emittedText.add(entry.id);
-        this.emit({ type: "text", id: entry.id, text: entry.text, phase, ...entry.scope });
-      }
-      pendingText.delete(messageId);
-    };
-    const phaseOf = (finish: string) => (finish.includes("tool") ? "commentary" : "final_answer");
-    const scopeOf = (sessionId: string): EventScope | undefined => {
-      if (sessionId === this.sessionId) return undefined;
-      const child = this.children.get(sessionId);
-      return child ? { subagentId: child.subagentId, turnId: child.turnId } : undefined;
-    };
-    const openChild = (info: Session) => {
-      if (!info.parentID || info.parentID !== this.sessionId) return;
-      const existing = this.children.get(info.id);
-      if (existing) {
-        if (info.title && existing.name !== info.title) existing.name = info.title;
-        return;
-      }
-      const suffix = info.id.replace(/[^a-zA-Z0-9]/g, "");
-      const child: ChildState = {
-        sessionId: info.id,
-        subagentId: `subagent_${suffix}`,
-        turnId: `turn_${suffix}`,
-        openedAt: Math.floor((info.time?.created ?? Date.now()) / 1000),
-        name: info.title || null,
-        closed: false,
-      };
-      this.children.set(info.id, child);
-      this.emit({
-        type: "subagent",
-        id: child.subagentId,
-        parentId: null,
-        name: child.name,
-        instructions: null,
-        openedAt: child.openedAt,
-        status: "active",
-      });
-      this.emit({
-        type: "subagent_turn",
-        id: child.turnId,
-        subagentId: child.subagentId,
-        status: "in_progress",
-        startedAt: child.openedAt,
-        completedAt: null,
-      });
-    };
-    const closeChild = (child: ChildState, status: "completed" | "failed") => {
-      if (child.closed) return;
-      child.closed = true;
-      for (const messageId of Array.from(pendingText.keys()))
-        if (pendingText.get(messageId)?.some((entry) => entry.scope?.turnId === child.turnId))
+  /**
+   * Runs the whole public turn: the initial prompt, admitted steers and their reruns.
+   * The event feed is a fiber of the turn's own Scope, so it ends with the turn.
+   */
+  private turn(client: Client): Effect.Effect<void, unknown> {
+    return Effect.scoped(
+      Effect.gen(this, function* () {
+        const usage = new Map<string, AssistantMessage>();
+        const started = Date.now();
+        const record = (info: AssistantMessage) => {
+          if (info.sessionID !== this.sessionId || info.time.created < started) return false;
+          usage.set(info.id, info);
+          return true;
+        };
+        const publishUsage = (messages: Iterable<AssistantMessage>, scope?: EventScope) => {
+          const list = [...messages];
+          const input = list.reduce(
+            (sum, message) =>
+              sum + message.tokens.input + message.tokens.cache.read + message.tokens.cache.write,
+            0,
+          );
+          const output = list.reduce(
+            (sum, message) => sum + message.tokens.output + message.tokens.reasoning,
+            0,
+          );
+          this.emit({
+            type: "usage",
+            id: `usage:${scope?.turnId ?? this.execution.turnId}`,
+            usage: {
+              input_tokens: input,
+              output_tokens: output,
+              total_tokens: input + output,
+              input_tokens_details: {
+                cached_tokens: list.reduce((sum, message) => sum + message.tokens.cache.read, 0),
+              },
+              output_tokens_details: {
+                reasoning_tokens: list.reduce((sum, message) => sum + message.tokens.reasoning, 0),
+              },
+            },
+            ...scope,
+          });
+        };
+        const childUsage = new Map<string, Map<string, AssistantMessage>>();
+        const parts = new Map<string, Part["type"]>();
+        /** Completed text parts wait for their step to finish so their phase is known. */
+        const pendingText = new Map<string, { id: string; text: string; scope?: EventScope }[]>();
+        const emittedText = new Set<string>();
+        const flushText = (messageId: string, phase: "commentary" | "final_answer") => {
+          for (const entry of pendingText.get(messageId) ?? []) {
+            if (emittedText.has(entry.id)) continue;
+            emittedText.add(entry.id);
+            this.emit({ type: "text", id: entry.id, text: entry.text, phase, ...entry.scope });
+          }
+          pendingText.delete(messageId);
+        };
+        const phaseOf = (finish: string) =>
+          finish.includes("tool") ? "commentary" : "final_answer";
+        const scopeOf = (sessionId: string): EventScope | undefined => {
+          if (sessionId === this.sessionId) return undefined;
+          const child = this.children.get(sessionId);
+          return child ? { subagentId: child.subagentId, turnId: child.turnId } : undefined;
+        };
+        const openChild = (info: Session) => {
+          if (!info.parentID || info.parentID !== this.sessionId) return;
+          const existing = this.children.get(info.id);
+          if (existing) {
+            if (info.title && existing.name !== info.title) existing.name = info.title;
+            return;
+          }
+          const suffix = info.id.replace(/[^a-zA-Z0-9]/g, "");
+          const child: ChildState = {
+            sessionId: info.id,
+            subagentId: `subagent_${suffix}`,
+            turnId: `turn_${suffix}`,
+            openedAt: Math.floor((info.time?.created ?? Date.now()) / 1000),
+            name: info.title || null,
+            closed: false,
+          };
+          this.children.set(info.id, child);
+          this.emit({
+            type: "subagent",
+            id: child.subagentId,
+            parentId: null,
+            name: child.name,
+            instructions: null,
+            openedAt: child.openedAt,
+            status: "active",
+          });
+          this.emit({
+            type: "subagent_turn",
+            id: child.turnId,
+            subagentId: child.subagentId,
+            status: "in_progress",
+            startedAt: child.openedAt,
+            completedAt: null,
+          });
+        };
+        const closeChild = (child: ChildState, status: "completed" | "failed") => {
+          if (child.closed) return;
+          child.closed = true;
+          for (const messageId of Array.from(pendingText.keys()))
+            if (pendingText.get(messageId)?.some((entry) => entry.scope?.turnId === child.turnId))
+              flushText(messageId, "final_answer");
+          this.emit({
+            type: "subagent_turn",
+            id: child.turnId,
+            subagentId: child.subagentId,
+            status,
+            startedAt: child.openedAt,
+            completedAt: Math.floor(Date.now() / 1000),
+          });
+          this.emit({
+            type: "subagent",
+            id: child.subagentId,
+            parentId: null,
+            name: child.name,
+            instructions: null,
+            openedAt: child.openedAt,
+            status: "closed",
+          });
+        };
+        const collectPart = (part: Part) => {
+          const scope = scopeOf(part.sessionID);
+          if (part.sessionID !== this.sessionId && !scope) return;
+          parts.set(part.id, part.type);
+          if (part.type === "tool") this.trackTool(part);
+          if (part.type === "reasoning")
+            this.emit({
+              type: "reasoning",
+              id: part.id,
+              summary: [part.text],
+              status: part.time.end ? "completed" : "in_progress",
+              ...scope,
+            });
+          if (part.type === "text" && part.time?.end && !emittedText.has(part.id)) {
+            const pending = pendingText.get(part.messageID) ?? [];
+            if (!pending.some((entry) => entry.id === part.id))
+              pending.push({ id: part.id, text: part.text, ...(scope ? { scope } : {}) });
+            pendingText.set(part.messageID, pending);
+          }
+          // A step that ends with tool calls makes its text commentary; a final step answers.
+          if (part.type === "step-finish") flushText(part.messageID, phaseOf(part.reason));
+        };
+        let streamError: unknown;
+        const subscribed = yield* Deferred.make<void>();
+        // Subscribing and reading share one `io`, so the fiber's signal ends the SSE
+        // request whenever the turn's Scope interrupts the feed.
+        const consume = async (signal: AbortSignal) => {
+          const events = await client.event.subscribe({}, { signal });
+          Deferred.unsafeDone(subscribed, Effect.void);
+          for await (const event of events.stream as AsyncIterable<Event>) {
+            if (process.env.CF_OPENCODE_TRACE)
+              this.options.diagnostics(`opencode-event ${trace(event)}`);
+            if (event.type === "session.created" || event.type === "session.updated")
+              openChild(event.properties.info);
+            if (event.type === "session.updated" && event.properties.info.id === this.sessionId) {
+              const token = event.properties.info.metadata?.cf_sync;
+              const barrier = typeof token === "string" ? this.barriers.get(token) : undefined;
+              if (barrier) Deferred.unsafeDone(barrier, Effect.void);
+            }
+            if (event.type === "message.updated" && event.properties.info.role === "assistant") {
+              const info = event.properties.info;
+              const scope = scopeOf(info.sessionID);
+              if (info.sessionID === this.sessionId) {
+                this.answered.add(info.parentID);
+                if (record(info)) publishUsage(usage.values());
+              } else if (scope) {
+                const list = childUsage.get(info.sessionID) ?? new Map<string, AssistantMessage>();
+                list.set(info.id, info);
+                childUsage.set(info.sessionID, list);
+                publishUsage(list.values(), scope);
+              }
+              if (
+                (info.sessionID === this.sessionId || scope) &&
+                info.finish &&
+                pendingText.has(info.id)
+              )
+                flushText(info.id, phaseOf(info.finish));
+            }
+            if (event.type === "message.part.updated") collectPart(event.properties.part);
+            if (event.type === "message.part.delta" && event.properties.field === "text") {
+              const scope = scopeOf(event.properties.sessionID);
+              if (event.properties.sessionID === this.sessionId || scope)
+                this.emit(
+                  parts.get(event.properties.partID) === "reasoning"
+                    ? {
+                        type: "reasoning_delta",
+                        id: event.properties.partID,
+                        summaryIndex: 0,
+                        text: event.properties.delta,
+                        ...scope,
+                      }
+                    : {
+                        type: "delta",
+                        id: event.properties.partID,
+                        text: event.properties.delta,
+                        ...scope,
+                      },
+                );
+            }
+            if (event.type === "session.status" && event.properties.status.type === "retry") {
+              const { attempt, message, next } = event.properties.status;
+              this.options.diagnostics(
+                `opencode retry session=${event.properties.sessionID} attempt=${attempt} next_in_ms=${Math.max(0, next - Date.now())}: ${message}`,
+              );
+            }
+            if (event.type === "session.idle") {
+              const child = this.children.get(event.properties.sessionID);
+              if (child) closeChild(child, "completed");
+              if (event.properties.sessionID === this.sessionId) this.idle.notify();
+            }
+            if (event.type === "session.error") {
+              const child = this.children.get(event.properties.sessionID ?? "");
+              if (child) closeChild(child, "failed");
+              if (event.properties.error)
+                this.options.diagnostics(
+                  `opencode session.error session=${event.properties.sessionID ?? "none"}: ${event.properties.error.name}`,
+                );
+            }
+          }
+        };
+        yield* io("opencode.events", consume).pipe(
+          Effect.catchAll((error) =>
+            Effect.sync(() => {
+              streamError = error;
+              Deferred.unsafeDone(subscribed, Effect.void);
+              this.abort.abort();
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(subscribed);
+        const failed = (message: string) => new OpenCodeTurnFailed({ message });
+        if (streamError) return yield* failed(describeFailure(streamError));
+        const prompt = (input: PromptParts) =>
+          Effect.gen(this, function* () {
+            const result = yield* io("opencode.prompt", (signal) =>
+              client.session.prompt(this.promptRequest(input), { signal: this.signals(signal) }),
+            );
+            if (streamError) return yield* failed(describeFailure(streamError));
+            const info = result.data?.info;
+            if (!result.data || !info)
+              return yield* failed("OpenCode returned no assistant message");
+            if (info.error) {
+              if (info.error.name === "MessageAbortedError")
+                return yield* failed("OpenCode turn aborted");
+              const mapped = opencodeTurnError(info.error);
+              this.options.diagnostics(`opencode ${info.error.name}: ${mapped.detail}`);
+              this.lifecycle.fail(mapped.code);
+              return yield* failed(`OpenCode turn failed: ${info.error.name}`);
+            }
+            const finish = info.finish ?? "stop";
+            // A structured answer is delivered through the StructuredOutput tool call.
+            const structured = info.structured !== undefined && finish === "tool-calls";
+            if (!structured && !["stop", "end_turn", "unknown"].includes(finish)) {
+              this.options.diagnostics(`opencode finish=${finish}`);
+              this.lifecycle.fail("internal_error");
+              return yield* failed(`OpenCode turn finished with ${finish}`);
+            }
+            return result.data;
+          });
+        let last = yield* prompt(
+          yield* io("opencode.input", () => this.inputParts(this.execution.input)),
+        );
+        for (;;) {
+          // A steer admitted while the loop ran was answered before the prompt resolved;
+          // one admitted while the session was idle started a loop of its own.
+          yield* this.untilIdle(client);
+          const orphans = yield* this.settle(client);
+          if (!orphans.length) break;
+          // The loop had exited before these steers were stored: rerun them in this turn.
+          for (const id of orphans)
+            yield* io("opencode.deleteMessage", (signal) =>
+              client.session.deleteMessage(
+                { sessionID: this.sessionId, messageID: id },
+                { signal: this.signals(signal) },
+              ),
+            );
+          last = yield* prompt(orphans.flatMap((id) => this.steered.get(id) ?? []));
+          for (const id of orphans) this.steered.delete(id);
+        }
+        // The event feed can lag behind the prompt response; once it has caught up
+        // the final usage report covers every inference of this turn.
+        yield* this.barrier(client);
+        record(last.info);
+        publishUsage(usage.values());
+        for (const child of this.children.values()) closeChild(child, "completed");
+        for (const messageId of Array.from(pendingText.keys()))
           flushText(messageId, "final_answer");
-      this.emit({
-        type: "subagent_turn",
-        id: child.turnId,
-        subagentId: child.subagentId,
-        status,
-        startedAt: child.openedAt,
-        completedAt: Math.floor(Date.now() / 1000),
-      });
-      this.emit({
-        type: "subagent",
-        id: child.subagentId,
-        parentId: null,
-        name: child.name,
-        instructions: null,
-        openedAt: child.openedAt,
-        status: "closed",
-      });
-    };
-    const collectPart = (part: Part) => {
-      const scope = scopeOf(part.sessionID);
-      if (part.sessionID !== this.sessionId && !scope) return;
-      parts.set(part.id, part.type);
-      if (part.type === "tool") this.trackTool(part);
-      if (part.type === "reasoning")
-        this.emit({
-          type: "reasoning",
-          id: part.id,
-          summary: [part.text],
-          status: part.time.end ? "completed" : "in_progress",
-          ...scope,
-        });
-      if (part.type === "text" && part.time?.end && !emittedText.has(part.id)) {
-        const pending = pendingText.get(part.messageID) ?? [];
-        if (!pending.some((entry) => entry.id === part.id))
-          pending.push({ id: part.id, text: part.text, ...(scope ? { scope } : {}) });
-        pendingText.set(part.messageID, pending);
-      }
-      // A step that ends with tool calls makes its text commentary; a final step answers.
-      if (part.type === "step-finish") flushText(part.messageID, phaseOf(part.reason));
-    };
-    const updates = new AbortController();
-    const events = await client.event.subscribe({}, { signal: updates.signal });
-    let streamError: unknown;
-    const consume = (async () => {
-      for await (const event of events.stream as AsyncIterable<Event>) {
-        if (process.env.CF_OPENCODE_TRACE)
-          this.options.diagnostics(`opencode-event ${trace(event)}`);
-        if (event.type === "session.created" || event.type === "session.updated")
-          openChild(event.properties.info);
-        if (event.type === "session.updated" && event.properties.info.id === this.sessionId) {
-          const token = event.properties.info.metadata?.cf_sync;
-          if (typeof token === "string") this.barriers.get(token)?.();
-        }
-        if (event.type === "message.updated" && event.properties.info.role === "assistant") {
-          const info = event.properties.info;
-          const scope = scopeOf(info.sessionID);
-          if (info.sessionID === this.sessionId) {
-            this.answered.add(info.parentID);
-            if (record(info)) publishUsage(usage.values());
-          } else if (scope) {
-            const list = childUsage.get(info.sessionID) ?? new Map<string, AssistantMessage>();
-            list.set(info.id, info);
-            childUsage.set(info.sessionID, list);
-            publishUsage(list.values(), scope);
-          }
-          if (
-            (info.sessionID === this.sessionId || scope) &&
-            info.finish &&
-            pendingText.has(info.id)
-          )
-            flushText(info.id, phaseOf(info.finish));
-        }
-        if (event.type === "message.part.updated") collectPart(event.properties.part);
-        if (event.type === "message.part.delta" && event.properties.field === "text") {
-          const scope = scopeOf(event.properties.sessionID);
-          if (event.properties.sessionID === this.sessionId || scope)
-            this.emit(
-              parts.get(event.properties.partID) === "reasoning"
-                ? {
-                    type: "reasoning_delta",
-                    id: event.properties.partID,
-                    summaryIndex: 0,
-                    text: event.properties.delta,
-                    ...scope,
-                  }
-                : {
-                    type: "delta",
-                    id: event.properties.partID,
-                    text: event.properties.delta,
-                    ...scope,
-                  },
-            );
-        }
-        if (event.type === "session.status" && event.properties.status.type === "retry") {
-          const { attempt, message, next } = event.properties.status;
-          this.options.diagnostics(
-            `opencode retry session=${event.properties.sessionID} attempt=${attempt} next_in_ms=${Math.max(0, next - Date.now())}: ${message}`,
-          );
-        }
-        if (event.type === "session.idle") {
-          const child = this.children.get(event.properties.sessionID);
-          if (child) closeChild(child, "completed");
-          if (event.properties.sessionID === this.sessionId) this.idle?.();
-        }
-        if (event.type === "session.error") {
-          const child = this.children.get(event.properties.sessionID ?? "");
-          if (child) closeChild(child, "failed");
-          if (event.properties.error)
-            this.options.diagnostics(
-              `opencode session.error session=${event.properties.sessionID ?? "none"}: ${event.properties.error.name}`,
-            );
-        }
-      }
-    })().catch((error) => {
-      if (!updates.signal.aborted) {
-        streamError = error;
-        this.abort.abort();
-      }
-    });
-    const prompt = async (input: PromptParts) => {
-      const result = await client.session.prompt(this.promptRequest(input), {
-        signal: this.abort.signal,
-      });
-      if (streamError)
-        throw streamError instanceof Error ? streamError : new Error(describeFailure(streamError));
-      const info = result.data?.info;
-      if (!result.data || !info) throw new Error("OpenCode returned no assistant message");
-      if (info.error) {
-        if (info.error.name === "MessageAbortedError") throw new Error("OpenCode turn aborted");
-        const mapped = opencodeTurnError(info.error);
-        this.options.diagnostics(`opencode ${info.error.name}: ${mapped.detail}`);
-        this.lifecycle.fail(mapped.code);
-        throw new Error(`OpenCode turn failed: ${info.error.name}`);
-      }
-      const finish = info.finish ?? "stop";
-      // A structured answer is delivered through the StructuredOutput tool call.
-      const structured = info.structured !== undefined && finish === "tool-calls";
-      if (!structured && !["stop", "end_turn", "unknown"].includes(finish)) {
-        this.options.diagnostics(`opencode finish=${finish}`);
-        this.lifecycle.fail("internal_error");
-        throw new Error(`OpenCode turn finished with ${finish}`);
-      }
-      return result.data;
-    };
-    try {
-      let last = await prompt(await this.inputParts(this.execution.input));
-      for (;;) {
-        // A steer admitted while the loop ran was answered before the prompt resolved;
-        // one admitted while the session was idle started a loop of its own.
-        await this.untilIdle(client);
-        const orphans = await this.settle(client);
-        if (!orphans.length) break;
-        // The loop had exited before these steers were stored: rerun them in this turn.
-        for (const id of orphans)
-          await client.session.deleteMessage(
-            { sessionID: this.sessionId, messageID: id },
-            { signal: this.abort.signal },
-          );
-        last = await prompt(orphans.flatMap((id) => this.steered.get(id) ?? []));
-        for (const id of orphans) this.steered.delete(id);
-      }
-      // The event feed can lag behind the prompt response; once it has caught up
-      // the final usage report covers every inference of this turn.
-      await this.barrier(client);
-      record(last.info);
-      publishUsage(usage.values());
-      for (const child of this.children.values()) closeChild(child, "completed");
-      for (const messageId of Array.from(pendingText.keys())) flushText(messageId, "final_answer");
-      const finalText = last.parts.filter(
-        (part): part is Extract<Part, { type: "text" }> => part.type === "text",
-      );
-      if (last.info.structured !== undefined) {
-        // The public answer is the validated structured value, like Codex's outputSchema.
-        const id = finalText.at(-1)?.id ?? `structured:${last.info.id}`;
-        for (const part of finalText) emittedText.add(part.id);
-        this.emit({
-          type: "text",
-          id,
-          text: JSON.stringify(last.info.structured),
-          phase: "final_answer",
-        });
-      } else
-        for (const part of finalText)
-          if (!emittedText.has(part.id)) {
-            emittedText.add(part.id);
-            this.emit({ type: "text", id: part.id, text: part.text, phase: "final_answer" });
-          }
-    } finally {
-      updates.abort();
-      await consume;
-    }
+        const finalText = last.parts.filter(
+          (part): part is Extract<Part, { type: "text" }> => part.type === "text",
+        );
+        if (last.info.structured !== undefined) {
+          // The public answer is the validated structured value, like Codex's outputSchema.
+          const id = finalText.at(-1)?.id ?? `structured:${last.info.id}`;
+          for (const part of finalText) emittedText.add(part.id);
+          this.emit({
+            type: "text",
+            id,
+            text: JSON.stringify(last.info.structured),
+            phase: "final_answer",
+          });
+        } else
+          for (const part of finalText)
+            if (!emittedText.has(part.id)) {
+              emittedText.add(part.id);
+              this.emit({ type: "text", id: part.id, text: part.text, phase: "final_answer" });
+            }
+      }),
+    );
   }
   /** Waits until OpenCode reports the session idle, bounded by the execution deadline. */
-  private async untilIdle(client: Client): Promise<void> {
-    for (;;) {
-      const status = await client.session
-        .status()
-        .then((response) => response.data)
-        .catch(() => undefined);
-      const busy =
-        status && typeof status === "object" && this.sessionId in status
-          ? (status as Record<string, { type?: string }>)[this.sessionId]?.type !== "idle"
-          : false;
-      if (!busy || this.closing) return;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 250);
-        this.idle = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
-      this.idle = undefined;
-      if (Date.now() > this.execution.deadline) return;
-    }
+  private untilIdle(client: Client): Effect.Effect<void> {
+    return Effect.gen(this, function* () {
+      for (;;) {
+        // Captured before the status read: an idle event that lands during it still wakes the wait.
+        const woken = this.idle.wait();
+        const status = yield* io("opencode.status", (signal) =>
+          client.session.status({}, { signal: this.signals(signal) }),
+        ).pipe(
+          Effect.map((response) => response.data),
+          Effect.orElseSucceed(() => undefined),
+        );
+        const busy =
+          status && typeof status === "object" && this.sessionId in status
+            ? (status as Record<string, { type?: string }>)[this.sessionId]?.type !== "idle"
+            : false;
+        if (!busy || this.closing) return;
+        yield* within(woken, "250 millis");
+        if (Date.now() > this.execution.deadline) return;
+      }
+    });
   }
   /** Runs `task` after every earlier gated task, whatever their outcome. */
-  private locked<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.gate.then(task, task);
-    this.gate = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  private locked<A, E>(task: Effect.Effect<A, E>): Effect.Effect<A, E> {
+    return this.gate.withPermits(1)(task);
   }
   /**
    * Resolves once the event feed has delivered everything published before the
@@ -649,39 +680,37 @@ export class OpenCodeJob extends ToolJob {
    * (Listing messages instead would trip OpenCode 1.18.30's re-encoding of a stored
    * json_schema format, which fails every structured turn.)
    */
-  private async barrier(client: Client): Promise<void> {
-    const token = crypto.randomUUID();
-    let timer: NodeJS.Timeout | undefined;
-    const echoed = new Promise<void>((resolve) => {
-      this.barriers.set(token, resolve);
-      timer = setTimeout(() => {
-        this.options.diagnostics("opencode event feed barrier timed out");
-        resolve();
-      }, 10_000);
+  private barrier(client: Client): Effect.Effect<void, unknown> {
+    return Effect.gen(this, function* () {
+      const token = crypto.randomUUID();
+      const echoed = yield* Deferred.make<void>();
+      this.barriers.set(token, echoed);
+      yield* Effect.gen(this, function* () {
+        yield* io("opencode.update", (signal) =>
+          client.session.update(
+            { sessionID: this.sessionId, metadata: { cf_sync: token } },
+            { signal: this.signals(signal) },
+          ),
+        );
+        if (!(yield* within(Deferred.await(echoed), BARRIER_BOUND)))
+          this.options.diagnostics("opencode event feed barrier timed out");
+      }).pipe(Effect.ensuring(Effect.sync(() => this.barriers.delete(token))));
     });
-    try {
-      await client.session.update(
-        { sessionID: this.sessionId, metadata: { cf_sync: token } },
-        { signal: this.abort.signal },
-      );
-      await echoed;
-    } finally {
-      clearTimeout(timer);
-      this.barriers.delete(token);
-    }
   }
   /**
    * Under the steer gate: returns the steers OpenCode's loop never answered. With
    * none, the turn settles and later steers are rejected for the next turn.
    */
-  private settle(client: Client): Promise<string[]> {
-    return this.locked(async () => {
-      if (this.steered.size) await this.barrier(client);
-      const orphans = [...this.steered.keys()].filter((id) => !this.answered.has(id));
-      for (const id of this.steered.keys()) if (this.answered.has(id)) this.steered.delete(id);
-      this.settling = orphans.length === 0;
-      return orphans;
-    });
+  private settle(client: Client): Effect.Effect<string[], unknown> {
+    return this.locked(
+      Effect.gen(this, function* () {
+        if (this.steered.size) yield* this.barrier(client);
+        const orphans = [...this.steered.keys()].filter((id) => !this.answered.has(id));
+        for (const id of this.steered.keys()) if (this.answered.has(id)) this.steered.delete(id);
+        this.settling = orphans.length === 0;
+        return orphans;
+      }),
+    );
   }
   private async inputParts(input: InputMessage[]): Promise<PromptParts> {
     return Promise.all(
@@ -709,22 +738,35 @@ export class OpenCodeJob extends ToolJob {
    * the model right after the step in flight. If the loop had already exited,
    * `settle` finds the message unanswered and reruns it before this turn completes.
    */
-  protected override async steer(input: InputMessage[]): Promise<void> {
-    const client = this.client;
-    if (!client || !this.sessionId)
-      throw new ApiError(409, "command_rejected", "OpenCode session is not running");
-    const parts = await this.inputParts(input);
-    await this.locked(async () => {
-      if (this.settling || this.closing)
-        throw new ApiError(409, "command_rejected", "OpenCode turn has already settled");
-      const stored = await client.session.prompt(
-        { ...this.promptRequest(parts), noReply: true },
-        { signal: this.abort.signal },
+  protected override steer(input: InputMessage[]) {
+    return Effect.gen(this, function* () {
+      const client = this.client;
+      if (!client || !this.sessionId)
+        return yield* new ApiError(409, "command_rejected", "OpenCode session is not running");
+      const parts = yield* io("opencode.input", () => this.inputParts(input));
+      yield* this.locked(
+        Effect.gen(this, function* () {
+          if (this.settling || this.closing)
+            return yield* new ApiError(
+              409,
+              "command_rejected",
+              "OpenCode turn has already settled",
+            );
+          const stored = yield* io("opencode.steer", (signal) =>
+            client.session.prompt(
+              { ...this.promptRequest(parts), noReply: true },
+              { signal: this.signals(signal) },
+            ),
+          );
+          // With `noReply` the created user message is returned instead of an assistant one.
+          const info = stored.data?.info as Message | undefined;
+          if (info?.role !== "user")
+            return yield* new OpenCodeTurnFailed({
+              message: "OpenCode did not store the steered message",
+            });
+          this.steered.set(info.id, parts);
+        }),
       );
-      // With `noReply` the created user message is returned instead of an assistant one.
-      const info = stored.data?.info as Message | undefined;
-      if (info?.role !== "user") throw new Error("OpenCode did not store the steered message");
-      this.steered.set(info.id, parts);
     });
   }
   private trackTool(part: ToolPart): void {
@@ -736,25 +778,37 @@ export class OpenCodeJob extends ToolJob {
         input: JSON.stringify(state.input ?? {}),
       });
     else this.runningTools.delete(part.callID);
+    this.toolsChanged.notify();
   }
-  /** Function calls raised by a child session are scoped to that child's public turn. */
-  private async scopeFor(name: string, args: unknown): Promise<EventScope | undefined> {
-    if (!this.children.size) return undefined;
+  /**
+   * Function calls raised by a child session are scoped to that child's public
+   * turn. The feed may deliver the running tool part slightly after the call
+   * itself, so the match waits, bounded, for the next tool-part update.
+   */
+  private scopeFor(name: string, args: unknown): Effect.Effect<EventScope | undefined> {
+    if (!this.children.size) return Effect.succeed(undefined);
     const wanted = JSON.stringify(args ?? {});
-    const deadline = Date.now() + 1_000;
-    for (;;) {
+    const tool = `${WORKSPACE_PREFIX}${name}`;
+    const lookup = (): Option.Option<EventScope | undefined> => {
       for (const running of this.runningTools.values())
-        if (running.tool === `${WORKSPACE_PREFIX}${name}` && running.input === wanted) {
-          if (running.sessionId === this.sessionId) return undefined;
+        if (running.tool === tool && running.input === wanted) {
+          if (running.sessionId === this.sessionId) return Option.some(undefined);
           const child = this.children.get(running.sessionId);
-          if (child) return { subagentId: child.subagentId, turnId: child.turnId };
+          if (child) return Option.some({ subagentId: child.subagentId, turnId: child.turnId });
         }
-      if (Date.now() >= deadline) return undefined;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+      return Option.none();
+    };
+    return Effect.gen(this, function* () {
+      for (;;) {
+        const woken = this.toolsChanged.wait();
+        const found = lookup();
+        if (Option.isSome(found)) return found.value;
+        yield* within(woken, "25 millis");
+      }
+    }).pipe(Effect.timeoutOption("1 second"), Effect.map(Option.getOrUndefined));
   }
   protected override async callTool(name: string, args: unknown) {
-    const scope = await this.scopeFor(name, args);
+    const scope = await this.perform(this.scopeFor(name, args));
     return scope
       ? this.toolScope.run(scope, () => super.callTool(name, args))
       : super.callTool(name, args);
@@ -764,8 +818,10 @@ export class OpenCodeJob extends ToolJob {
     super.emit(scope && event.type === "function_call" ? { ...event, ...scope } : event);
   }
   /** The server process itself is terminated by the resource Scope that owns it. */
-  protected async closeRuntime(): Promise<void> {
-    await chmod(join(this.home, "config", "opencode"), 0o755).catch(() => {});
+  protected closeRuntime() {
+    return io("opencode.unlock", () => chmod(join(this.home, "config", "opencode"), 0o755)).pipe(
+      Effect.ignore,
+    );
   }
 }
 

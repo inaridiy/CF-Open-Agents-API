@@ -288,10 +288,14 @@ export abstract class Job<Prepared = void> implements NativeJob {
   protected own(child: ChildProcess, grace: Duration.DurationInput): Promise<void> {
     return this.perform(ownProcess(child, grace).pipe(Effect.asVoid));
   }
-  /** The native turn: completion waits for delegated children, like native Codex children. */
-  protected run(task: () => Promise<void>): void {
+  /**
+   * The native turn, as a fiber of this job's resources: completion waits for
+   * delegated children, like native Codex children. SDK consumption inside it stays
+   * a Promise behind `io`; the job's abort ends it, and the Scope interrupts the fiber.
+   */
+  protected run(task: Effect.Effect<void, unknown, Scope.Scope>): void {
     void this.perform(
-      io("native.run", () => task()).pipe(
+      task.pipe(
         Effect.zipRight(this.delegations.settle()),
         Effect.tap(() => Effect.sync(() => this.lifecycle.setStatus("completed"))),
         Effect.catchAllCause((cause) =>
@@ -385,39 +389,44 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
   protected get thread() {
     return this.sessionId || undefined;
   }
+  /** Bring the native runtime up; SDK setup is inherently Promise-based and runs behind `io`. */
   protected abstract open(bundle?: unknown): Promise<void>;
-  protected abstract closeRuntime(): Promise<void>;
+  /** Close what `open` created outside the resource Scope; bounded by the implementation. */
+  protected abstract closeRuntime(): Effect.Effect<void, unknown>;
   /**
    * Ask the native runtime to end the current turn gracefully before the job is
    * closed; runtimes that can report usage for an interrupted turn override this.
    * Bounded by the implementation; the default returns immediately.
    */
-  protected interruptRuntime(): Promise<void> {
-    return Promise.resolve();
+  protected interruptRuntime(): Effect.Effect<void, unknown> {
+    return Effect.void;
   }
   /**
    * Deliver input to the running native turn. Runtimes that can queue or inject
    * messages override this; the default rejects, which the HarnessDO reports as
    * `command_rejected` so the Worker re-queues the message as the next turn.
    */
-  protected steer(_input: InputMessage[]): Promise<void> {
-    return Promise.reject(
+  protected steer(_input: InputMessage[]): Effect.Effect<void, unknown> {
+    return Effect.fail(
       new ApiError(409, "command_rejected", "This harness cannot steer an active turn"),
     );
   }
   protected acquire(bundle?: unknown) {
     return io("native.open", () => this.open(bundle));
   }
-  /** Reset the native home, restore a checkpoint into it and connect remote MCP tools. */
+  /**
+   * Reset the native home, restore a checkpoint into it and connect remote MCP
+   * tools; the connections are resources of this job and close with it.
+   */
   protected async prepare(bundle?: unknown): Promise<string | undefined> {
     await rm(this.home, { recursive: true, force: true });
     await mkdir(this.home, { recursive: true });
     const previous = bundle ? await this.perform(restore(this.home, bundle)) : undefined;
-    await this.remoteTools.open(this.execution);
+    await this.perform(this.remoteTools.open(this.execution));
     return previous;
   }
   protected override interruptTurn() {
-    return io("native.interrupt", () => this.interruptRuntime());
+    return this.interruptRuntime();
   }
   protected override abandon(): void {
     const failure = Effect.fail(new ExecutionStopped());
@@ -425,24 +434,26 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     this.pending.clear();
   }
   protected override teardown() {
-    return Effect.gen(this, function* () {
-      yield* io("native.remoteTools.close", () => this.remoteTools.close());
-      yield* io("native.close", () => this.closeRuntime());
-    });
+    return this.closeRuntime();
   }
   private async runWorkspace(
     name: WorkspaceToolName,
     args: unknown,
     scope?: ToolScope,
+    signal?: AbortSignal,
   ): Promise<{ text: string; exitCode: number | null }> {
     if (!this.execution.sandbox || this.closing || this.abort.signal.aborted)
       throw new Error("No active sandbox assignment");
-    return executeWorkspace(this.options.sandboxUrl, name, args, this.abort.signal, (event) =>
-      this.emit(scope ? { ...event, ...scope } : event),
+    return executeWorkspace(
+      this.options.sandboxUrl,
+      name,
+      args,
+      signal ? AbortSignal.any([this.abort.signal, signal]) : this.abort.signal,
+      (event) => this.emit(scope ? { ...event, ...scope } : event),
     );
   }
   workspace(name: WorkspaceToolName, args: unknown) {
-    return io("native.workspace", () => this.runWorkspace(name, args));
+    return io("native.workspace", (signal) => this.runWorkspace(name, args, undefined, signal));
   }
   /** Raise a client function call; the Promise settles with the routed result or the stop. */
   protected externalTool(
@@ -522,7 +533,9 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
         };
       }
       if (this.remoteTools.tools.some((tool) => tool.codeName === name))
-        return yield* io("native.remoteTool", () => this.remoteTools.call(name, args));
+        return yield* this.remoteTools
+          .call(name, args)
+          .pipe(Effect.mapError(toServiceError("native.remoteTool")));
       return yield* io("native.codeTool", () =>
         this.externalTool(name, functionArguments(this.execution, name, args), invocation),
       );
@@ -640,7 +653,9 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       };
     }
     if (this.remoteTools.tools.some((tool) => tool.definition.name === name))
-      return CallToolResultSchema.parse(await this.remoteTools.call(name, args, scope));
+      return CallToolResultSchema.parse(
+        await this.perform(this.remoteTools.call(name, args, scope)),
+      );
     const index = /^function_(\d+)$/.exec(name)?.[1];
     const tool = index === undefined ? undefined : this.execution.agent.tools?.[Number(index)];
     if (tool?.type !== "function" || tool.defer_loading) throw new Error("Unknown function tool");
@@ -701,13 +716,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       if (command.type === "steer") {
         if (this.closing || !["running", "waiting"].includes(this.status))
           return yield* rejected("Turn is no longer active");
-        return yield* io("native.steer", () => this.steer(command.input)).pipe(
-          Effect.mapError((error) =>
-            error instanceof OperationError && error.cause instanceof ApiError
-              ? error.cause
-              : error,
-          ),
-        );
+        return yield* this.steer(command.input);
       }
       if (command.type === "cancel") {
         // Idempotent: closing marks the outcome cancelled unless it is already terminal.
