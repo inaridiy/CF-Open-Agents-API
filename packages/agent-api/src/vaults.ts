@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { attempt, io } from "./effect.js";
 import { requestWithoutRedirect } from "./http.js";
+import { kind } from "./persistence/kind.js";
 import {
   ApiError,
   canonicalJSON,
@@ -82,6 +83,19 @@ export const vaultPageSchema = pageSchema.extend({
 });
 type Auth = z.infer<typeof credentialAuthSchema>;
 type CredentialRecord = { version: 1; resource: Credential; auth: Auth };
+/** Every record kind the vault repository stores inside the tenant catalog. */
+const Kinds = {
+  vault: kind<{ version: 1; resource: Vault }>("vault"),
+  credential: (vaultId: string) => kind<CredentialRecord>(`credential:${vaultId}`),
+  /** id = credential id: an OAuth refresh in flight, so a lost answer is never replayed. */
+  credentialRefresh: kind<{ version: 1; fingerprint: string; operationId: string }>(
+    "credential_refresh",
+  ),
+  /** id = credential id: the token endpoint rejected the grant; only rotation clears it. */
+  credentialRefreshRejected: kind<{ version: 1; status: number; at: number }>(
+    "credential_refresh_rejected",
+  ),
+} as const;
 /** The token endpoint answered: the refresh token was not consumed by a lost request. */
 class RefreshRejected extends Data.TaggedError("RefreshRejected")<{
   readonly status: number;
@@ -127,7 +141,7 @@ export class VaultRepository {
       this.retrieve(vaultId);
       let after: string | undefined;
       do {
-        const page = this.db.list<CredentialRecord>(`credential:${vaultId}`, {
+        const page = this.db.list(Kinds.credential(vaultId), {
           order: "asc",
           limit: 100,
           after,
@@ -150,7 +164,7 @@ export class VaultRepository {
   private usableToken(record: CredentialRecord): string | undefined {
     const auth = record.auth;
     if (auth.type === "static_bearer") return auth.token;
-    if (this.db.get("credential_refresh_rejected", record.resource.id))
+    if (this.db.get(Kinds.credentialRefreshRejected, record.resource.id))
       throw new ApiError(
         422,
         "credential_refresh_rejected",
@@ -180,10 +194,7 @@ export class VaultRepository {
         Effect.gen(this, function* () {
           // A concurrent refresh or rotation may have completed while acquiring the gate.
           const current = yield* attempt("vault.reload", () =>
-            this.db.require<CredentialRecord>(
-              `credential:${record.resource.vault_id}`,
-              record.resource.id,
-            ),
+            this.db.require(Kinds.credential(record.resource.vault_id), record.resource.id),
           );
           const renewed = yield* attempt("vault.expiry", () => this.usableToken(current));
           return renewed ?? (yield* this.refresh(current));
@@ -205,13 +216,13 @@ export class VaultRepository {
       const operationId = identifier("refresh");
       yield* attempt("vault.refresh.reserve", () =>
         this.db.transaction(() => {
-          if (this.db.get("credential_refresh", id))
+          if (this.db.get(Kinds.credentialRefresh, id))
             throw new ApiError(
               409,
               "outcome_unknown",
               "OAuth refresh outcome is unknown; rotate the credential",
             );
-          this.db.put("credential_refresh", id, { version: 1, fingerprint, operationId });
+          this.db.put(Kinds.credentialRefresh, id, { version: 1, fingerprint, operationId });
         }),
       );
       const refresh = auth.refresh;
@@ -301,13 +312,10 @@ export class VaultRepository {
               const rejected = failure instanceof RefreshRejected && failure.rejected;
               yield* attempt("vault.refresh.release", () =>
                 this.db.transaction(() => {
-                  if (
-                    this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId ===
-                    operationId
-                  )
-                    this.db.remove("credential_refresh", id);
+                  if (this.db.get(Kinds.credentialRefresh, id)?.operationId === operationId)
+                    this.db.remove(Kinds.credentialRefresh, id);
                   if (rejected)
-                    this.db.put("credential_refresh_rejected", id, {
+                    this.db.put(Kinds.credentialRefreshRejected, id, {
                       version: 1,
                       status: failure.status,
                       at: Math.floor(Date.now() / 1000),
@@ -331,14 +339,10 @@ export class VaultRepository {
           const result = outcome.right;
           return yield* attempt("vault.refresh.commit", () =>
             this.db.transaction(() => {
-              const current = this.db.require<CredentialRecord>(
-                `credential:${record.resource.vault_id}`,
-                id,
-              );
+              const current = this.db.require(Kinds.credential(record.resource.vault_id), id);
               if (
                 canonicalJSON(current.auth) !== fingerprint ||
-                this.db.get<{ operationId: string }>("credential_refresh", id)?.operationId !==
-                  operationId
+                this.db.get(Kinds.credentialRefresh, id)?.operationId !== operationId
               )
                 throw new ApiError(
                   409,
@@ -357,7 +361,7 @@ export class VaultRepository {
                   scope: result.scope ?? refresh.scope,
                 },
               };
-              this.db.put(`credential:${record.resource.vault_id}`, id, {
+              this.db.put(Kinds.credential(record.resource.vault_id), id, {
                 ...record,
                 auth: updated,
                 resource: {
@@ -366,7 +370,7 @@ export class VaultRepository {
                   updated_at: Math.floor(Date.now() / 1000),
                 },
               });
-              this.db.remove("credential_refresh", id);
+              this.db.remove(Kinds.credentialRefresh, id);
               return updated.access_token;
             }),
           );
@@ -383,17 +387,17 @@ export class VaultRepository {
       name: input.name ?? null,
       metadata: input.metadata ?? {},
     };
-    this.db.put("vault", resource.id, { version: 1, resource });
+    this.db.put(Kinds.vault, resource.id, { version: 1, resource });
     return resource;
   }
   retrieve(id: string): Vault {
-    return this.db.require<{ version: 1; resource: Vault }>("vault", id).resource;
+    return this.db.require(Kinds.vault, id).resource;
   }
   list(parameters: z.infer<typeof vaultPageSchema>) {
     const input = parse(vaultPageSchema, parameters);
     const statuses = input.status === undefined ? ["active"] : [input.status].flat();
     // Deleted resources and their secrets are removed, so this deployment has no archived rows.
-    const page = this.db.list<{ resource: Vault }>("vault", input);
+    const page = this.db.list(Kinds.vault, input);
     return {
       ...page,
       ...(statuses.includes("active")
@@ -404,8 +408,8 @@ export class VaultRepository {
   delete(id: string) {
     return this.db.transaction(() => {
       this.retrieve(id);
-      this.db.clear(`credential:${id}`);
-      this.db.remove("vault", id);
+      this.db.clear(Kinds.credential(id));
+      this.db.remove(Kinds.vault, id);
       return { id, object: "vault.deleted" as const, deleted: true };
     });
   }
@@ -422,7 +426,7 @@ export class VaultRepository {
       updated_at: now,
       auth: publicCredentialAuth(input.auth),
     };
-    this.db.put(`credential:${vaultId}`, resource.id, {
+    this.db.put(Kinds.credential(vaultId), resource.id, {
       version: 1,
       resource,
       auth: input.auth,
@@ -431,12 +435,12 @@ export class VaultRepository {
   }
   credential(vaultId: string, id: string): Credential {
     this.retrieve(vaultId);
-    return this.db.require<CredentialRecord>(`credential:${vaultId}`, id).resource;
+    return this.db.require(Kinds.credential(vaultId), id).resource;
   }
   credentials(vaultId: string, parameters: z.infer<typeof vaultPageSchema>) {
     this.retrieve(vaultId);
     const input = parse(vaultPageSchema, parameters);
-    const page = this.db.list<CredentialRecord>(`credential:${vaultId}`, input);
+    const page = this.db.list(Kinds.credential(vaultId), input);
     const statuses = input.status === undefined ? ["active"] : [input.status].flat();
     return {
       ...page,
@@ -453,7 +457,7 @@ export class VaultRepository {
     return this.db.transaction(() => {
       this.retrieve(vaultId);
       const update = parse(rotateCredentialSchema, parameters).auth;
-      const record = this.db.require<CredentialRecord>(`credential:${vaultId}`, id);
+      const record = this.db.require(Kinds.credential(vaultId), id);
       const auth = record.auth;
       if (auth.type !== update.type)
         throw new ApiError(400, "invalid_request", "Credential authentication type cannot change");
@@ -489,17 +493,17 @@ export class VaultRepository {
       }
       record.resource.auth = publicCredentialAuth(auth);
       record.resource.updated_at = Math.floor(Date.now() / 1000);
-      this.db.put(`credential:${vaultId}`, id, record);
-      this.db.remove("credential_refresh", id);
-      this.db.remove("credential_refresh_rejected", id);
+      this.db.put(Kinds.credential(vaultId), id, record);
+      this.db.remove(Kinds.credentialRefresh, id);
+      this.db.remove(Kinds.credentialRefreshRejected, id);
       return record.resource;
     });
   }
   deleteCredential(vaultId: string, id: string) {
     this.credential(vaultId, id);
-    this.db.remove(`credential:${vaultId}`, id);
-    this.db.remove("credential_refresh", id);
-    this.db.remove("credential_refresh_rejected", id);
+    this.db.remove(Kinds.credential(vaultId), id);
+    this.db.remove(Kinds.credentialRefresh, id);
+    this.db.remove(Kinds.credentialRefreshRejected, id);
     return { id, object: "vault.credential.deleted" as const, deleted: true };
   }
 }

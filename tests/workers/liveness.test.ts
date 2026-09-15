@@ -4,6 +4,9 @@ import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
 
+import { CatalogKinds } from "../../packages/agent-api/src/catalog.js";
+import type { Kind } from "../../packages/agent-api/src/persistence/kind.js";
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import { ApiError } from "../../packages/agent-api/src/protocol.js";
 import type {
   PromiseRuntimeDriver,
@@ -11,7 +14,7 @@ import type {
   RuntimeDriver,
 } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
-import { type SessionRecord, TRANSCRIPT_LIMIT } from "../../packages/agent-api/src/session.js";
+import { TRANSCRIPT_LIMIT } from "../../packages/agent-api/src/session.js";
 import type * as WorkerModule from "./worker.js";
 import type { CatalogDO, SessionDO, TestEnv } from "./worker.js";
 
@@ -73,7 +76,7 @@ const summary = (instance: SessionDO) => ({
   status: instance.retrieve().status,
   error: instance.retrieve().error,
   turns: instance.turns({ order: "asc", limit: 10 }).data.map((turn) => turn.status),
-  commands: instance.db.list("command", { order: "asc", limit: 10 }).data.length,
+  commands: instance.db.list(SessionKinds.command, { order: "asc", limit: 10 }).data.length,
   lastEvent: instance.replay(0).at(-1)?.event.type,
 });
 afterEach(() => reset());
@@ -264,9 +267,9 @@ it.each([
         await instance.submit([message("go")], "initial");
         if (code === "request_timeout") {
           await instance.alarm();
-          const state = instance.db.require<SessionRecord>("state", "session");
+          const state = instance.db.require(SessionKinds.state, "session");
           if (state.execution)
-            instance.db.put("state", "session", {
+            instance.db.put(SessionKinds.state, "session", {
               ...state,
               execution: { ...state.execution, deadline: Date.now() - 1 },
             });
@@ -414,9 +417,15 @@ it("deleting a session purges its object and the catalog's reservation records",
   const counts = () =>
     runInDurableObject<CatalogDO, Record<string, number>>(catalog, async (instance) =>
       Object.fromEntries(
-        ["reservation", "reservation_session", "agent_key", "agent_key_index", "session"].map(
-          (kind) => [kind, instance.db.list(kind, { order: "asc", limit: 100 }).data.length],
-        ),
+        (
+          [
+            CatalogKinds.reservation,
+            CatalogKinds.reservationSession,
+            CatalogKinds.agentKey,
+            CatalogKinds.agentKeyIndex,
+            CatalogKinds.session,
+          ] as Kind<unknown>[]
+        ).map((kind) => [kind, instance.db.list(kind, { order: "asc", limit: 100 }).data.length]),
       ),
     );
   expect(await counts()).toEqual({
@@ -438,8 +447,8 @@ it("deleting a session purges its object and the catalog's reservation records",
   const purged = await runInDurableObject<SessionDO, unknown>(
     stub(session.id),
     async (instance) => ({
-      record: instance.db.get("state", "session"),
-      tombstone: instance.db.get("state", "tombstone"),
+      record: instance.db.get(SessionKinds.state, "session"),
+      tombstone: instance.db.get(SessionKinds.tombstone, "tombstone"),
       events: instance.db.events(0).length,
       alarm: await storageOf(instance).getAlarm(),
     }),
@@ -466,7 +475,7 @@ it("pages and fork transcripts stay bounded when records are large", async () =>
     stub(session.id),
     async (instance) => {
       for (let index = 0; index < 8; index++)
-        instance.db.put("item", `msg_${index}`, {
+        instance.db.put(SessionKinds.item, `msg_${index}`, {
           id: `msg_${index}`,
           type: "message",
           role: "user",

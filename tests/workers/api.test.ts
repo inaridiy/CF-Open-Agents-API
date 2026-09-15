@@ -10,6 +10,7 @@ import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
 
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
 import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
@@ -53,7 +54,7 @@ it("the official SDK creates, runs, pages and retrieves a persisted session", as
   expect((await api.beta.agents.sessions.retrieve(session.id)).status).toBe("idle");
   const persisted = await runInDurableObject<SessionDO, SessionRecord>(
     stub(session.id),
-    (instance) => instance.db.require<SessionRecord>("state", "session"),
+    (instance) => instance.db.require(SessionKinds.state, "session"),
   );
   expect(persisted.checkpoint?.native).toContain("checkpoint/");
   expect((await api.beta.agents.sessions.list()).data).toHaveLength(1);
@@ -133,7 +134,7 @@ it("never starts a missing acknowledged execution again", async () => {
     .poll(() =>
       runInDurableObject<SessionDO, string>(
         stub(session.id),
-        (instance) => instance.db.require<SessionRecord>("state", "session").phase,
+        (instance) => instance.db.require(SessionKinds.state, "session").phase,
       ),
     )
     .toBe("running");

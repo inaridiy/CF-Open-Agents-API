@@ -17,6 +17,7 @@ import type {
   EnvironmentSpec,
   environmentFilePageSchema,
 } from "./environments.js";
+import { kind } from "./persistence/kind.js";
 import { ApiError, parse } from "./protocol.js";
 import type { Checkpoint } from "./runtime.js";
 import { SqlStore } from "./storage.js";
@@ -44,6 +45,14 @@ export interface ExportedEnvironment {
   base?: NonNullable<Checkpoint["workspace"]>;
   capabilityRoots: string[];
 }
+/** Every record kind the workspace stores; two counters share the `environment_state` partition. */
+const Kinds = {
+  /** id `current`: the workspace state. */
+  state: kind<State>("environment_state"),
+  /** ids `file_version` and `applied_file_version`: the last accepted and applied upload versions. */
+  fileVersion: kind<number>("environment_state"),
+  upload: kind<Upload>("environment_upload"),
+} as const;
 function comparePaths(a: string, b: string): number {
   const left = a.split("/");
   const right = b.split("/");
@@ -57,7 +66,7 @@ function comparePaths(a: string, b: string): number {
 export class EnvironmentWorkspace implements EnvironmentDriver {
   private readonly db: SqlStore;
   private state(): State | undefined {
-    return this.db.get<State>("environment_state", "current");
+    return this.db.get(Kinds.state, "current");
   }
   private sandbox(spec: EnvironmentSpec) {
     return getSandbox(this.env.SANDBOX, spec.sessionId);
@@ -121,7 +130,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
           "This environment driver cannot inherit a workspace",
         );
       yield* attempt("environment.reserve", () =>
-        this.db.put("environment_state", "current", {
+        this.db.put(Kinds.state, "current", {
           version: 1,
           spec,
           status: "pending",
@@ -133,7 +142,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         Effect.onExit((exit) =>
           Exit.isFailure(exit)
             ? attempt("environment.fail", () =>
-                this.db.put("environment_state", "current", {
+                this.db.put(Kinds.state, "current", {
                   version: 1,
                   spec,
                   status: "failed",
@@ -160,7 +169,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       if (base)
         yield* io("environment.adopt.restore", () => this.sandbox(spec).restoreBackup(base));
       yield* attempt("environment.adopt", () =>
-        this.db.put("environment_state", "current", {
+        this.db.put(Kinds.state, "current", {
           version: 1,
           spec,
           status: "connected",
@@ -291,7 +300,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         }),
       );
       yield* attempt("environment.commit", () =>
-        this.db.put("environment_state", "current", {
+        this.db.put(Kinds.state, "current", {
           version: 1,
           spec,
           status: "connected",
@@ -438,13 +447,13 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       // lost response can then be reconciled from immutable R2 bytes after restore.
       yield* attempt("environment.upload.commit", () =>
         this.db.transaction(() => {
-          this.db.put("environment_upload", upload.id, upload);
-          this.db.put("environment_state", "file_version", version);
+          this.db.put(Kinds.upload, upload.id, upload);
+          this.db.put(Kinds.fileVersion, "file_version", version);
         }),
       );
       const applied = yield* attempt(
         "environment.upload.applied",
-        () => this.db.get<number>("environment_state", "applied_file_version") ?? 0,
+        () => this.db.get(Kinds.fileVersion, "applied_file_version") ?? 0,
       );
       yield* this.applyUploads(applied);
       return {
@@ -456,7 +465,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
     });
   }
   fileVersion(): number {
-    return this.db.get<number>("environment_state", "file_version") ?? 0;
+    return this.db.get(Kinds.fileVersion, "file_version") ?? 0;
   }
   applyUploads(afterVersion: number) {
     return Effect.gen(this, function* () {
@@ -466,7 +475,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       let after: string | undefined;
       do {
         const page = yield* attempt("environment.upload.list", () =>
-          this.db.list<Upload>("environment_upload", { order: "asc", limit: 100, after }),
+          this.db.list(Kinds.upload, { order: "asc", limit: 100, after }),
         );
         yield* Effect.forEach(
           page.data,
@@ -497,7 +506,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
                   "Environment upload write failed",
                 );
               yield* attempt("environment.upload.applied", () =>
-                this.db.put("environment_state", "applied_file_version", upload.version),
+                this.db.put(Kinds.fileVersion, "applied_file_version", upload.version),
               );
             }),
           { discard: true },
@@ -513,7 +522,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         return yield* new ApiError(404, "not_found", "Environment not found");
       const applied = yield* attempt(
         "environment.upload.applied",
-        () => this.db.get<number>("environment_state", "applied_file_version") ?? 0,
+        () => this.db.get(Kinds.fileVersion, "applied_file_version") ?? 0,
       );
       yield* this.applyUploads(applied);
       const result = yield* io("environment.files.list", () =>

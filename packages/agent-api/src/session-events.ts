@@ -1,26 +1,23 @@
-import type {
-  Subagent,
-  TokenUsage,
-  AgentOutputItem as UpstreamOutputItem,
-} from "openai/resources/beta/agents/agents";
+import type { Subagent, TokenUsage } from "openai/resources/beta/agents/agents";
 
 import { InvalidRuntimeEvent } from "./errors.js";
+import type { Kind } from "./persistence/kind.js";
+import type { RecordStore } from "./persistence/record-store.js";
+import { SessionKinds } from "./persistence/session-kinds.js";
 import type {
-  AgentSessionEvent,
-  AgentSessionItem,
-  InputEvent,
-  JsonWire,
-  Turn,
-} from "./protocol.js";
+  ActiveSession,
+  OutputItem,
+  OutputPosition,
+  SessionRecord,
+} from "./persistence/session-record.js";
+import type { SessionTx } from "./persistence/session-tx.js";
+import type { AgentSessionEvent, AgentSessionItem, InputEvent, Turn } from "./protocol.js";
 import { identifier } from "./protocol.js";
 import type { RuntimeEvent } from "./runtime.js";
-import type { ActiveSession, SessionRecord } from "./session.js";
-import type { SqlStore } from "./storage.js";
 
-type OutputItem = JsonWire<UpstreamOutputItem>;
 /** A runtime event naming state this session never created is a protocol violation, not a retry. */
-function runtimeRecord<T>(db: SqlStore, kind: string, id: string): T {
-  const value = db.get<T>(kind, id);
+function runtimeRecord<T>(store: RecordStore, kind: Kind<T>, id: string): T {
+  const value = store.get(kind, id);
   if (!value)
     throw new InvalidRuntimeEvent({
       code: "invalid_runtime_event",
@@ -29,19 +26,16 @@ function runtimeRecord<T>(db: SqlStore, kind: string, id: string): T {
   return value;
 }
 type AssistantMessage = Extract<OutputItem, { type: "message" }>;
-interface OutputPosition {
-  index: number;
-  item: OutputItem;
-}
 
 /** Called inside the SessionDO transition transaction. Emits no network I/O. */
 export function acceptRuntimeEvent(
-  db: SqlStore,
+  tx: SessionTx,
   record: ActiveSession,
   event: RuntimeEvent,
 ): ActiveSession {
+  const db = tx.store;
   if (event.type === "subagent") {
-    const previous = db.get<Subagent>("subagent", event.id);
+    const previous = db.get(SessionKinds.subagent, event.id);
     const subagent: Subagent = {
       id: event.id,
       object: "agent.session.subagent",
@@ -56,7 +50,7 @@ export function acceptRuntimeEvent(
       opened_at: previous?.opened_at ?? event.openedAt,
       closed_at: event.status === "closed" ? Math.floor(Date.now() / 1000) : null,
     };
-    db.put("subagent", event.id, subagent);
+    db.put(SessionKinds.subagent, event.id, subagent);
     if (!previous || previous.status !== subagent.status)
       db.append({
         type: !previous
@@ -70,8 +64,8 @@ export function acceptRuntimeEvent(
     return record;
   }
   if (event.type === "subagent_turn") {
-    runtimeRecord<Subagent>(db, "subagent", event.subagentId);
-    const previous = db.get<Turn>("turn", event.id);
+    runtimeRecord(db, SessionKinds.subagent, event.subagentId);
+    const previous = tx.turn(event.id);
     const turn: Turn = {
       id: event.id,
       object: "agent.session.turn",
@@ -88,12 +82,11 @@ export function acceptRuntimeEvent(
     if (event.status === "completed") {
       // Child history belongs to the root checkpoint. Publish completion only
       // after that checkpoint commits, even when Codex finished the child early.
-      db.put("pending_subagent_turn", turn.id, turn);
-      if (!previous)
-        db.put("turn", turn.id, { ...turn, status: "in_progress", completed_at: null });
+      db.put(SessionKinds.pendingSubagentTurn, turn.id, turn);
+      if (!previous) tx.putTurn({ ...turn, status: "in_progress", completed_at: null });
       return record;
     }
-    db.put("turn", turn.id, turn);
+    tx.putTurn(turn);
     const context = {
       event_id: identifier("evt"),
       session_id: record.session.id,
@@ -109,7 +102,7 @@ export function acceptRuntimeEvent(
         type: "agent.session.turn.in_progress",
       } satisfies AgentSessionEvent);
     else if (event.status !== "waiting") {
-      finishOutputItems(db, record, turn.id, `subagent_item:${event.subagentId}`);
+      finishOutputItems(tx, record, turn.id, SessionKinds.subagentItem(event.subagentId));
       db.append({
         ...context,
         event_id: identifier("evt"),
@@ -121,7 +114,7 @@ export function acceptRuntimeEvent(
   }
   const turnId = event.turnId ?? record.execution.turnId;
   if (event.type === "usage") {
-    const turn = runtimeRecord<Turn>(db, "turn", turnId);
+    const turn = runtimeRecord(db, SessionKinds.turn, turnId);
     const previous = turn.usage;
     const total = record.session.usage;
     const add = (current: number | undefined, next: number, old: number | undefined) =>
@@ -145,27 +138,30 @@ export function acceptRuntimeEvent(
         ),
       },
     };
-    db.put("turn", turnId, { ...turn, usage: event.usage });
-    const pending = db.get<Turn>("pending_subagent_turn", turnId);
-    if (pending) db.put("pending_subagent_turn", turnId, { ...pending, usage: event.usage });
+    tx.putTurn({ ...turn, usage: event.usage });
+    const pending = db.get(SessionKinds.pendingSubagentTurn, turnId);
+    if (pending)
+      db.put(SessionKinds.pendingSubagentTurn, turnId, { ...pending, usage: event.usage });
     return { ...record, session: { ...record.session, usage } };
   }
-  const itemKind = event.subagentId ? `subagent_item:${event.subagentId}` : "item";
+  const itemKind = event.subagentId
+    ? SessionKinds.subagentItem(event.subagentId)
+    : SessionKinds.item;
   const context = { session_id: record.session.id, turn_id: turnId };
   const emit = (event: AgentSessionEvent) => {
     db.append(event);
   };
-  const previous = db.get<OutputPosition>("output", `${turnId}:${event.id}`);
+  const previous = db.get(SessionKinds.output, `${turnId}:${event.id}`);
   const itemId =
     previous?.item.id ??
     identifier(event.type === "text" || event.type === "delta" ? "msg" : "item");
-  const index = previous?.index ?? db.get<number>("output_count", turnId) ?? 0;
+  const index = previous?.index ?? db.get(SessionKinds.outputCount, turnId) ?? 0;
   const save = (item: OutputItem) => {
     db.put(itemKind, item.id, item);
-    db.put("output", `${turnId}:${event.id}`, { index, item } satisfies OutputPosition);
+    db.put(SessionKinds.output, `${turnId}:${event.id}`, { index, item } satisfies OutputPosition);
   };
   const added = (item: OutputItem) => {
-    db.put("output_count", turnId, index + 1);
+    db.put(SessionKinds.outputCount, turnId, index + 1);
     emit({
       ...context,
       event_id: identifier("evt"),
@@ -517,9 +513,9 @@ export function acceptRuntimeEvent(
       ...record,
       session: { ...record.session, required_actions, status: "requires_action" },
     };
-    const turn = runtimeRecord<Turn>(db, "turn", turnId);
+    const turn = runtimeRecord(db, SessionKinds.turn, turnId);
     turn.status = "waiting";
-    db.put("turn", turnId, turn);
+    tx.putTurn(turn);
     emit({
       type: "agent.session.requires_action",
       event_id: identifier("evt"),
@@ -531,7 +527,7 @@ export function acceptRuntimeEvent(
 }
 
 export function recordToolResult(
-  db: SqlStore,
+  tx: SessionTx,
   record: SessionRecord,
   event: Extract<InputEvent, { type: "agent.session.input.tool_result" }>,
 ): void {
@@ -544,13 +540,13 @@ export function recordToolResult(
     output: event.output ?? null,
     error: event.error ?? null,
   };
-  const turn = db.require<Turn>("turn", event.turn_id);
-  db.put(
-    turn.subagent_id ? `subagent_item:${turn.subagent_id}` : "item",
+  const turn = tx.requireTurn(event.turn_id);
+  tx.store.put(
+    turn.subagent_id ? SessionKinds.subagentItem(turn.subagent_id) : SessionKinds.item,
     item.id ?? identifier("output"),
     item,
   );
-  db.append({
+  tx.emit({
     type: "agent.session.turn.item.added",
     event_id: identifier("evt"),
     session_id: record.session.id,
@@ -562,15 +558,16 @@ export function recordToolResult(
 
 /** Close partial streamed output before publishing a terminal turn, including cancellation. */
 export function finishOutputItems(
-  db: SqlStore,
+  tx: SessionTx,
   record: ActiveSession,
   turnId: string,
-  itemKind: string,
+  itemKind: Kind<AgentSessionItem>,
 ): void {
+  const db = tx.store;
   let after: string | undefined;
   do {
-    const page = db.list<OutputPosition>(
-      "output",
+    const page = db.list(
+      SessionKinds.output,
       { order: "asc", limit: 100, after },
       { field: "item.turn_id", value: turnId },
     );
@@ -579,7 +576,7 @@ export function finishOutputItems(
       item.status = "incomplete";
       db.put(itemKind, item.id, item);
       const key = db.outputKey(item.id);
-      if (key) db.put("output", key, { index, item } satisfies OutputPosition);
+      if (key) db.put(SessionKinds.output, key, { index, item } satisfies OutputPosition);
       const context = {
         session_id: record.session.id,
         turn_id: turnId,

@@ -10,24 +10,16 @@ import {
   sql,
 } from "kysely";
 
-import { InvalidCursor, RecordTooLarge } from "./errors.js";
-import type { PageQuery } from "./protocol.js";
+import { InvalidCursor } from "./errors.js";
+import type { Kind } from "./persistence/kind.js";
+import type { ListFilter, Page, RecordStore, Transactional } from "./persistence/record-store.js";
+import { encodeRow } from "./persistence/row.js";
+import type { AgentSessionEvent, PageQuery } from "./protocol.js";
 import { ApiError } from "./protocol.js";
 
-// Leave space for SQLite's row metadata below the platform's 2 MB row limit.
-const MAX_ROW_BYTES = 1_900_000;
 // A page stops growing past this many serialized characters, so a response stays
 // far below the isolate's memory limit even when every record is at the row limit.
 const MAX_PAGE_CHARS = 4 * 1024 * 1024;
-function encodeRow(value: unknown, ...keys: string[]): string {
-  const serialized = JSON.stringify(value);
-  const encoder = new TextEncoder();
-  const size =
-    encoder.encode(serialized).byteLength +
-    keys.reduce((total, key) => total + encoder.encode(key).byteLength, 0);
-  if (size > MAX_ROW_BYTES) throw new RecordTooLarge({ bytes: size });
-  return serialized;
-}
 
 interface Database {
   records: { kind: string; id: string; seq: number; value: string };
@@ -38,8 +30,10 @@ interface Database {
  * Kysely builds and types every query. Execution stays synchronous so a complete
  * state transition can use DO transactionSync, including rollback on a guard.
  * Kysely's async transaction() cannot express that platform contract.
+ *
+ * The one durable `RecordStore`: the inside of the persistence seam, free of Effect.
  */
-export class SqlStore {
+export class SqlStore implements RecordStore, Transactional {
   readonly queries: Kysely<Database>;
   constructor(readonly storage: DurableObjectStorage) {
     this.queries = new Kysely<Database>({
@@ -96,7 +90,7 @@ export class SqlStore {
   private execute<Row>(query: Compilable<Row>): Row[] {
     return [...this.cursor(query)];
   }
-  get<T>(kind: string, id: string): T | undefined {
+  get<A>(kind: Kind<A>, id: string): A | undefined {
     const row = this.execute(
       this.queries
         .selectFrom("records")
@@ -104,17 +98,17 @@ export class SqlStore {
         .where("kind", "=", kind)
         .where("id", "=", id),
     )[0];
-    return row ? (JSON.parse(row.value) as T) : undefined;
+    return row ? (JSON.parse(row.value) as A) : undefined;
   }
-  require<T>(kind: string, id: string): T {
-    const value = this.get<T>(kind, id);
+  require<A>(kind: Kind<A>, id: string): A {
+    const value = this.get(kind, id);
     if (!value) throw new ApiError(404, "not_found", `${kind} not found`);
     return value;
   }
-  put(
-    kind: string,
+  put<A>(
+    kind: Kind<A>,
     id: string,
-    value: unknown,
+    value: NoInfer<A>,
     seq = (this.execute(
       this.queries.selectFrom("records").select("seq").orderBy("seq", "desc").limit(1),
     )[0]?.seq ?? 0) + 1,
@@ -127,10 +121,10 @@ export class SqlStore {
         .onConflict((c) => c.columns(["kind", "id"]).doUpdateSet({ value: encoded })),
     );
   }
-  remove(kind: string, id: string): void {
+  remove(kind: Kind<unknown>, id: string): void {
     this.execute(this.queries.deleteFrom("records").where("kind", "=", kind).where("id", "=", id));
   }
-  clear(kind: string): void {
+  clear(kind: Kind<unknown>): void {
     this.execute(this.queries.deleteFrom("records").where("kind", "=", kind));
   }
   /** Resolve the native position key when a streamed public item is finalized. */
@@ -144,21 +138,7 @@ export class SqlStore {
         .limit(1),
     )[0]?.id;
   }
-  list<T>(
-    kind: string,
-    query: PageQuery,
-    filter?: {
-      field?: "agent_id" | "environment_id" | "turn_id" | "item.turn_id" | "resource.purpose";
-      value?: string;
-      expiresAfter?: number;
-    },
-  ): {
-    object: "list";
-    data: T[];
-    has_more: boolean;
-    first_id: string | null;
-    last_id: string | null;
-  } {
+  list<A>(kind: Kind<A>, query: PageQuery, filter?: ListFilter): Page<A> {
     let selection = this.queries
       .selectFrom("records")
       .select(["id", "value"])
@@ -224,23 +204,23 @@ export class SqlStore {
     }
     return {
       object: "list",
-      data: visible.map((row) => JSON.parse(row.value) as T),
+      data: visible.map((row) => JSON.parse(row.value) as A),
       has_more,
       first_id: visible[0]?.id ?? null,
       last_id: visible.at(-1)?.id ?? null,
     };
   }
-  append(value: unknown): number {
+  append(event: AgentSessionEvent): number {
     const row = this.execute(
       this.queries
         .insertInto("events")
-        .values({ value: encodeRow(value) })
+        .values({ value: encodeRow(event) })
         .returning("seq"),
     )[0];
     if (!row) throw new Error("SQLite did not return the event sequence");
     return row.seq;
   }
-  events<T>(after: number, limit = 100): { seq: number; event: T }[] {
+  events(after: number, limit = 100): { seq: number; event: AgentSessionEvent }[] {
     return this.execute(
       this.queries
         .selectFrom("events")
@@ -248,7 +228,7 @@ export class SqlStore {
         .where("seq", ">", after)
         .orderBy("seq", "asc")
         .limit(limit),
-    ).map((row) => ({ seq: row.seq, event: JSON.parse(row.value) as T }));
+    ).map((row) => ({ seq: row.seq, event: JSON.parse(row.value) as AgentSessionEvent }));
   }
   /** Remove every record and event. The schema stays, so the object remains usable. */
   purge(): void {
@@ -267,5 +247,8 @@ export class SqlStore {
       (T extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown),
   ): T {
     return this.storage.transactionSync(callback);
+  }
+  transactionSync<T>(closure: () => T): T {
+    return this.storage.transactionSync(closure);
   }
 }

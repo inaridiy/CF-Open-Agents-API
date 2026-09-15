@@ -31,10 +31,10 @@ import {
   TurnCheckpointing,
   UnknownToolCall,
 } from "../../packages/agent-api/src/errors.js";
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import { ApiError, remoteApiError } from "../../packages/agent-api/src/protocol.js";
 import type { Execution } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
-import type { SessionRecord } from "../../packages/agent-api/src/session.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
@@ -107,7 +107,7 @@ it("overlapping alarms share reconciliation while new input stays independently 
         controls,
         accepted,
         status: instance.retrieve().status,
-        commands: instance.db.list("command", { order: "asc", limit: 100 }).data,
+        commands: instance.db.list(SessionKinds.command, { order: "asc", limit: 100 }).data,
       };
     },
   );
@@ -166,7 +166,7 @@ it("a noncontiguous runtime batch rolls back every event and fails the turn at o
       await instance.alarm();
       const turn = instance.turns({ order: "asc", limit: 1 }).data[0];
       return {
-        cursor: instance.db.require<SessionRecord>("state", "session").cursor,
+        cursor: instance.db.require(SessionKinds.state, "session").cursor,
         outputs: instance
           .items({ order: "asc", limit: 100 })
           .data.filter((item) => item.type === "message" && item.role === "assistant"),

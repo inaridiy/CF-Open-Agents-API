@@ -4,6 +4,7 @@ import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
 
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type { RuntimeDriver } from "../../packages/agent-api/src/runtime.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
@@ -45,18 +46,18 @@ it("migrates the legacy nullable subagent limit after eviction without losing in
   const session = await api.beta.agents.sessions.create(params);
   await stub(session.id).submit([message("preserved legacy input")], "legacy");
   await runInDurableObject<SessionDO, void>(stub(session.id), async (instance) => {
-    const record = instance.db.require<SessionRecord>("state", "session");
+    const record = instance.db.require(SessionKinds.state, "session");
     const legacy = JSON.parse(JSON.stringify(record));
     delete legacy.schemaVersion;
     legacy.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
     legacy.execution.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
-    instance.db.put("state", "session", legacy);
+    instance.db.put(SessionKinds.state, "session", legacy);
   });
   await abortAllDurableObjects();
   expect((await api.beta.agents.sessions.retrieve(session.id)).id).toBe(session.id);
   const restored = await runInDurableObject<SessionDO, SessionRecord>(
     stub(session.id),
-    async (instance) => instance.db.require<SessionRecord>("state", "session"),
+    async (instance) => instance.db.require(SessionKinds.state, "session"),
   );
   expect(restored.schemaVersion).toBe(2);
   expect(restored.agent.multi_agent).toEqual({ enabled: false });
@@ -117,7 +118,7 @@ it("accepted steering is not lost when a poll finishes concurrently", async () =
         status: instance.retrieve().status,
         commands,
         inputs: instance.items({ order: "asc", limit: 100 }).data,
-        pending: instance.db.list("command", { order: "asc", limit: 100 }).data,
+        pending: instance.db.list(SessionKinds.command, { order: "asc", limit: 100 }).data,
       };
     },
   );
@@ -153,7 +154,7 @@ it("checkpoint recovery does not require a surviving container", async () => {
       });
       await instance.submit([message("initial")], "first");
       await instance.alarm();
-      const firstPhase = instance.db.require<SessionRecord>("state", "session").phase;
+      const firstPhase = instance.db.require(SessionKinds.state, "session").phase;
       await instance.alarm();
       return {
         firstPhase,
@@ -413,7 +414,7 @@ it("oversized UTF-8 state rolls back the complete input transaction", async () =
         status: instance.retrieve().status,
         turns: instance.turns({ order: "asc", limit: 100 }).data,
         items: instance.items({ order: "asc", limit: 100 }).data,
-        idempotency: instance.db.get("idempotency", "oversized-unicode") ?? null,
+        idempotency: instance.db.get(SessionKinds.idempotency, "oversized-unicode") ?? null,
       };
     },
   );
@@ -529,12 +530,10 @@ it.each([
 it("direct deletion migrates legacy records and remains idempotent after eviction", async () => {
   const session = await api.beta.agents.sessions.create(params);
   await runInDurableObject<SessionDO, void>(stub(session.id), (instance) => {
-    const legacy = JSON.parse(
-      JSON.stringify(instance.db.require<SessionRecord>("state", "session")),
-    );
+    const legacy = JSON.parse(JSON.stringify(instance.db.require(SessionKinds.state, "session")));
     delete legacy.schemaVersion;
     legacy.agent.multi_agent = { enabled: false, max_concurrent_subagents: null };
-    instance.db.put("state", "session", legacy);
+    instance.db.put(SessionKinds.state, "session", legacy);
   });
   await abortAllDurableObjects();
   expect(await stub(session.id).delete()).toMatchObject({ deleted: true });
