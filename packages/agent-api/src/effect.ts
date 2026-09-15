@@ -1,7 +1,7 @@
 import { Cause, Data, Effect, Exit, FiberId, Runtime, Schema } from "effect";
 
-import { type DomainError, isDomainError } from "./errors.js";
-import { ApiError, remoteApiError } from "./protocol.js";
+import { ApiError, remoteApiError } from "./api-error.js";
+import { type DomainError, InvalidRequest, isDomainError } from "./errors.js";
 
 /** An I/O failure has an operation and a cause; it is never permission to replay a write. */
 export class OperationError extends Data.TaggedError("OperationError")<{
@@ -13,6 +13,11 @@ export class OperationError extends Data.TaggedError("OperationError")<{
   }
 }
 
+/**
+ * What an Effect program may fail with: a tagged domain failure, an `OperationError`
+ * from an I/O boundary, or an `ApiError` recovered from the wire name a definite
+ * failure carried across an un-enveloped RPC hop.
+ */
 export type ServiceError = ApiError | OperationError | DomainError;
 /** A typed failure keeps its tag; an RPC wire name becomes an ApiError; the rest is opaque. */
 const failure = (operation: string, cause: unknown): ServiceError =>
@@ -66,7 +71,7 @@ export function runSync<A, E>(effect: Effect.Effect<A, E>, operation = "runSync"
 /** Strict decoding at untrusted HTTP, RPC and persistence boundaries. */
 export const decodeEffect = <A, I>(schema: Schema.Schema<A, I>, input: unknown) =>
   Schema.decodeUnknown(schema, { onExcessProperty: "error" })(input).pipe(
-    Effect.mapError((error) => new ApiError(400, "invalid_request", error.message)),
+    Effect.mapError((error) => new InvalidRequest({ issues: error.message })),
   );
 export const decode = <A, I>(schema: Schema.Schema<A, I>, input: unknown): A =>
   runSync(decodeEffect(schema, input), "decode");

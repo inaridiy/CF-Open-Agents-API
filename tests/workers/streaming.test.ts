@@ -50,13 +50,13 @@ it("a cancelled stream returns its listener permit", async () => {
       const again = instance.stream();
       for (const response of [again, ...responses.slice(1)]) await response.body?.cancel();
       return {
-        limited: (limited as { code?: string } | undefined)?.code,
+        limited: (limited as { _tag?: string } | undefined)?._tag,
         cancelMs,
         again: again.status,
       };
     },
   );
-  expect(result).toMatchObject({ limited: "stream_limit", again: 200 });
+  expect(result).toMatchObject({ limited: "StreamLimitExceeded", again: 200 });
   expect((result as { cancelMs: number }).cancelMs).toBeLessThan(1_000);
 });
 

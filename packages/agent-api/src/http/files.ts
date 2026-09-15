@@ -1,8 +1,9 @@
 import { z } from "zod";
 
 import { runPromise } from "../effect.js";
+import { StoredObjectMissing } from "../errors.js";
 import { uploadInputFile } from "../files.js";
-import { ApiError, pageSchema, parse } from "../protocol.js";
+import { pageSchema, parse } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
 import { objects, type RouteApp } from "./context.js";
 
@@ -27,7 +28,7 @@ export function registerFileRoutes<Env>(app: RouteApp<Env>, options: ServiceOpti
   app.get("/v1/files/:id/content", async (c) => {
     const record = await c.env.catalog(c.get("tenant")).file(c.req.param("id"));
     const object = await objects(options, c.env).get(record.key);
-    if (!object) throw new ApiError(404, "not_found", "File content not found");
+    if (!object) throw new StoredObjectMissing({ object: "file_content" });
     return new Response(object.body, {
       headers: {
         "content-type": "application/octet-stream",

@@ -2,14 +2,13 @@ import { crc32, inflateRawSync } from "node:zlib";
 
 import { z } from "zod";
 
-import { ApiError } from "./protocol.js";
+import { SkillInvalid, SkillTooLarge } from "./errors.js";
 
 export interface SkillZipEntry {
   bytes: Uint8Array;
   executable: boolean;
 }
-const invalid = () =>
-  new ApiError(400, "invalid_skill", "Invalid or unsupported skill ZIP archive");
+const invalid = () => new SkillInvalid({ reason: "Invalid or unsupported skill ZIP archive" });
 const inflated = z.object({
   buffer: z.instanceof(Uint8Array),
   engine: z.object({ bytesWritten: z.number() }),
@@ -80,7 +79,7 @@ export function readSkillZip(data: Uint8Array, limit: number): Map<string, Skill
         throw invalid();
       names.add(path);
       size += expanded;
-      if (size > limit) throw new ApiError(413, "skill_too_large", "Expanded skill exceeds 32 MiB");
+      if (size > limit) throw new SkillTooLarge({ limit: "expanded" });
       if (
         local + 30 > central ||
         u32(local) !== 0x04034b50 ||
@@ -126,7 +125,7 @@ export function readSkillZip(data: Uint8Array, limit: number): Map<string, Skill
     }
     return entries;
   } catch (error) {
-    if (error instanceof ApiError) throw error;
+    if (error instanceof SkillInvalid || error instanceof SkillTooLarge) throw error;
     throw invalid();
   }
 }

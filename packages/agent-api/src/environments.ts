@@ -5,8 +5,8 @@ import { z } from "zod";
 
 import type { ServiceError } from "./effect.js";
 import type { EnvironmentFileInput, HostedConfiguration } from "./environment-config.js";
+import { NetworkPolicyBroadened } from "./errors.js";
 import type { ResolvedInputFile } from "./files.js";
-import { ApiError } from "./protocol.js";
 import type { ResolvedSkill } from "./skills.js";
 
 export interface EnvironmentSpec {
@@ -60,11 +60,7 @@ export function mergeEnvironment(
       (base.access === "disabled" && next.access !== "disabled") ||
       next.access === "enabled"
     )
-      throw new ApiError(
-        400,
-        "network_policy_broadened",
-        "Session cannot broaden its template network policy",
-      );
+      throw new NetworkPolicyBroadened({ rule: "access" });
     if (base.access === "restricted" && next.access === "restricted") {
       const allowed = base.allowed_domains ?? [];
       for (const domain of next.allowed_domains ?? []) {
@@ -74,11 +70,7 @@ export function mergeEnvironment(
               entry === domain || (entry.startsWith("*.") && domain.endsWith(entry.slice(1))),
           )
         )
-          throw new ApiError(
-            400,
-            "network_policy_broadened",
-            "Session domains must be allowed by its template",
-          );
+          throw new NetworkPolicyBroadened({ rule: "domains" });
       }
     }
   }

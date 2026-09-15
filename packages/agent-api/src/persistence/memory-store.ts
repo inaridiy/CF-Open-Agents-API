@@ -1,6 +1,5 @@
-import { InvalidCursor } from "../errors.js";
+import { InvalidCursor, RecordNotFound } from "../errors.js";
 import type { AgentSessionEvent, PageQuery } from "../protocol.js";
-import { ApiError } from "../protocol.js";
 import type { Kind } from "./kind.js";
 import type { ListFilter, Page, RecordStore, Transactional } from "./record-store.js";
 import { encodeRow } from "./row.js";
@@ -44,7 +43,7 @@ export class MemoryStore implements RecordStore, Transactional {
   }
   require<A>(kind: Kind<A>, id: string): A {
     const value = this.get(kind, id);
-    if (!value) throw new ApiError(404, "not_found", `${kind} not found`);
+    if (!value) throw new RecordNotFound({ kind, id });
     return value;
   }
   put<A>(kind: Kind<A>, id: string, value: NoInfer<A>, seq = this.sequence + 1): void {

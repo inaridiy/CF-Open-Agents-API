@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 
 import { io } from "./effect.js";
-import { ApiError } from "./protocol.js";
+import { UpstreamRedirect } from "./errors.js";
 
 /** Workers supports manual redirects. Never forward configured credentials to a redirect target. */
 export function requestWithoutRedirect(
@@ -20,11 +20,7 @@ export function requestWithoutRedirect(
     );
     if (response.status >= 300 && response.status < 400) {
       yield* io(`${operation}.discard`, () => response.body?.cancel() ?? Promise.resolve());
-      return yield* new ApiError(
-        503,
-        "upstream_redirect",
-        "Configured upstream returned a redirect",
-      );
+      return yield* new UpstreamRedirect({ operation });
     }
     return response;
   });

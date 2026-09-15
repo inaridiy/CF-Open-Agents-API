@@ -10,6 +10,7 @@ import {
 import { Context, Effect, Layer } from "effect";
 
 import { attempt, io, runPromise, type ServiceError } from "./effect.js";
+import { ModelNotFound, ModelProtocolMismatch, projectApiError } from "./errors.js";
 import { requestWithoutRedirect } from "./http.js";
 import { readModelBodyEffect } from "./models/body.js";
 import {
@@ -19,7 +20,6 @@ import {
   type ReasoningEffort,
 } from "./models/input.js";
 import { encodeModelResponse, type ModelChunk } from "./models/output.js";
-import { ApiError } from "./protocol.js";
 
 /** A single model request. The native harness owns the agent loop and its tools. */
 export interface ModelAdapter {
@@ -263,11 +263,7 @@ export function nativeModel(options: {
     Effect.gen(function* () {
       const path = new URL(request.url).pathname.replace(/^\/v1/, "");
       if (path !== paths[options.protocol])
-        return yield* new ApiError(
-          400,
-          "model_protocol_mismatch",
-          "Model preset does not support this harness protocol",
-        );
+        return yield* new ModelProtocolMismatch({ protocol: options.protocol });
       const body = yield* io("model.body", () => request.json<Record<string, unknown>>());
       const headers = new Headers({ "content-type": "application/json" });
       if (options.protocol === "anthropic") {
@@ -292,6 +288,23 @@ export function nativeModel(options: {
   );
 }
 
+/** The gateway's own envelope: the projected status and message of a definite failure. */
+function gatewayFailure(error: ServiceError): Response {
+  const definite =
+    error._tag !== "OperationError" &&
+    error._tag !== "TransportFailure" &&
+    error._tag !== "StorageFailure";
+  const known = definite ? projectApiError(error) : undefined;
+  return Response.json(
+    {
+      error: {
+        type: "model_gateway_error",
+        message: known ? known.message : "Invalid or unsupported model request",
+      },
+    },
+    { status: known ? known.status : 400 },
+  );
+}
 /** A registered model: an adapter, or a factory called only when that name is selected. */
 export type ModelRegistration = ModelAdapter | (() => ModelAdapter);
 class Models extends Context.Tag("agent-api/Models")<
@@ -321,21 +334,12 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
           );
           const registry = yield* Models;
           if (!body || typeof body.model !== "string" || !Object.hasOwn(registry, body.model))
-            return yield* new ApiError(
-              404,
-              "model_not_found",
-              "No model is registered with this name",
-            );
+            return yield* new ModelNotFound({ model: String(body?.model) });
           const registration = registry[body.model];
           const adapter = registration
             ? yield* attempt("model.registration", () => resolveModel(registration))
             : undefined;
-          if (!adapter)
-            return yield* new ApiError(
-              404,
-              "model_not_found",
-              "No model is registered with this name",
-            );
+          if (!adapter) return yield* new ModelNotFound({ model: body.model });
           return yield* io("model.inference", (signal) =>
             adapter.fetch(
               new Request(request, {
@@ -346,22 +350,8 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
           );
         }).pipe(
           Effect.provide(Layer.sync(Models, () => models(env))),
-          Effect.catchAll((error) =>
-            Effect.succeed(
-              Response.json(
-                {
-                  error: {
-                    type: "model_gateway_error",
-                    message:
-                      error instanceof ApiError
-                        ? error.message
-                        : "Invalid or unsupported model request",
-                  },
-                },
-                { status: error instanceof ApiError ? error.status : 400 },
-              ),
-            ),
-          ),
+          // A definite failure answers with its projection; an I/O failure stays a 400.
+          Effect.catchAll((error) => Effect.succeed(gatewayFailure(error))),
         ),
       ),
   };

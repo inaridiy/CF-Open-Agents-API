@@ -1,5 +1,5 @@
+import { SkillInvalid, StoredObjectMissing } from "../errors.js";
 import { identifier, pageSchema, parse } from "../protocol.js";
-import { ApiError } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
 import { readSkillUpload } from "../skills.js";
 import { jsonBody, objects, type RouteApp, type WorkerAccess } from "./context.js";
@@ -17,7 +17,7 @@ export function registerSkillRoutes<Env>(app: RouteApp<Env>, options: ServiceOpt
     try {
       form = await request.formData();
     } catch {
-      throw new ApiError(400, "invalid_skill", "Provide multipart skill files or a ZIP archive");
+      throw new SkillInvalid({ reason: "Provide multipart skill files or a ZIP archive" });
     }
     const { bundle, makeDefault, ...metadata } = await readSkillUpload(form);
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bundle)), (byte) =>
@@ -46,7 +46,7 @@ export function registerSkillRoutes<Env>(app: RouteApp<Env>, options: ServiceOpt
   ) => {
     const version = await worker.catalog(tenant).skillVersion(id, selector);
     const object = await objects(options, worker).get(version.key);
-    if (!object) throw new ApiError(404, "not_found", "Skill content not found");
+    if (!object) throw new StoredObjectMissing({ object: "skill_content" });
     return new Response(object.body, {
       headers: {
         "content-type": "application/zip",

@@ -1,7 +1,7 @@
 import { z } from "zod";
 
+import { StoredObjectMissing } from "../errors.js";
 import {
-  ApiError,
   createSessionSchema,
   eventsSchema,
   forkSessionSchema,
@@ -162,7 +162,7 @@ export function registerSessionRoutes<Env>(app: RouteApp<Env>, options: ServiceO
       await c.env.session(c.get("tenant"), c.req.param("id"))
     ).artifact(c.req.param("artifact"));
     const object = await options.objects?.(c.env.env).get(artifact.key);
-    if (!object) throw new ApiError(404, "not_found", "Artifact content not found");
+    if (!object) throw new StoredObjectMissing({ object: "artifact_content" });
     return new Response(object.body, {
       headers: {
         "content-type": "application/octet-stream",

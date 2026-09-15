@@ -1,14 +1,14 @@
 import { Effect } from "effect";
 
 import { io, runPromise } from "../effect.js";
-import { ApiError } from "../protocol.js";
+import { ModelInputMissing, ModelInputTooLarge } from "../errors.js";
 
 /** Bound the stream before parsing or cloning it across a Service Binding. */
 export const readModelBodyEffect = (request: Request) =>
   Effect.scoped(
     Effect.gen(function* () {
       const body = request.body;
-      if (!body) return yield* new ApiError(400, "missing_model_input", "Model input is required");
+      if (!body) return yield* new ModelInputMissing();
       const reader = yield* Effect.acquireRelease(
         Effect.sync(() => body.getReader()),
         (acquired) =>
@@ -27,8 +27,7 @@ export const readModelBodyEffect = (request: Request) =>
         if (next.done) break;
         const value = next.value as Uint8Array;
         size += value.byteLength;
-        if (size > 4 * 1024 * 1024)
-          return yield* new ApiError(413, "model_input_too_large", "Model input exceeds 4 MiB");
+        if (size > 4 * 1024 * 1024) return yield* new ModelInputTooLarge();
         chunks.push(value);
       }
       const bytes = new Uint8Array(size);

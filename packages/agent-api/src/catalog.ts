@@ -11,11 +11,11 @@ import {
   templateSchema,
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
-import { encodeRpc, IdempotencyConflict, rpcEnvelope } from "./errors.js";
+import { encodeRpc, FileExpired, IdempotencyConflict, rpcEnvelope } from "./errors.js";
 import type { StoredInputFile } from "./files.js";
 import { kind } from "./persistence/kind.js";
 import type { Agent, PageQuery } from "./protocol.js";
-import { ApiError, canonicalJSON, identifier, parse, savedAgentSchema } from "./protocol.js";
+import { canonicalJSON, identifier, parse, savedAgentSchema } from "./protocol.js";
 import type { SessionRecord } from "./session.js";
 import { SkillRepository } from "./skills.js";
 import { SqlStore } from "./storage.js";
@@ -91,7 +91,7 @@ export class CatalogObject extends DurableObject {
   file(id: string): StoredInputFile {
     const record = this.db.require(CatalogKinds.inputFile, id);
     if (record.resource.expires_at !== undefined && record.resource.expires_at <= Date.now() / 1000)
-      throw new ApiError(404, "not_found", "File not found");
+      throw new FileExpired({ id });
     return record;
   }
   deleteFile(id: string): void {

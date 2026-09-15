@@ -17,8 +17,22 @@ import type {
   EnvironmentSpec,
   environmentFilePageSchema,
 } from "./environments.js";
+import {
+  CapabilityBudgetExceeded,
+  CapabilityUnsupported,
+  EnvironmentConflict,
+  EnvironmentListFailed,
+  EnvironmentNotFound,
+  EnvironmentNotReady,
+  EnvironmentSetupFailed,
+  EnvironmentSetupIndeterminate,
+  EnvironmentWriteFailed,
+  FileTooLarge,
+  InvalidCursor,
+  StoredObjectMissing,
+} from "./errors.js";
 import { kind } from "./persistence/kind.js";
-import { ApiError, parse } from "./protocol.js";
+import { parseEffect } from "./protocol.js";
 import type { Checkpoint } from "./runtime.js";
 import { SqlStore } from "./storage.js";
 
@@ -76,12 +90,9 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const stored = yield* io("environment.configuration.get", () =>
         this.env.CHECKPOINTS.get(spec.configuration),
       );
-      if (!stored)
-        return yield* new ApiError(404, "not_found", "Environment configuration not found");
+      if (!stored) return yield* new StoredObjectMissing({ object: "environment_configuration" });
       const value = yield* io("environment.configuration.body", () => stored.json());
-      return yield* attempt("environment.configuration.decode", () =>
-        parse(hostedConfigurationSchema, value),
-      );
+      return yield* parseEffect(hostedConfigurationSchema, value);
     });
   }
   constructor(
@@ -99,7 +110,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
   exported(environmentId: string): ExportedEnvironment {
     const state = this.state();
     if (state?.spec.id !== environmentId || state.status !== "connected")
-      throw new ApiError(409, "environment_not_ready", "Source environment is not connected");
+      throw new EnvironmentNotReady({ reason: "source" });
     return {
       ...(state.base ? { base: state.base } : {}),
       capabilityRoots: state.capabilityRoots ?? [],
@@ -110,25 +121,13 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const previous = yield* attempt("environment.state", () => this.state());
       if (previous) {
         if (previous.spec.id !== spec.id)
-          return yield* new ApiError(
-            409,
-            "environment_conflict",
-            "Harness already owns another environment",
-          );
+          return yield* new EnvironmentConflict({ environmentId: previous.spec.id });
         if (previous.status === "connected") return;
-        return yield* new ApiError(
-          409,
-          "outcome_unknown",
-          "Environment setup did not complete; create a new session",
-        );
+        return yield* new EnvironmentSetupIndeterminate();
       }
       const inherited = spec.inherited;
       if (inherited && !this.exportFrom)
-        return yield* new ApiError(
-          422,
-          "unsupported_capability",
-          "This environment driver cannot inherit a workspace",
-        );
+        return yield* new CapabilityUnsupported({ capability: "workspace_inheritance" });
       yield* attempt("environment.reserve", () =>
         this.db.put(Kinds.state, "current", {
           version: 1,
@@ -217,7 +216,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         const head = yield* io("environment.skill.head", () =>
           this.env.CHECKPOINTS.head(skill.key),
         );
-        if (!head) return yield* new ApiError(404, "not_found", "Pinned skill bundle not found");
+        if (!head) return yield* new StoredObjectMissing({ object: "skill_bundle" });
         capabilities.push({
           kind: "skill",
           name: skill.name,
@@ -229,11 +228,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       if (
         capabilities.reduce((sum, capability) => sum + capability.size, 0) > CAPABILITY_BYTES_LIMIT
       )
-        return yield* new ApiError(
-          413,
-          "capability_limit",
-          "Skills and plugins exceed 64 MiB per environment",
-        );
+        return yield* new CapabilityBudgetExceeded();
       const installed = yield* Effect.forEach(capabilities, (capability, index) =>
         Effect.gen(this, function* () {
           const archive = `/tmp/cf-capability-${index}.zip`;
@@ -248,8 +243,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
               const object = yield* io("environment.skill.get", () =>
                 this.env.CHECKPOINTS.get(key),
               );
-              if (!object)
-                return yield* new ApiError(404, "not_found", "Pinned skill bundle not found");
+              if (!object) return yield* new StoredObjectMissing({ object: "skill_bundle" });
               return yield* io("environment.capability.stream", () =>
                 sandbox.writeFile(archive, object.body),
               );
@@ -266,16 +260,12 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
                 capability.description,
               ]).pipe(
                 Effect.flatMap((output) =>
-                  attempt("environment.capability.root", () => {
-                    const root: unknown = JSON.parse(output.stdout);
-                    if (typeof root !== "string" || !root.startsWith("/workspace/.capabilities/"))
-                      throw new ApiError(
-                        422,
-                        "environment_setup_failed",
-                        "Invalid capability installation result",
-                      );
-                    return root;
-                  }),
+                  attempt("environment.capability.root", (): unknown => JSON.parse(output.stdout)),
+                ),
+                Effect.filterOrFail(
+                  (root): root is string =>
+                    typeof root === "string" && root.startsWith("/workspace/.capabilities/"),
+                  () => new EnvironmentSetupFailed({ reason: "capability_result" }),
                 ),
               ),
             () =>
@@ -341,7 +331,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         io("environment.command.output", () => process.output({ encoding: "utf8" })).pipe(
           Effect.filterOrFail(
             (output) => output.exitCode === 0,
-            () => new ApiError(422, "environment_setup_failed", "Environment command failed"),
+            () => new EnvironmentSetupFailed({ reason: "command" }),
           ),
         ),
       (process, exit) =>
@@ -357,15 +347,15 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         ? yield* io("environment.file.get", () => this.env.CHECKPOINTS.get(reference.key))
         : undefined;
       if (file.type === "file_id" && !object)
-        return yield* new ApiError(404, "not_found", "Input file not found");
+        return yield* new StoredObjectMissing({ object: "input_file" });
       const size = file.type === "inline" ? base64Size(file.data) : (object?.size ?? 0);
       if (file.type === "inline" && size > 5 * 1024 * 1024)
-        return yield* new ApiError(413, "file_too_large", "Inline file exceeds 5 MiB");
+        return yield* new FileTooLarge({ kind: "inline" });
       yield* io("environment.file.mkdir", () =>
         sandbox.mkdir(file.path.slice(0, file.path.lastIndexOf("/")), { recursive: true }),
       );
       const body = file.type === "inline" ? file.data : object?.body;
-      if (body === undefined) return yield* new ApiError(404, "not_found", "Input file not found");
+      if (body === undefined) return yield* new StoredObjectMissing({ object: "input_file" });
       const written = yield* io("environment.file.write", () =>
         sandbox.writeFile(
           file.path,
@@ -373,12 +363,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
           file.type === "inline" ? { encoding: "base64" } : undefined,
         ),
       );
-      if (!written.success)
-        return yield* new ApiError(
-          503,
-          "environment_write_failed",
-          "Environment file write failed",
-        );
+      if (!written.success) return yield* new EnvironmentWriteFailed({ reason: "file" });
       return size;
     });
   }
@@ -412,17 +397,13 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
     return Effect.gen(this, function* () {
       const state = yield* attempt("environment.state", () => this.state());
       if (state?.spec.id !== spec.id || state.status !== "connected")
-        return yield* new ApiError(
-          409,
-          "environment_not_ready",
-          "Wait for the environment to connect",
-        );
+        return yield* new EnvironmentNotReady({ reason: "upload" });
       const source = file.type === "file_id" ? spec.inputFiles?.[file.file_id] : undefined;
       const object = source
         ? yield* io("environment.upload.get", () => this.env.CHECKPOINTS.get(source.key))
         : undefined;
       if (file.type === "file_id" && !object)
-        return yield* new ApiError(404, "not_found", "Input file not found");
+        return yield* new StoredObjectMissing({ object: "input_file" });
       const size = file.type === "inline" ? base64Size(file.data) : (source?.size ?? 0);
       const version = yield* attempt("environment.upload.version", () => this.fileVersion() + 1);
       const upload: Upload = {
@@ -438,7 +419,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
               Uint8Array.from(atob(file.data), (char) => char.charCodeAt(0)),
             )
           : object?.body;
-      if (!bytes) return yield* new ApiError(404, "not_found", "Input file not found");
+      if (!bytes) return yield* new StoredObjectMissing({ object: "input_file" });
       // The upload row below names this object: observe the put's outcome before committing.
       yield* Effect.uninterruptible(
         io("environment.upload.store", () => this.env.CHECKPOINTS.put(upload.key, bytes)),
@@ -485,12 +466,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
               const object = yield* io("environment.upload.get", () =>
                 this.env.CHECKPOINTS.get(upload.key),
               );
-              if (!object)
-                return yield* new ApiError(
-                  503,
-                  "environment_write_failed",
-                  "Environment upload missing",
-                );
+              if (!object) return yield* new EnvironmentWriteFailed({ reason: "upload_missing" });
               yield* io("environment.upload.mkdir", () =>
                 sandbox.mkdir(upload.path.slice(0, upload.path.lastIndexOf("/")), {
                   recursive: true,
@@ -499,12 +475,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
               const result = yield* io("environment.upload.apply", () =>
                 sandbox.writeFile(upload.path, object.body),
               );
-              if (!result.success)
-                return yield* new ApiError(
-                  503,
-                  "environment_write_failed",
-                  "Environment upload write failed",
-                );
+              if (!result.success) return yield* new EnvironmentWriteFailed({ reason: "upload" });
               yield* attempt("environment.upload.applied", () =>
                 this.db.put(Kinds.fileVersion, "applied_file_version", upload.version),
               );
@@ -519,7 +490,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
     return Effect.gen(this, function* () {
       const state = yield* attempt("environment.state", () => this.state());
       if (state?.spec.id !== spec.id)
-        return yield* new ApiError(404, "not_found", "Environment not found");
+        return yield* new EnvironmentNotFound({ environmentId: spec.id });
       const applied = yield* attempt(
         "environment.upload.applied",
         () => this.db.get(Kinds.fileVersion, "applied_file_version") ?? 0,
@@ -528,8 +499,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const result = yield* io("environment.files.list", () =>
         this.sandbox(spec).listFiles("/workspace", { recursive: true, includeHidden: true }),
       );
-      if (!result.success)
-        return yield* new ApiError(503, "environment_list_failed", "Environment listing failed");
+      if (!result.success) return yield* new EnvironmentListFailed();
       let files = result.files
         .filter(
           (file) =>
@@ -547,7 +517,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
                 Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0)),
               ),
             ),
-          catch: () => new ApiError(400, "invalid_cursor", "Invalid environment file cursor"),
+          catch: () => new InvalidCursor({ reason: "Invalid environment file cursor" }),
         });
         if (
           !Array.isArray(cursor) ||
@@ -556,11 +526,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
           cursor[2] !== (query.path ?? null) ||
           typeof cursor[3] !== "string"
         )
-          return yield* new ApiError(
-            400,
-            "invalid_cursor",
-            "Cursor does not belong to this listing",
-          );
+          return yield* new InvalidCursor({ reason: "Cursor does not belong to this listing" });
         const path = cursor[3];
         files = files.filter((file) =>
           query.order === "asc"

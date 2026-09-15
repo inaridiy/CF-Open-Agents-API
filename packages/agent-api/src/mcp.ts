@@ -2,8 +2,8 @@ import { Effect } from "effect";
 
 import type { McpToolConfig } from "./agent-tools.js";
 import { io } from "./effect.js";
+import { CredentialAmbiguous, McpTransportUnsupported } from "./errors.js";
 import { requestWithoutRedirect } from "./http.js";
-import { ApiError } from "./protocol.js";
 
 /** One fixed destination per configured server. No client-controlled redirect target. */
 export function proxyMcp(
@@ -14,7 +14,7 @@ export function proxyMcp(
 ) {
   return Effect.gen(function* () {
     if (tool.transport.type !== "http")
-      return yield* new ApiError(400, "invalid_request", "Expected HTTP MCP");
+      return yield* new McpTransportUnsupported({ transport: tool.transport.type });
     const headers = new Headers();
     for (const name of [
       "accept",
@@ -31,11 +31,7 @@ export function proxyMcp(
     if (tool.transport.authorization) headers.set("authorization", tool.transport.authorization);
     if (token) {
       if (headers.has("authorization"))
-        return yield* new ApiError(
-          400,
-          "ambiguous_credential",
-          "Use either inline or vault authorization",
-        );
+        return yield* new CredentialAmbiguous({ reason: "inline_and_vault" });
       headers.set("authorization", `Bearer ${token}`);
     }
     let body: BodyInit | undefined;

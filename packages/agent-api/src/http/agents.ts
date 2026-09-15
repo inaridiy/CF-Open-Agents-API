@@ -1,11 +1,12 @@
 import { agentResource } from "../catalog.js";
+import { runPromise } from "../effect.js";
 import { identifier, pageSchema, parse, savedAgentSchema } from "../protocol.js";
 import { jsonBody, type RouteApp } from "./context.js";
 
 export function registerAgentRoutes<Env>(app: RouteApp<Env>) {
   app.post("/v1/agents", async (c) => {
     const input = parse(savedAgentSchema, await jsonBody(c));
-    c.env.validateModel(input.model, input, false);
+    await runPromise(c.env.validateModel(input.model, input, false));
     return Response.json(
       await c.env
         .catalog(c.get("tenant"))
@@ -22,16 +23,18 @@ export function registerAgentRoutes<Env>(app: RouteApp<Env>) {
     const input = parse(savedAgentSchema.partial(), await jsonBody(c));
     const catalog = c.env.catalog(c.get("tenant"));
     const previous = await catalog.agent(c.req.param("id"));
-    c.env.validateModel(
-      input.model ?? previous.model,
-      {
-        tools: input.tools === undefined ? previous.tools : input.tools,
-        multi_agent:
-          input.multi_agent === undefined
-            ? { enabled: previous.multi_agent.enabled }
-            : input.multi_agent,
-      },
-      false,
+    await runPromise(
+      c.env.validateModel(
+        input.model ?? previous.model,
+        {
+          tools: input.tools === undefined ? previous.tools : input.tools,
+          multi_agent:
+            input.multi_agent === undefined
+              ? { enabled: previous.multi_agent.enabled }
+              : input.multi_agent,
+        },
+        false,
+      ),
     );
     return Response.json(await catalog.updateAgent(c.req.param("id"), input));
   });

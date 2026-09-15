@@ -15,7 +15,25 @@ import {
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
 import { mergeEnvironment } from "./environments.js";
-import { decodeRpc, projectApiError, toApiError } from "./errors.js";
+import {
+  BodyTooLarge,
+  type Capability,
+  CapabilityUnsupported,
+  caughtFailure,
+  decodeRpc,
+  DelegateUnavailable,
+  EnvironmentDriverUnavailable,
+  ImageLimitExceeded,
+  InvalidJson,
+  InvalidTenant,
+  isPermanent,
+  McpPlacementInvalid,
+  ModelNotRegistered,
+  ReservedToolName,
+  SessionNotFound,
+  toApiError,
+  Unauthorized,
+} from "./errors.js";
 import { INPUT_FILE_LIMIT, type ResolvedInputFile } from "./files.js";
 import { registerAgentRoutes } from "./http/agents.js";
 import { registerCapabilityRoutes } from "./http/capabilities.js";
@@ -38,17 +56,16 @@ import type {
   Turn,
 } from "./protocol.js";
 import {
-  ApiError,
   agentConfigSchema,
-  assertImageLimit,
   canonicalJSON,
   createSessionSchema,
   eventsSchema,
   forkSessionSchema,
   identifier,
+  IMAGE_LIMIT,
   inputMessages,
   pageSchema,
-  parse,
+  parseEffect,
   remoteImageURLs,
   reservedDelegationName,
   sessionPageSchema,
@@ -114,19 +131,14 @@ export function createAgentService<Env extends AgentBindings>(
   }
   class AgentWorker extends WorkerEntrypoint<Env> implements AgentRPC {
     private catalog(tenant: string) {
-      if (!tenant || tenant.length > 256)
-        throw new ApiError(
-          400,
-          "invalid_tenant",
-          "Tenant must be nonempty and at most 256 characters",
-        );
+      if (!tenant || tenant.length > 256) throw new InvalidTenant();
       return this.env.CATALOG.getByName(tenant);
     }
     private session(tenant: string, id: string) {
       return runPromise(
         Effect.gen(this, function* () {
           if (!(yield* io("api.session", () => this.catalog(tenant).owns(id))))
-            return yield* new ApiError(404, "not_found", "Session not found");
+            return yield* new SessionNotFound();
           return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
         }),
       );
@@ -140,85 +152,75 @@ export function createAgentService<Env extends AgentBindings>(
       },
       sandbox: boolean,
     ) {
-      const registration = options.agents[model];
-      const driver = registration && options.harnesses(this.env)[registration.harness];
-      if (!registration || !driver)
-        throw new ApiError(422, "unsupported_model", "Model is not registered in this deployment");
-      const tools = agent.tools ?? [];
-      const unsupported = (message: string) => new ApiError(422, "unsupported_capability", message);
-      if (
-        (tools.length > 0 && !driver.capabilities.functions) ||
-        (sandbox && !driver.capabilities.sandbox)
-      )
-        throw unsupported("The selected harness does not support this configuration");
-      if (
-        agent.multi_agent?.enabled &&
-        !driver.capabilities.subagents &&
-        !registration.delegates?.length
-      )
-        throw unsupported("The selected harness does not support subagents");
-      if (reservedDelegationName(agent))
-        throw new ApiError(
-          400,
-          "invalid_request",
-          "Subagent delegation reserves cf_delegate, cf_wait and cf_close",
-        );
-      if (agent.multi_agent?.enabled)
-        for (const alias of registration.delegates ?? []) {
-          const target = options.agents[alias];
-          if (!target || !options.harnesses(this.env)[target.harness])
-            throw new ApiError(
-              503,
-              "delegate_unavailable",
-              `Delegate preset ${alias} is not registered in this deployment`,
-            );
-        }
-      if (tools.some((tool) => tool.type === "mcp") && !driver.capabilities.mcp)
-        throw unsupported("The selected harness does not support MCP servers");
-      // Hosted search needs both a runtime that drives it and a model connection that provides it.
-      if (
-        tools.some((tool) => tool.type === "web_search") &&
-        !(driver.capabilities.webSearch && registration.webSearch === true)
-      )
-        throw unsupported("The selected harness or model alias does not support web search");
-      if (
-        tools.some(
-          (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
-        ) &&
-        !driver.capabilities.toolSearch
-      )
-        throw unsupported("The selected harness does not support deferred tool loading");
-      if (
-        tools.some((tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false) &&
-        !driver.capabilities.programmaticToolCalling
-      )
-        throw unsupported("Programmatic tool calling requires a configured isolated code runner");
-      return { registration, driver };
+      return Effect.gen(this, function* () {
+        const registration = options.agents[model];
+        const driver = registration && options.harnesses(this.env)[registration.harness];
+        if (!registration || !driver) return yield* new ModelNotRegistered({ alias: model });
+        const tools = agent.tools ?? [];
+        const unsupported = (capability: Capability) =>
+          new CapabilityUnsupported({ capability, harness: driver.name });
+        if (
+          (tools.length > 0 && !driver.capabilities.functions) ||
+          (sandbox && !driver.capabilities.sandbox)
+        )
+          return yield* unsupported("configuration");
+        if (
+          agent.multi_agent?.enabled &&
+          !driver.capabilities.subagents &&
+          !registration.delegates?.length
+        )
+          return yield* unsupported("subagents");
+        if (reservedDelegationName(agent)) return yield* new ReservedToolName();
+        if (agent.multi_agent?.enabled)
+          for (const alias of registration.delegates ?? []) {
+            const target = options.agents[alias];
+            if (!target || !options.harnesses(this.env)[target.harness])
+              return yield* new DelegateUnavailable({ alias });
+          }
+        if (tools.some((tool) => tool.type === "mcp") && !driver.capabilities.mcp)
+          return yield* unsupported("mcp");
+        // Hosted search needs both a runtime that drives it and a model connection that provides it.
+        if (
+          tools.some((tool) => tool.type === "web_search") &&
+          !(driver.capabilities.webSearch && registration.webSearch === true)
+        )
+          return yield* unsupported("web_search");
+        if (
+          tools.some(
+            (tool) =>
+              tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
+          ) &&
+          !driver.capabilities.toolSearch
+        )
+          return yield* unsupported("tool_search");
+        if (
+          tools.some(
+            (tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false,
+          ) &&
+          !driver.capabilities.programmaticToolCalling
+        )
+          return yield* unsupported("programmatic_tool_calling");
+        return { registration, driver };
+      });
     }
     /** MCP placement rules that depend on the environment rather than the driver. */
-    private validateMcp(agent: AgentConfig, hosted: boolean): void {
-      for (const tool of agent.tools ?? []) {
-        if (tool.type !== "mcp") continue;
-        const environmentOrigin =
-          tool.transport.type === "stdio" || tool.connection_origin === "environment";
-        if (environmentOrigin && !hosted)
-          throw new ApiError(
-            400,
-            "invalid_request",
-            "Environment-origin MCP requires an execution environment",
-          );
-        if (tool.transport.type === "stdio" && tool.connection_origin === "service")
-          throw new ApiError(400, "invalid_request", "Stdio MCP runs in the execution environment");
-        if (
-          environmentOrigin &&
-          (tool.credential_id || Object.keys(tool.request_metadata ?? {}).length)
-        )
-          throw new ApiError(
-            422,
-            "unsupported_capability",
-            "Environment-origin MCP cannot use vault credentials or request metadata",
-          );
-      }
+    private validateMcp(agent: AgentConfig, hosted: boolean) {
+      return Effect.gen(function* () {
+        for (const tool of agent.tools ?? []) {
+          if (tool.type !== "mcp") continue;
+          const environmentOrigin =
+            tool.transport.type === "stdio" || tool.connection_origin === "environment";
+          if (environmentOrigin && !hosted)
+            return yield* new McpPlacementInvalid({ rule: "environment_required" });
+          if (tool.transport.type === "stdio" && tool.connection_origin === "service")
+            return yield* new McpPlacementInvalid({ rule: "stdio_in_service" });
+          if (
+            environmentOrigin &&
+            (tool.credential_id || Object.keys(tool.request_metadata ?? {}).length)
+          )
+            return yield* new CapabilityUnsupported({ capability: "environment_mcp_credentials" });
+        }
+      });
     }
     /** Large bodies are compared by digest so the reservation row stays small. */
     private fingerprint(value: unknown) {
@@ -252,12 +254,7 @@ export function createAgentService<Env extends AgentBindings>(
         if (environmentSpec) {
           yield* io("api.environment.register", () => catalog.registerEnvironment(environmentSpec));
           const environments = options.environments?.(this.env);
-          if (!environments)
-            return yield* new ApiError(
-              503,
-              "environment_unavailable",
-              "Environment driver is unavailable",
-            );
+          if (!environments) return yield* new EnvironmentDriverUnavailable();
           yield* io("api.environment.pending", () => stub.environmentStatus("pending"));
           const prepared = yield* environments.prepare(environmentSpec).pipe(Effect.either);
           if (prepared._tag === "Left") {
@@ -287,10 +284,8 @@ export function createAgentService<Env extends AgentBindings>(
     ): Promise<AgentSession> {
       return runPromise(
         Effect.gen(this, function* () {
-          const input = yield* attempt("api.validate", () =>
-            parse(createSessionSchema, parameters),
-          );
-          yield* attempt("api.images", () => assertInputImages(input.input));
+          const input = yield* parseEffect(createSessionSchema, parameters);
+          yield* checkInputImages(input.input);
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint(input);
           const previous = yield* decodeRpc(ReservationResult)(
@@ -303,50 +298,40 @@ export function createAgentService<Env extends AgentBindings>(
               const saved: Agent | undefined = agentId
                 ? yield* io("api.createSession", () => catalog.agent(agentId))
                 : undefined;
-              const agent = yield* attempt("api.agent.validate", () =>
-                parse(agentConfigSchema, {
-                  ...(saved
-                    ? {
-                        model: saved.model,
-                        instructions: saved.instructions,
-                        tools: saved.tools,
-                        multi_agent: {
-                          enabled: saved.multi_agent.enabled,
-                          ...(saved.multi_agent.max_concurrent_subagents != null
-                            ? {
-                                max_concurrent_subagents:
-                                  saved.multi_agent.max_concurrent_subagents,
-                              }
-                            : {}),
-                        },
-                        reasoning: saved.reasoning,
-                        text: saved.text,
-                        service_tier: saved.service_tier,
-                      }
-                    : {}),
-                  ...input.agent,
-                }),
+              const agent = yield* parseEffect(agentConfigSchema, {
+                ...(saved
+                  ? {
+                      model: saved.model,
+                      instructions: saved.instructions,
+                      tools: saved.tools,
+                      multi_agent: {
+                        enabled: saved.multi_agent.enabled,
+                        ...(saved.multi_agent.max_concurrent_subagents != null
+                          ? {
+                              max_concurrent_subagents: saved.multi_agent.max_concurrent_subagents,
+                            }
+                          : {}),
+                      },
+                      reasoning: saved.reasoning,
+                      text: saved.text,
+                      service_tier: saved.service_tier,
+                    }
+                  : {}),
+                ...input.agent,
+              });
+              const { registration, driver } = yield* this.validateModel(
+                agent.model,
+                agent,
+                input.environment.type !== "none",
               );
-              const { registration, driver } = yield* attempt("api.model.validate", () =>
-                this.validateModel(agent.model, agent, input.environment.type !== "none"),
-              );
-              if (
-                Array.isArray(input.input) &&
-                input.input.some((message) =>
-                  message.content.some((part) => part.type === "input_image"),
-                ) &&
-                !driver.capabilities.images
-              )
-                return yield* new ApiError(
-                  422,
-                  "unsupported_capability",
-                  "The selected harness does not support image input",
-                );
+              if (hasImageInput(input.input) && !driver.capabilities.images)
+                return yield* new CapabilityUnsupported({
+                  capability: "image_input",
+                  harness: driver.name,
+                });
               for (const id of input.vault_ids ?? [])
                 yield* io("api.vault", () => catalog.vault(id));
-              yield* attempt("api.mcp.validate", () =>
-                this.validateMcp(agent, input.environment.type !== "none"),
-              );
+              yield* this.validateMcp(agent, input.environment.type !== "none");
               const resource = agentResource({
                 ...agent,
                 name: saved?.name,
@@ -371,20 +356,17 @@ export function createAgentService<Env extends AgentBindings>(
                   mergeEnvironment(template, inline),
                 );
               }
-              const configured = yield* attempt("api.environment.validate", () =>
-                parse(hostedConfigurationSchema, configuration),
-              );
+              const configured = yield* parseEffect(hostedConfigurationSchema, configuration);
               if (
                 !driver.capabilities.environmentCapabilities &&
                 (configured.skills?.length ||
                   configured.plugins?.length ||
                   configured.capability_directories?.length)
               )
-                return yield* new ApiError(
-                  422,
-                  "unsupported_capability",
-                  "The selected harness does not support environment skills or plugins",
-                );
+                return yield* new CapabilityUnsupported({
+                  capability: "environment_capabilities",
+                  harness: driver.name,
+                });
               const inputFiles: Record<string, ResolvedInputFile> = {};
               for (const file of configured.files ?? []) {
                 if (file.type !== "file_id") continue;
@@ -439,11 +421,7 @@ export function createAgentService<Env extends AgentBindings>(
                 Object.keys(configured).length &&
                 !environmentSpec
               )
-                return yield* new ApiError(
-                  422,
-                  "unsupported_capability",
-                  "Configured environments require an environment driver and object storage",
-                );
+                return yield* new CapabilityUnsupported({ capability: "configured_environment" });
               if (environmentSpec)
                 yield* io("api.environment.config", async () => {
                   await options
@@ -532,8 +510,8 @@ export function createAgentService<Env extends AgentBindings>(
     ): Promise<AgentSession> {
       return runPromise(
         Effect.gen(this, function* () {
-          const input = yield* attempt("api.validate", () => parse(forkSessionSchema, parameters));
-          yield* attempt("api.images", () => assertInputImages(input.input));
+          const input = yield* parseEffect(forkSessionSchema, parameters);
+          yield* checkInputImages(input.input);
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const fingerprint = yield* this.fingerprint({ fork: id, ...input });
           const previous = yield* decodeRpc(ReservationResult)(
@@ -547,33 +525,25 @@ export function createAgentService<Env extends AgentBindings>(
                 yield* io("api.fork.source", () => sourceStub.forkSource()),
               );
               const hosted = source.session.environment.type !== "none";
-              const agent = yield* attempt("api.agent.validate", () =>
-                parse(agentConfigSchema, { ...source.agent, ...input.agent }),
+              const agent = yield* parseEffect(agentConfigSchema, {
+                ...source.agent,
+                ...input.agent,
+              });
+              const { registration, driver } = yield* this.validateModel(
+                agent.model,
+                agent,
+                hosted,
               );
-              const { registration, driver } = yield* attempt("api.model.validate", () =>
-                this.validateModel(agent.model, agent, hosted),
-              );
-              yield* attempt("api.mcp.validate", () => this.validateMcp(agent, hosted));
-              if (
-                Array.isArray(input.input) &&
-                input.input.some((message) =>
-                  message.content.some((part) => part.type === "input_image"),
-                ) &&
-                !driver.capabilities.images
-              )
-                return yield* new ApiError(
-                  422,
-                  "unsupported_capability",
-                  "The selected harness does not support image input",
-                );
+              yield* this.validateMcp(agent, hosted);
+              if (hasImageInput(input.input) && !driver.capabilities.images)
+                return yield* new CapabilityUnsupported({
+                  capability: "image_input",
+                  harness: driver.name,
+                });
               const vaultIds = input.vault_ids ?? source.session.vault_ids;
               for (const vaultId of vaultIds) yield* io("api.vault", () => catalog.vault(vaultId));
               if (hosted && source.environmentSpec && !(options.environments && options.objects))
-                return yield* new ApiError(
-                  422,
-                  "unsupported_capability",
-                  "Forking a configured environment requires an environment driver",
-                );
+                return yield* new CapabilityUnsupported({ capability: "environment_fork" });
               const sameHarness =
                 registration.harness === source.driver && driver.revision === source.revision;
               // A runtime that fixes tools at thread start cannot resume with a different tool surface.
@@ -690,9 +660,7 @@ export function createAgentService<Env extends AgentBindings>(
     submitEvents(tenant: string, id: string, events: InputEvent[], key = identifier("key")) {
       return runPromise(
         Effect.gen(this, function* () {
-          const parsed = yield* attempt("api.events.validate", () =>
-            parse(eventsSchema, { events }),
-          );
+          const parsed = yield* parseEffect(eventsSchema, { events });
           const stub = yield* io("api.submitEvents", () => this.session(tenant, id));
           yield* decodeRpc(SubmitResult)(
             yield* io<typeof SubmitResult.Encoded>("api.submitEvents", () =>
@@ -708,16 +676,18 @@ export function createAgentService<Env extends AgentBindings>(
     ): Promise<ListPage<AgentSession>> {
       return runPromise(
         Effect.gen(this, function* () {
-          const page = yield* io("api.listSessions", () =>
-            this.catalog(tenant).sessions(parse(sessionPageSchema, query)),
-          );
-          // A session deleted but not yet removed from discovery must not fail the page.
+          const parsed = yield* parseEffect(sessionPageSchema, query);
+          const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
+          const page = yield* io("api.listSessions", () => catalog.sessions(parsed));
+          // A session deleted but not yet removed from discovery must not fail the page. The
+          // object answers over RPC, so its `SessionNotFound` may arrive by wire name.
           const sessions = yield* Effect.forEach(
             page.data,
             ({ id }) =>
               io("api.retrieveSession", () => this.retrieveSession(tenant, id)).pipe(
+                Effect.catchTag("SessionNotFound", () => Effect.void),
                 Effect.catchIf(
-                  (error) => error._tag !== "OperationError" && toApiError(error).status === 404,
+                  (error) => error._tag === "ApiError" && error.status === 404,
                   () => Effect.void,
                 ),
               ),
@@ -737,7 +707,7 @@ export function createAgentService<Env extends AgentBindings>(
     ): Promise<ListPage<AgentSessionItem>> {
       return runPromise(
         Effect.gen(this, function* () {
-          const page = yield* attempt("api.page.validate", () => parse(pageSchema, query));
+          const page = yield* parseEffect(pageSchema, query);
           const stub = yield* io("api.listItems", () => this.session(tenant, id));
           return yield* io("api.listItems", () => stub.items(page));
         }),
@@ -746,7 +716,7 @@ export function createAgentService<Env extends AgentBindings>(
     listTurns(tenant: string, id: string, query: Partial<PageQuery> = {}): Promise<ListPage<Turn>> {
       return runPromise(
         Effect.gen(this, function* () {
-          const page = yield* attempt("api.page.validate", () => parse(pageSchema, query));
+          const page = yield* parseEffect(pageSchema, query);
           const stub = yield* io("api.listTurns", () => this.session(tenant, id));
           return yield* io("api.listTurns", () => stub.turns(page));
         }),
@@ -817,7 +787,7 @@ export function createAgentService<Env extends AgentBindings>(
     });
     app.use("*", async (c, next) => {
       const tenant = await options.authenticate(c.req.raw, c.env.env);
-      if (!tenant) throw new ApiError(401, "unauthorized", "Authentication required");
+      if (!tenant) throw new Unauthorized();
       c.set("tenant", tenant);
       await next();
     });
@@ -831,15 +801,13 @@ export function createAgentService<Env extends AgentBindings>(
               ? SKILL_UPLOAD_LIMIT + 128 * 1024
               : 16 * 1024 * 1024,
         onError: () => {
-          throw new ApiError(413, "body_too_large", "Request exceeds its upload limit");
+          throw new BodyTooLarge();
         },
       })(c, next),
     );
     app.onError((error) => {
-      const known =
-        error instanceof SyntaxError
-          ? new ApiError(400, "invalid_json", "Request body must be valid JSON")
-          : projectApiError(error);
+      const failure = error instanceof SyntaxError ? new InvalidJson() : caughtFailure(error);
+      const known = failure && toApiError(failure);
       if (!known || known.status === 500)
         console.error("Agent API request failed", { message: error.message });
       const status = known ? known.status : 500;
@@ -855,8 +823,7 @@ export function createAgentService<Env extends AgentBindings>(
         { status },
       );
       // The SDK retries 409 by default; these conflicts never resolve by retrying.
-      if (known && PERMANENT_CONFLICTS.has(known.code))
-        response.headers.set("x-should-retry", "false");
+      if (failure && isPermanent(failure)) response.headers.set("x-should-retry", "false");
       return response;
     });
     registerCapabilityRoutes(app, options);
@@ -884,23 +851,17 @@ export function createAgentService<Env extends AgentBindings>(
   return { AgentWorker, SessionDO };
 }
 
-/** Conflicts a retry cannot resolve; the SDK honors `x-should-retry: false`. */
-const PERMANENT_CONFLICTS = new Set([
-  "idempotency_conflict",
-  "active_turn",
-  "session_failed",
-  "turn_checkpointing",
-  "active_turn_not_steerable",
-  "outcome_unknown",
-  "network_policy_conflict",
-  "invalid_session_state",
-  "not_deleted",
-  "environment_conflict",
-]);
-function assertInputImages(input: CreateSession["input"]): void {
-  if (Array.isArray(input))
-    assertImageLimit(remoteImageURLs(input.flatMap((message) => message.content)));
-}
+const hasImageInput = (input: CreateSession["input"]): boolean =>
+  Array.isArray(input) &&
+  input.some((message) => message.content.some((part) => part.type === "input_image"));
+/** Remote images are bounded per request before any state exists. */
+const checkInputImages = (input: CreateSession["input"]) =>
+  Effect.suspend(() =>
+    Array.isArray(input) &&
+    remoteImageURLs(input.flatMap((message) => message.content)).size > IMAGE_LIMIT
+      ? new ImageLimitExceeded({ limit: IMAGE_LIMIT, scope: "request" })
+      : Effect.void,
+  );
 
 /** OpenAI's error envelope categorizes by status; the SDK selects error classes by status too. */
 function errorType(status: number): string {

@@ -1,4 +1,4 @@
-import { Data } from "effect";
+import { Effect } from "effect";
 import type {
   Agent as UpstreamAgent,
   AgentSessionEvent as UpstreamEvent,
@@ -9,9 +9,11 @@ import { z } from "zod";
 
 import { agentToolSchema, credentialFreeTools, type functionToolSchema } from "./agent-tools.js";
 import { hostedConfigurationSchema } from "./environment-config.js";
+import { ImageLimitExceeded, InvalidRequest } from "./errors.js";
 
 export type { Turn } from "openai/resources/beta/agents/sessions/turns";
 export { functionToolSchema } from "./agent-tools.js";
+export { ApiError, remoteApiError, type Status } from "./api-error.js";
 
 export type JsonValue =
   | string
@@ -44,41 +46,6 @@ export const COMPATIBILITY = {
   openaiSDK: "7.15.0",
   codex: "0.154.0",
 } as const;
-
-export class ApiError extends Data.TaggedError("ApiError")<{
-  readonly status: 400 | 401 | 404 | 409 | 413 | 422 | 429 | 500 | 503;
-  readonly code: string;
-  readonly message: string;
-}> {
-  constructor(
-    status: 400 | 401 | 404 | 409 | 413 | 422 | 429 | 500 | 503,
-    code: string,
-    message: string,
-  ) {
-    super({ status, code, message });
-    // Error name/message survive Workers RPC; custom properties/prototypes do not.
-    this.name = `AgentApiError:${status}:${code}`;
-  }
-}
-export function remoteApiError(error: Error): ApiError | undefined {
-  if (error instanceof ApiError) return error;
-  const match = /^AgentApiError:(400|401|404|409|413|422|429|500|503):([a-z_]+)$/.exec(error.name);
-  if (!match?.[1] || !match[2]) return undefined;
-  const status = z
-    .union([
-      z.literal(400),
-      z.literal(401),
-      z.literal(404),
-      z.literal(409),
-      z.literal(413),
-      z.literal(422),
-      z.literal(429),
-      z.literal(500),
-      z.literal(503),
-    ])
-    .parse(Number(match[1]));
-  return new ApiError(status, match[2], error.message);
-}
 
 const WORKSPACE_TOOL_NAMES = new Set(["bash", "read", "write", "edit"]);
 const TOOL_SEARCH_NAMES = new Set(["cf_tool_search", "cf_call_tool"]);
@@ -266,11 +233,23 @@ export type InputMessage = z.infer<typeof inputMessageSchema>;
 export type FunctionTool = z.infer<typeof functionToolSchema>;
 export type PageQuery = z.infer<typeof pageSchema>;
 
+/** Validate at a synchronous boundary (an HTTP handler, a plain RPC method, a transaction). */
 export function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
-  if (!result.success) throw new ApiError(400, "invalid_request", z.prettifyError(result.error));
+  if (!result.success) throw new InvalidRequest({ issues: z.prettifyError(result.error) });
   return result.data;
 }
+/** The same validation inside an Effect program: the failure stays in the error channel. */
+export const parseEffect = <T>(
+  schema: z.ZodType<T>,
+  input: unknown,
+): Effect.Effect<T, InvalidRequest> =>
+  Effect.suspend(() => {
+    const result = schema.safeParse(input);
+    return result.success
+      ? Effect.succeed(result.data)
+      : new InvalidRequest({ issues: z.prettifyError(result.error) });
+  });
 
 export function canonicalJSON(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -299,11 +278,7 @@ export function remoteImageURLs(
 }
 export function assertImageLimit(urls: ReadonlySet<string>): void {
   if (urls.size > IMAGE_LIMIT)
-    throw new ApiError(
-      413,
-      "image_limit",
-      `At most ${IMAGE_LIMIT} distinct remote images per request`,
-    );
+    throw new ImageLimitExceeded({ limit: IMAGE_LIMIT, scope: "request" });
 }
 export function inputMessages(input: NonNullable<CreateSession["input"]>): InputMessage[] {
   return typeof input === "string"

@@ -1,8 +1,13 @@
 import { RpcTarget, type WorkerEntrypoint } from "cloudflare:workers";
 import { z } from "zod";
 
+import {
+  ProgrammaticExecutionFailed,
+  ProgrammaticInputTooLarge,
+  ProgrammaticOutcomeUncertain,
+} from "./errors.js";
 import { programmaticInputSchema } from "./programmatic-contract.js";
-import { ApiError, type JsonValue } from "./protocol.js";
+import type { JsonValue } from "./protocol.js";
 
 interface ProgrammaticOptions {
   input: z.infer<typeof programmaticInputSchema>;
@@ -84,9 +89,9 @@ export async function runProgrammatic(
 ): Promise<JsonValue> {
   const input = programmaticInputSchema.parse(options.input);
   if ((options.timeoutMs ?? 120_000) <= 0)
-    throw new ApiError(422, "programmatic_execution_failed", "Execution deadline expired");
+    throw new ProgrammaticExecutionFailed({ reason: "Execution deadline expired" });
   if (new TextEncoder().encode(JSON.stringify(input)).byteLength > 256_000)
-    throw new ApiError(413, "programmatic_input_too_large", "Code and arguments exceed 256 KB");
+    throw new ProgrammaticInputTooLarge();
   options.signal?.throwIfAborted();
   const controller = new AbortController();
   const signal = options.signal
@@ -130,11 +135,10 @@ export async function runProgrammatic(
       throw new Error("Code result exceeds 256 KB");
     return z.json().parse(JSON.parse(result));
   } catch (error) {
-    throw new ApiError(
-      422,
-      bridge.uncertain ? "programmatic_execution_uncertain" : "programmatic_execution_failed",
-      error instanceof Error ? error.message : "Code execution failed",
-    );
+    const reason = error instanceof Error ? error.message : "Code execution failed";
+    throw bridge.uncertain
+      ? new ProgrammaticOutcomeUncertain({ reason })
+      : new ProgrammaticExecutionFailed({ reason });
   } finally {
     if (timer) clearTimeout(timer);
     if (onAbort) signal.removeEventListener("abort", onAbort);

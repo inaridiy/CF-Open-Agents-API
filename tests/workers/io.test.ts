@@ -54,7 +54,10 @@ it("native requests work in workerd and reject redirects before forwarding provi
       body: JSON.stringify({ model: "alias", opaque: "preserved" }),
     });
   expect(await (await model.fetch(request())).json()).toEqual({ opaque: "response" });
-  await expect(model.fetch(request())).rejects.toMatchObject({ code: "upstream_redirect" });
+  await expect(model.fetch(request())).rejects.toMatchObject({
+    _tag: "UpstreamRedirect",
+    name: "AgentApiError:503:upstream_redirect",
+  });
   expect(calls).toBe(2);
   expect(discarded).toBe(true);
 });
@@ -280,7 +283,7 @@ it("a late OAuth response cannot overwrite a manual rotation, even back to the s
       response.resolve(
         Response.json({ access_token: "stale-response", token_type: "Bearer", expires_in: 3600 }),
       );
-      await expect(refresh).rejects.toMatchObject({ code: "credential_changed" });
+      await expect(refresh).rejects.toMatchObject({ _tag: "CredentialChanged" });
       repository.rotate(vault.id, credential.id, {
         auth: { type: "mcp_oauth", access_token: "current" },
       });

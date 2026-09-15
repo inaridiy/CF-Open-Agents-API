@@ -1,6 +1,6 @@
 import type { FinishReason, LanguageModelUsage } from "ai";
 
-import { ApiError } from "../protocol.js";
+import { ModelOutputFailed } from "../errors.js";
 import type { ModelInput } from "./input.js";
 
 export type ModelChunk =
@@ -351,12 +351,7 @@ export async function encodeModelResponse(
         yield "data: [DONE]\n\n";
       }
     } catch {
-      if (!input.stream)
-        throw new ApiError(
-          503,
-          "model_output_failed",
-          "Upstream model output failed or was incomplete",
-        );
+      if (!input.stream) throw new ModelOutputFailed();
       if (input.protocol === "responses")
         yield responsesEvent("response.failed", {
           response: {

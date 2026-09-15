@@ -10,12 +10,11 @@ import {
   sql,
 } from "kysely";
 
-import { InvalidCursor } from "./errors.js";
+import { InvalidCursor, RecordNotFound } from "./errors.js";
 import type { Kind } from "./persistence/kind.js";
 import type { ListFilter, Page, RecordStore, Transactional } from "./persistence/record-store.js";
 import { encodeRow } from "./persistence/row.js";
 import type { AgentSessionEvent, PageQuery } from "./protocol.js";
-import { ApiError } from "./protocol.js";
 
 // A page stops growing past this many serialized characters, so a response stays
 // far below the isolate's memory limit even when every record is at the row limit.
@@ -102,7 +101,7 @@ export class SqlStore implements RecordStore, Transactional {
   }
   require<A>(kind: Kind<A>, id: string): A {
     const value = this.get(kind, id);
-    if (!value) throw new ApiError(404, "not_found", `${kind} not found`);
+    if (!value) throw new RecordNotFound({ kind, id });
     return value;
   }
   put<A>(
