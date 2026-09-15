@@ -34,15 +34,17 @@ const service = createAgentService<Bindings>({
   environments: containerEnvironments,
   authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
 });
+// Registry entries may be factories; a preset is built only when a session selects it.
 const gateway = createModelGateway<Bindings>((env) => ({
-  codex: nativeModel({
-    protocol: "responses",
-    baseURL: "https://api.openai.com/v1",
-    apiKey: env.OPENAI_API_KEY,
-    model: "gpt-6-astra",
-  }),
-  primary: aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-  workers: aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+  codex: () =>
+    nativeModel({
+      protocol: "responses",
+      baseURL: "https://api.openai.com/v1",
+      apiKey: env.OPENAI_API_KEY,
+      model: "gpt-6-astra",
+    }),
+  primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+  workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
 }));
 // A private WorkerEntrypoint named Models delegates fetch(request) to gateway.fetch(request, this.env).
 ```

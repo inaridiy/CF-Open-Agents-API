@@ -2,12 +2,14 @@ import { createOpenAI } from "@ai-sdk/openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { simulateReadableStream } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import { Effect } from "effect";
 import OpenAI from "openai";
 import { expect, it } from "vitest";
 
 import {
   aiSDKModel,
   createModelGateway,
+  modelAdapter,
   nativeModel,
   openAICompatibleModel,
 } from "../../packages/agent-api/src/models.js";
@@ -574,4 +576,33 @@ it("native Anthropic passthrough streams server tool blocks unchanged", async ()
   );
   expect(response.headers.get("content-type")).toContain("text/event-stream");
   expect(await response.text()).toBe(upstream);
+});
+
+it("builds a registry entry only when a session selects it", async () => {
+  let built = 0;
+  const gateway = createModelGateway(() => ({
+    broken: () => {
+      throw new Error("credentials missing");
+    },
+    ready: () => {
+      built++;
+      return modelAdapter(() => Effect.succeed(Response.json({ ok: true })));
+    },
+  }));
+  const call = (model: string) =>
+    gateway.fetch(
+      new Request("http://model.internal/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "hi" }),
+      }),
+      {},
+    );
+  expect(built).toBe(0);
+  expect((await call("ready")).status).toBe(200);
+  expect(built).toBe(1);
+  const failed = await call("broken");
+  expect(failed.status).toBe(400);
+  const body = await failed.json<{ error: { type: string } }>();
+  expect(body.error.type).toBe("model_gateway_error");
 });

@@ -292,13 +292,21 @@ export function nativeModel(options: {
   );
 }
 
+/** A registered model: an adapter, or a factory called only when that name is selected. */
+export type ModelRegistration = ModelAdapter | (() => ModelAdapter);
 class Models extends Context.Tag("agent-api/Models")<
   Models,
-  Readonly<Record<string, ModelAdapter>>
+  Readonly<Record<string, ModelRegistration>>
 >() {}
+const resolveModel = (registration: ModelRegistration): ModelAdapter =>
+  typeof registration === "function" ? registration() : registration;
 
-/** Compose behind a private Service Binding, never a public unauthenticated route. */
-export function createModelGateway<Env>(models: (env: Env) => Record<string, ModelAdapter>): {
+/**
+ * Compose behind a private Service Binding, never a public unauthenticated route.
+ * A registry entry may be a factory (`() => nativeModel(...)`) so a deployment that
+ * lacks one provider's credentials still serves its other presets.
+ */
+export function createModelGateway<Env>(models: (env: Env) => Record<string, ModelRegistration>): {
   fetch(request: Request, env: Env): Promise<Response>;
 } {
   return {
@@ -318,7 +326,10 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
               "model_not_found",
               "No model is registered with this name",
             );
-          const adapter = registry[body.model];
+          const registration = registry[body.model];
+          const adapter = registration
+            ? yield* attempt("model.registration", () => resolveModel(registration))
+            : undefined;
           if (!adapter)
             return yield* new ApiError(
               404,

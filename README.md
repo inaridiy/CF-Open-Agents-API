@@ -76,9 +76,8 @@ pnpm build
 cp examples/worker/.dev.vars.example examples/worker/.dev.vars
 cp examples/caller/.dev.vars.example examples/caller/.dev.vars
 # Put the same unpredictable API_TOKEN (at least 32 characters) in both files.
-# Keep the OPENAI_API_KEY placeholder if you have no OpenAI key: the gateway
-# builds every preset at request time and needs a non-empty string, but the
-# `workers` preset never calls OpenAI.
+# Leave OPENAI_API_KEY empty if you have no OpenAI key: presets are built only
+# when a session selects them, and the `workers` preset never calls OpenAI.
 pnpm dev:caller
 ```
 

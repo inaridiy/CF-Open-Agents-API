@@ -41,15 +41,18 @@ const service = createAgentService<Bindings>({
   authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
 });
 
+// Each entry is a factory: a preset is built only when a session selects it, so a
+// deployment without an OpenAI key can still serve the Workers AI preset.
 const gateway = createModelGateway<Bindings>((env) => ({
-  codex: nativeModel({
-    protocol: "responses",
-    baseURL: "https://api.openai.com/v1",
-    apiKey: env.OPENAI_API_KEY,
-    model: "gpt-6-astra",
-  }),
-  primary: aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-  workers: aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+  codex: () =>
+    nativeModel({
+      protocol: "responses",
+      baseURL: "https://api.openai.com/v1",
+      apiKey: env.OPENAI_API_KEY,
+      model: "gpt-6-astra",
+    }),
+  primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+  workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
 }));
 
 export class SessionDO extends service.SessionDO {}
