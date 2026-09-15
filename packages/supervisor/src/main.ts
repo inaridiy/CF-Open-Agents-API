@@ -53,15 +53,17 @@ const program = Effect.scoped(
     yield* Effect.acquireRelease(
       Effect.sync(() => serve({ fetch: supervisor.app.fetch, port: settings.port })),
       (server) =>
-        io("supervisor.shutdown", async () => {
-          try {
-            await supervisor.stop();
-          } finally {
-            await new Promise<void>((resolve, reject) =>
-              server.close((error) => (error ? reject(error) : resolve())),
-            );
-          }
-        }).pipe(Effect.orDie),
+        supervisor.shutdown.pipe(
+          Effect.ensuring(
+            io(
+              "supervisor.close",
+              () =>
+                new Promise<void>((resolve, reject) =>
+                  server.close((error) => (error ? reject(error) : resolve())),
+                ),
+            ).pipe(Effect.orDie),
+          ),
+        ),
     );
     yield* shutdown;
   }),

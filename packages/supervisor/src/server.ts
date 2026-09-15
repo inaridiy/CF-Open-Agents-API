@@ -252,5 +252,5 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
     );
   });
   app.post("/stop", (c) => runPromise(stop.pipe(Effect.as(c.body(null, 204)))));
-  return { app, stop: () => runPromise(stop) };
+  return { app, stop: () => runPromise(stop), shutdown: stop };
 }

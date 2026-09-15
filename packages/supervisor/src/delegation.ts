@@ -11,8 +11,10 @@ import {
   type RuntimeEvent,
   type ServiceError,
 } from "cf-open-agents-api";
-import { Data, Deferred, Duration, Effect, Option, type Scope } from "effect";
+import { Data, Deferred, Duration, Effect, type Scope } from "effect";
 import { z } from "zod";
+
+import { within } from "./lifecycle.js";
 
 type ChildStatus = "in_progress" | "completed" | "cancelled" | "failed";
 interface Child {
@@ -396,12 +398,9 @@ export class Delegations {
   }
   /** Resolves to whether every child settled before `ms` elapsed. */
   private settledWithin(children: Child[], ms: number): Effect.Effect<boolean> {
-    return Effect.forEach(children, (child) => Deferred.await(child.settled), {
-      discard: true,
-    }).pipe(
-      Effect.interruptible,
-      Effect.timeoutOption(Duration.millis(ms)),
-      Effect.map(Option.isSome),
+    return within(
+      Effect.forEach(children, (child) => Deferred.await(child.settled), { discard: true }),
+      Duration.millis(ms),
     );
   }
   private wait(args: unknown): Effect.Effect<DelegationResult> {

@@ -1,6 +1,5 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 
 import {
   type HookCallback,
@@ -15,18 +14,34 @@ import {
 import type { BetaContentBlock } from "@anthropic-ai/sdk/resources/beta";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ApiError, type Execution, type InputMessage, workspaceTools } from "cf-open-agents-api";
+import {
+  ApiError,
+  type Execution,
+  type InputMessage,
+  io,
+  workspaceTools,
+} from "cf-open-agents-api";
+import { Data, Effect } from "effect";
 import { z } from "zod";
 
 import { type NativeOptions, ToolJob, type ToolScope } from "./job.js";
-import type { TurnErrorCode } from "./lifecycle.js";
+import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
 import { imageContent } from "./media.js";
+import { exitedWithin } from "./process.js";
 
 /** Tool input key that carries a subagent attribution from the PreToolUse hook to the MCP handler. */
 const SCOPE_KEY = "__cf_scope";
-const INTERRUPT_GRACE_MS = 10_000;
+/** Time allowed for an interrupted turn to report its result, so cancelled turns still carry usage. */
+const INTERRUPT_GRACE = "10 seconds";
 /** Time allowed for the CLI to exit and flush its session files once its input ends. */
-const EXIT_GRACE_MS = 5_000;
+const EXIT_GRACE = "5 seconds";
+
+/** The CLI's message stream ended without the turn's result. */
+class ClaudeCodeExited extends Data.TaggedError("ClaudeCodeExited")<{}> {
+  override get message(): string {
+    return "Claude Code exited without a completed result";
+  }
+}
 const SUBAGENT_PROMPT =
   "You are a subagent working on one delegated subtask for the main agent. Complete the subtask with the tools available and reply with a concise report of the result.";
 
@@ -125,9 +140,10 @@ export class ClaudeCodeJob extends ToolJob {
   private workspaceServer?: McpServer;
   /** The turn produced its terminal result; late input belongs to the next public turn. */
   private finished = false;
-  private settleResult?: () => void;
-  /** Resolves when the CLI process has exited; the SDK ends its message stream earlier. */
-  private exited?: Promise<void>;
+  /** Fires when a result message lands; an interrupt waits on it, bounded, for the turn's usage. */
+  private readonly resultSettled = new Wake();
+  /** The CLI process; the SDK ends its message stream before the process has exited. */
+  private cli?: ChildProcess;
   private readonly children: Child[] = [];
   private readonly innerToolUses = new Map<string, Child>();
   private readonly pendingTexts: PendingText[] = [];
@@ -345,12 +361,9 @@ export class ClaudeCodeJob extends ToolJob {
           child.stderr.setEncoding("utf8");
           child.stderr.on("data", (chunk: string) => this.options.diagnostics(chunk.trimEnd()));
           child.stderr.on("error", () => {});
-          this.exited = new Promise((resolve) => {
-            child.once("exit", () => resolve());
-            child.once("error", () => resolve());
-          });
+          this.cli = child;
           // The job's resources terminate the CLI if the SDK's own shutdown leaves it running.
-          void this.own(child, `${EXIT_GRACE_MS} millis`).catch(() => {});
+          void this.own(child, EXIT_GRACE).catch(() => {});
           return child;
         },
         env: {
@@ -367,107 +380,119 @@ export class ClaudeCodeJob extends ToolJob {
       },
     });
     this.query = session;
-    this.run(async () => {
-      let completed = false;
-      for await (const message of session) {
-        if (message.session_id) this.sessionId = message.session_id;
-        if (
-          message.type === "system" &&
-          message.subtype === "init" &&
-          !message.mcp_servers.some(
-            (server) => server.name === "workspace" && server.status === "connected",
-          )
-        )
-          throw new Error("Workspace MCP server failed to connect");
-        if (message.type === "system" && message.subtype === "task_started") {
-          if (message.tool_use_id) {
-            const child = this.child({ taskToolUseId: message.tool_use_id }, message.task_id);
-            child.name ??= message.subagent_type ?? null;
-            child.instructions ??= message.description;
-            this.announce(child);
-          }
-        } else if (message.type === "system" && message.subtype === "task_notification") {
-          const child = this.children.find(
-            (entry) =>
-              entry.taskId === message.task_id ||
-              (message.tool_use_id !== undefined && entry.taskToolUseId === message.tool_use_id),
-          );
-          if (child)
-            this.finish(
-              child,
-              message.status === "completed"
-                ? "completed"
-                : message.status === "stopped"
-                  ? "cancelled"
-                  : "failed",
-              message.summary,
-            );
-        } else if (message.type === "user" && !("isReplay" in message)) {
-          this.acceptUser(message);
-        } else if (message.type === "assistant") {
-          this.acceptAssistant(
-            message.message.id,
-            message.message.content,
-            message.parent_tool_use_id,
-          );
-        } else if (message.type === "stream_event") {
-          this.acceptStream(message.event, message.parent_tool_use_id);
-        } else if (message.type === "result") {
-          this.recordUsage(message);
-          // Queued input and running native subagents keep the session alive: the CLI
-          // wakes the main thread again when a background task finishes.
-          const pendingWork =
-            (message.queued_turn_count ?? 0) > 0 ||
-            this.children.some((child) => child.status === "in_progress");
-          // This CLI release gives up on structured output silently: the turn's final
-          // result reads as a success that carries no `structured_output`.
-          const structuredOutputMissing =
-            message.subtype === "error_max_structured_output_retries" ||
-            (!pendingWork &&
-              this.outputFormat !== undefined &&
-              message.subtype === "success" &&
-              !message.is_error &&
-              message.structured_output === undefined);
-          const error =
-            claudeTurnError(message) ?? (structuredOutputMissing ? "internal_error" : undefined);
-          if (error) {
-            if (this.cancelling) return;
-            if (structuredOutputMissing)
-              this.options.diagnostics(
-                "claude-code gave up on structured output: the model never produced a reply matching agent.text.format",
-              );
-            this.options.diagnostics(
-              `claude-code turn failed (${error}): ${JSON.stringify({
-                subtype: message.subtype,
-                terminal_reason: message.terminal_reason,
-                status: message.subtype === "success" ? message.api_error_status : undefined,
-                errors: message.subtype === "success" ? [message.result] : message.errors,
-              })}`,
-            );
-            this.lifecycle.fail(error);
-            input.close();
-            return;
-          }
-          if (pendingWork) continue;
-          this.finalize(message);
-          completed = true;
-          this.finished = true;
-          input.close();
-        }
-      }
-      // The turn is exposed as complete only once the CLI has written its history.
-      await this.awaitExit();
-      if (this.cancelling) return;
-      if (!completed) throw new Error("Claude Code exited without a completed result");
-    });
+    this.run(
+      Effect.gen(this, function* () {
+        const outcome = yield* io("claude.messages", () => this.consume(session, input));
+        if (outcome === "abandoned") return;
+        // The turn is exposed as complete only once the CLI has written its history.
+        yield* this.cliExited();
+        if (this.cancelling) return;
+        if (outcome !== "completed") return yield* new ClaudeCodeExited();
+      }),
+    );
   }
-  private async awaitExit(): Promise<void> {
-    if (!this.exited) return;
-    const timer = new AbortController();
-    await Promise.race([
-      this.exited,
-      delay(EXIT_GRACE_MS, undefined, { signal: timer.signal }).catch(() => {}),
-    ]).finally(() => timer.abort());
+  /**
+   * Consume the SDK's message stream until it ends; the job's abort ends it early.
+   * `abandoned` means the turn failed or was cancelled and the CLI's exit is not
+   * awaited; `incomplete` means the stream ended without the turn's result.
+   */
+  private async consume(
+    session: Query,
+    input: InputQueue,
+  ): Promise<"completed" | "incomplete" | "abandoned"> {
+    let completed = false;
+    for await (const message of session) {
+      if (message.session_id) this.sessionId = message.session_id;
+      if (
+        message.type === "system" &&
+        message.subtype === "init" &&
+        !message.mcp_servers.some(
+          (server) => server.name === "workspace" && server.status === "connected",
+        )
+      )
+        throw new Error("Workspace MCP server failed to connect");
+      if (message.type === "system" && message.subtype === "task_started") {
+        if (message.tool_use_id) {
+          const child = this.child({ taskToolUseId: message.tool_use_id }, message.task_id);
+          child.name ??= message.subagent_type ?? null;
+          child.instructions ??= message.description;
+          this.announce(child);
+        }
+      } else if (message.type === "system" && message.subtype === "task_notification") {
+        const child = this.children.find(
+          (entry) =>
+            entry.taskId === message.task_id ||
+            (message.tool_use_id !== undefined && entry.taskToolUseId === message.tool_use_id),
+        );
+        if (child)
+          this.finish(
+            child,
+            message.status === "completed"
+              ? "completed"
+              : message.status === "stopped"
+                ? "cancelled"
+                : "failed",
+            message.summary,
+          );
+      } else if (message.type === "user" && !("isReplay" in message)) {
+        this.acceptUser(message);
+      } else if (message.type === "assistant") {
+        this.acceptAssistant(
+          message.message.id,
+          message.message.content,
+          message.parent_tool_use_id,
+        );
+      } else if (message.type === "stream_event") {
+        this.acceptStream(message.event, message.parent_tool_use_id);
+      } else if (message.type === "result") {
+        this.recordUsage(message);
+        // Queued input and running native subagents keep the session alive: the CLI
+        // wakes the main thread again when a background task finishes.
+        const pendingWork =
+          (message.queued_turn_count ?? 0) > 0 ||
+          this.children.some((child) => child.status === "in_progress");
+        // This CLI release gives up on structured output silently: the turn's final
+        // result reads as a success that carries no `structured_output`.
+        const structuredOutputMissing =
+          message.subtype === "error_max_structured_output_retries" ||
+          (!pendingWork &&
+            this.outputFormat !== undefined &&
+            message.subtype === "success" &&
+            !message.is_error &&
+            message.structured_output === undefined);
+        const error =
+          claudeTurnError(message) ?? (structuredOutputMissing ? "internal_error" : undefined);
+        if (error) {
+          if (this.cancelling) return "abandoned";
+          if (structuredOutputMissing)
+            this.options.diagnostics(
+              "claude-code gave up on structured output: the model never produced a reply matching agent.text.format",
+            );
+          this.options.diagnostics(
+            `claude-code turn failed (${error}): ${JSON.stringify({
+              subtype: message.subtype,
+              terminal_reason: message.terminal_reason,
+              status: message.subtype === "success" ? message.api_error_status : undefined,
+              errors: message.subtype === "success" ? [message.result] : message.errors,
+            })}`,
+          );
+          this.lifecycle.fail(error);
+          input.close();
+          return "abandoned";
+        }
+        if (pendingWork) continue;
+        this.finalize(message);
+        completed = true;
+        this.finished = true;
+        input.close();
+      }
+    }
+    return completed ? "completed" : "incomplete";
+  }
+  /** Waits, up to the exit grace, for the CLI to exit on its own after its input ended. */
+  private cliExited(): Effect.Effect<void> {
+    const cli = this.cli;
+    return cli ? exitedWithin(cli, EXIT_GRACE).pipe(Effect.asVoid) : Effect.void;
   }
   /** Register or merge a native subagent identified by whichever signal arrived first. */
   private child(key: { agentId?: string; taskToolUseId?: string }, taskId?: string): Child {
@@ -736,7 +761,7 @@ export class ClaudeCodeJob extends ToolJob {
       });
   }
   private recordUsage(message: SDKResultMessage): void {
-    this.settleResult?.();
+    this.resultSettled.notify();
     const models = Object.values(message.modelUsage);
     const input = models.reduce(
       (sum, model) =>
@@ -772,42 +797,57 @@ export class ClaudeCodeJob extends ToolJob {
         phase: "final_answer",
       });
   }
-  protected override async steer(messages: InputMessage[]): Promise<void> {
-    const input = this.input;
-    if (!input || this.finished || input.closed)
-      throw new ApiError(409, "command_rejected", "Turn has already finished");
-    const message = await this.userMessage(messages);
-    if (this.finished || input.closed)
-      throw new ApiError(409, "command_rejected", "Turn has already finished");
-    input.push({
-      type: "user",
-      message,
-      parent_tool_use_id: null,
-      session_id: this.sessionId,
-      priority: "now",
+  protected override steer(messages: InputMessage[]) {
+    return Effect.gen(this, function* () {
+      const finished = () => new ApiError(409, "command_rejected", "Turn has already finished");
+      const input = this.input;
+      if (!input || this.finished || input.closed) return yield* finished();
+      const message = yield* io("claude.input", () => this.userMessage(messages));
+      if (this.finished || input.closed) return yield* finished();
+      input.push({
+        type: "user",
+        message,
+        parent_tool_use_id: null,
+        session_id: this.sessionId,
+        priority: "now",
+      });
     });
   }
-  /** Interrupt the native turn and wait for its result so cancelled turns still report usage. */
-  protected override async interruptRuntime(): Promise<void> {
-    const session = this.query;
-    if (!session || this.finished || !this.input || this.input.closed) return;
-    const settled = new Promise<void>((resolve) => {
-      this.settleResult = resolve;
+  /**
+   * Interrupt the native turn and wait for its result so cancelled turns still report
+   * usage. The control request and the result it should produce share one grace: the
+   * SDK's request takes no signal and settles only when the query closes, so a CLI
+   * that never answers cannot hold the stop.
+   */
+  protected override interruptRuntime() {
+    return Effect.gen(this, function* () {
+      const session = this.query;
+      const input = this.input;
+      if (!session || this.finished || !input || input.closed) return;
+      // Captured before the interrupt: a result that lands during it still counts.
+      const settled = this.resultSettled.wait();
+      const interrupted = io("claude.interrupt", () => session.interrupt()).pipe(
+        Effect.catchAll((error) =>
+          Effect.sync(() =>
+            this.options.diagnostics(`claude-code interrupt: ${describeFailure(error)}`),
+          ),
+        ),
+      );
+      yield* within(interrupted.pipe(Effect.zipRight(settled)), INTERRUPT_GRACE);
+      this.finished = true;
+      input.close();
     });
-    await session.interrupt().catch((error) => {
-      this.options.diagnostics(`claude-code interrupt: ${String(error)}`);
-    });
-    await Promise.race([settled, delay(INTERRUPT_GRACE_MS)]);
-    this.finished = true;
-    this.input.close();
   }
-  protected async closeRuntime(): Promise<void> {
-    this.finished = true;
-    this.input?.close();
-    this.query?.close();
-    // The SDK ends input and force-kills after a short grace; a checkpoint taken
-    // after this must see the flushed session files, so wait for the exit.
-    await this.awaitExit();
-    await this.workspaceServer?.close();
+  protected closeRuntime() {
+    return Effect.gen(this, function* () {
+      this.finished = true;
+      this.input?.close();
+      this.query?.close();
+      // The SDK ends input and force-kills after a short grace; a checkpoint taken
+      // after this must see the flushed session files, so wait for the exit.
+      yield* this.cliExited();
+      const workspace = this.workspaceServer;
+      if (workspace) yield* io("claude.workspace.close", () => workspace.close());
+    });
   }
 }

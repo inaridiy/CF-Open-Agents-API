@@ -15,6 +15,7 @@ import {
   Effect,
   FiberId,
   MutableRef,
+  Option,
   Ref,
   SynchronizedRef,
 } from "effect";
@@ -94,6 +95,17 @@ export type TurnErrorCode = (typeof TURN_ERROR_CODES)[number];
 
 /** Retained native events per execution, including streamed deltas and completed items. */
 export const EVENT_LOG_LIMIT = 8_000_000;
+
+/**
+ * The one "wait, or give up after a grace period" policy: true when `wait` completed
+ * before `bound` elapsed. Opts back into interruption so the bound also holds inside
+ * finalizers, which otherwise run uninterruptibly.
+ */
+export const within = (
+  wait: Effect.Effect<void>,
+  bound: Duration.DurationInput,
+): Effect.Effect<boolean> =>
+  wait.pipe(Effect.interruptible, Effect.timeoutOption(bound), Effect.map(Option.isSome));
 
 /**
  * An edge trigger between callback land and fibers: `notify()` is synchronous (native
