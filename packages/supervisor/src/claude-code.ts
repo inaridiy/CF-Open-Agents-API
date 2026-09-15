@@ -14,20 +14,21 @@ import {
 import type { BetaContentBlock } from "@anthropic-ai/sdk/resources/beta";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ApiError,
-  type Execution,
-  type InputMessage,
-  io,
-  workspaceTools,
-} from "cf-open-agents-api";
-import { Data, Effect } from "effect";
+import { type Execution, type InputMessage, io, workspaceTools } from "cf-open-agents-api";
+import { Effect } from "effect";
 import { z } from "zod";
 
 import { type NativeOptions, ToolJob, type ToolScope } from "./job.js";
-import { describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
+import {
+  CommandRejected,
+  describeFailure,
+  ExecutionStopped,
+  type TurnErrorCode,
+  Wake,
+  within,
+} from "./lifecycle.js";
 import { imageContent } from "./media.js";
-import { exitedWithin } from "./process.js";
+import { exitedWithin, NativeStartupFailed, NativeTurnFailed } from "./process.js";
 
 /** Tool input key that carries a subagent attribution from the PreToolUse hook to the MCP handler. */
 const SCOPE_KEY = "__cf_scope";
@@ -36,11 +37,11 @@ const INTERRUPT_GRACE = "10 seconds";
 /** Time allowed for the CLI to exit and flush its session files once its input ends. */
 const EXIT_GRACE = "5 seconds";
 
-/** The CLI's message stream ended without the turn's result. */
-class ClaudeCodeExited extends Data.TaggedError("ClaudeCodeExited")<{}> {
-  override get message(): string {
-    return "Claude Code exited without a completed result";
-  }
+const RUNTIME = "claude-code";
+/** A native task's terminal status as the public subagent turn status. */
+function taskStatus(status: string): "completed" | "cancelled" | "failed" {
+  if (status === "completed") return "completed";
+  return status === "stopped" ? "cancelled" : "failed";
 }
 const SUBAGENT_PROMPT =
   "You are a subagent working on one delegated subtask for the main agent. Complete the subtask with the tools available and reply with a concise report of the result.";
@@ -50,8 +51,9 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   private readonly items: SDKUserMessage[] = [];
   private wake?: () => void;
   closed = false;
+  /** The queue closes with the turn; a push after that has nowhere to go. */
   push(message: SDKUserMessage): void {
-    if (this.closed) throw new Error("Input is closed");
+    if (this.closed) throw new ExecutionStopped();
     this.items.push(message);
     this.wake?.();
   }
@@ -95,6 +97,25 @@ interface PendingText {
   scope?: ToolScope;
 }
 
+/**
+ * `none` disables extended thinking; every other level maps onto the SDK's effort
+ * scale (`minimal` is its `low`). The SDK default applies when no effort is set. A
+ * requested summary asks the API for summarized thinking; without one the model's
+ * own thinking display applies, matching the alpha behavior.
+ */
+function reasoningOptions(reasoning: Execution["agent"]["reasoning"]): {
+  effort: Options["effort"];
+  thinking: Options["thinking"];
+} {
+  const level = reasoning?.effort;
+  if (level === "none") return { effort: undefined, thinking: { type: "disabled" } };
+  const thinking: Options["thinking"] = {
+    type: "adaptive",
+    ...(reasoning?.summary ? { display: "summarized" as const } : {}),
+  };
+  if (!level) return { effort: undefined, thinking };
+  return { effort: level === "minimal" ? "low" : level, thinking };
+}
 /** Map a Claude Code result to the public turn error code; native detail goes to diagnostics. */
 export function claudeTurnError(result: SDKResultMessage): TurnErrorCode | undefined {
   if (result.subtype === "success" && !result.is_error) return undefined;
@@ -213,7 +234,10 @@ export class ClaudeCodeJob extends ToolJob {
     for (const definition of this.toolDefinitions()) {
       const schema = z.fromJSONSchema(z.record(z.string(), z.json()).parse(definition.inputSchema));
       if (!(schema instanceof z.ZodObject))
-        throw new Error("Tool parameters must describe an object");
+        throw new NativeStartupFailed({
+          runtime: RUNTIME,
+          cause: `Tool ${definition.name} parameters must describe an object`,
+        });
       instance.registerTool(
         definition.name,
         {
@@ -245,21 +269,7 @@ export class ClaudeCodeJob extends ToolJob {
       parent_tool_use_id: null,
       session_id: previous ?? "",
     });
-    const reasoning = this.execution.agent.reasoning;
-    // `none` disables extended thinking; every other level maps onto the SDK's effort
-    // scale (`minimal` is its `low`). The SDK default applies when no effort is set.
-    const effort =
-      reasoning?.effort === "minimal"
-        ? ("low" as const)
-        : reasoning?.effort && reasoning.effort !== "none"
-          ? reasoning.effort
-          : undefined;
-    // A requested summary asks the API for summarized thinking; without one the
-    // model's own thinking display applies, matching the alpha behavior.
-    const thinking: Options["thinking"] =
-      reasoning?.effort === "none"
-        ? { type: "disabled" }
-        : { type: "adaptive", ...(reasoning?.summary ? { display: "summarized" as const } : {}) };
+    const { effort, thinking } = reasoningOptions(this.execution.agent.reasoning);
     const webSearch = this.webSearch;
     const subagents = this.subagentsEnabled;
     // One native subagent definition: it inherits the parent's tools (the workspace
@@ -311,32 +321,7 @@ export class ClaudeCodeJob extends ToolJob {
         enableFileCheckpointing: false,
         mcpServers: { workspace },
         ...(subagents ? { forwardSubagentText: true, hooks, agents } : {}),
-        canUseTool: async (name, toolInput) => {
-          if (name.startsWith("mcp__workspace__"))
-            return { behavior: "allow", updatedInput: toolInput };
-          if (name === "WebSearch" && webSearch)
-            return {
-              behavior: "allow",
-              updatedInput: {
-                ...toolInput,
-                ...(webSearch.allowed_domains?.length
-                  ? { allowed_domains: webSearch.allowed_domains }
-                  : {}),
-              },
-            };
-          if ((name === "Task" || name === "Agent") && subagents) {
-            if (
-              this.children.filter((child) => child.status === "in_progress").length >=
-              this.maxChildren
-            )
-              return { behavior: "deny", message: "Concurrent subagent limit reached" };
-            return { behavior: "allow", updatedInput: toolInput };
-          }
-          return {
-            behavior: "deny",
-            message: "Only deployment-owned workspace tools are available",
-          };
-        },
+        canUseTool: this.canUseTool,
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
@@ -387,7 +372,12 @@ export class ClaudeCodeJob extends ToolJob {
         // The turn is exposed as complete only once the CLI has written its history.
         yield* this.cliExited();
         if (this.cancelling) return;
-        if (outcome !== "completed") return yield* new ClaudeCodeExited();
+        if (outcome !== "completed")
+          return yield* new NativeTurnFailed({
+            runtime: RUNTIME,
+            code: "native_harness_failed",
+            reason: "Claude Code exited without a completed result",
+          });
       }),
     );
   }
@@ -403,91 +393,101 @@ export class ClaudeCodeJob extends ToolJob {
     let completed = false;
     for await (const message of session) {
       if (message.session_id) this.sessionId = message.session_id;
-      if (
-        message.type === "system" &&
-        message.subtype === "init" &&
-        !message.mcp_servers.some(
-          (server) => server.name === "workspace" && server.status === "connected",
-        )
-      )
-        throw new Error("Workspace MCP server failed to connect");
-      if (message.type === "system" && message.subtype === "task_started") {
-        if (message.tool_use_id) {
-          const child = this.child({ taskToolUseId: message.tool_use_id }, message.task_id);
-          child.name ??= message.subagent_type ?? null;
-          child.instructions ??= message.description;
-          this.announce(child);
-        }
-      } else if (message.type === "system" && message.subtype === "task_notification") {
-        const child = this.children.find(
-          (entry) =>
-            entry.taskId === message.task_id ||
-            (message.tool_use_id !== undefined && entry.taskToolUseId === message.tool_use_id),
-        );
-        if (child)
-          this.finish(
-            child,
-            message.status === "completed"
-              ? "completed"
-              : message.status === "stopped"
-                ? "cancelled"
-                : "failed",
-            message.summary,
-          );
-      } else if (message.type === "user" && !("isReplay" in message)) {
-        this.acceptUser(message);
-      } else if (message.type === "assistant") {
+      if (message.type === "system") this.acceptSystem(message);
+      else if (message.type === "user" && !("isReplay" in message)) this.acceptUser(message);
+      else if (message.type === "assistant")
         this.acceptAssistant(
           message.message.id,
           message.message.content,
           message.parent_tool_use_id,
         );
-      } else if (message.type === "stream_event") {
+      else if (message.type === "stream_event")
         this.acceptStream(message.event, message.parent_tool_use_id);
-      } else if (message.type === "result") {
-        this.recordUsage(message);
-        // Queued input and running native subagents keep the session alive: the CLI
-        // wakes the main thread again when a background task finishes.
-        const pendingWork =
-          (message.queued_turn_count ?? 0) > 0 ||
-          this.children.some((child) => child.status === "in_progress");
-        // This CLI release gives up on structured output silently: the turn's final
-        // result reads as a success that carries no `structured_output`.
-        const structuredOutputMissing =
-          message.subtype === "error_max_structured_output_retries" ||
-          (!pendingWork &&
-            this.outputFormat !== undefined &&
-            message.subtype === "success" &&
-            !message.is_error &&
-            message.structured_output === undefined);
-        const error =
-          claudeTurnError(message) ?? (structuredOutputMissing ? "internal_error" : undefined);
-        if (error) {
-          if (this.cancelling) return "abandoned";
-          if (structuredOutputMissing)
-            this.options.diagnostics(
-              "claude-code gave up on structured output: the model never produced a reply matching agent.text.format",
-            );
-          this.options.diagnostics(
-            `claude-code turn failed (${error}): ${JSON.stringify({
-              subtype: message.subtype,
-              terminal_reason: message.terminal_reason,
-              status: message.subtype === "success" ? message.api_error_status : undefined,
-              errors: message.subtype === "success" ? [message.result] : message.errors,
-            })}`,
-          );
-          this.lifecycle.fail(error);
-          input.close();
-          return "abandoned";
-        }
-        if (pendingWork) continue;
-        this.finalize(message);
-        completed = true;
-        this.finished = true;
-        input.close();
+      else if (message.type === "result") {
+        // The stream is drained to its end either way; only a failed turn stops reading.
+        const outcome = this.acceptResult(message, input);
+        if (outcome === "abandoned") return outcome;
+        if (outcome === "completed") completed = true;
       }
     }
     return completed ? "completed" : "incomplete";
+  }
+  /** Session bookkeeping: the workspace server must be up, and native tasks map onto children. */
+  private acceptSystem(message: Extract<SDKMessage, { type: "system" }>): void {
+    if (
+      message.subtype === "init" &&
+      !message.mcp_servers.some(
+        (server) => server.name === "workspace" && server.status === "connected",
+      )
+    )
+      throw new NativeStartupFailed({
+        runtime: RUNTIME,
+        cause: "Workspace MCP server failed to connect",
+      });
+    if (message.subtype === "task_started" && message.tool_use_id) {
+      const child = this.child({ taskToolUseId: message.tool_use_id }, message.task_id);
+      child.name ??= message.subagent_type ?? null;
+      child.instructions ??= message.description;
+      this.announce(child);
+    }
+    if (message.subtype === "task_notification") {
+      const child = this.children.find(
+        (entry) =>
+          entry.taskId === message.task_id ||
+          (message.tool_use_id !== undefined && entry.taskToolUseId === message.tool_use_id),
+      );
+      if (child) this.finish(child, taskStatus(message.status), message.summary);
+    }
+  }
+  /**
+   * The turn's result: `abandoned` when it failed or was cancelled (the CLI's exit is
+   * not awaited), `completed` once the turn and its native subagents are done, and
+   * nothing while queued input or a running subagent keeps the session alive.
+   */
+  private acceptResult(
+    message: SDKResultMessage,
+    input: InputQueue,
+  ): "completed" | "abandoned" | undefined {
+    this.recordUsage(message);
+    // Queued input and running native subagents keep the session alive: the CLI
+    // wakes the main thread again when a background task finishes.
+    const pendingWork =
+      (message.queued_turn_count ?? 0) > 0 ||
+      this.children.some((child) => child.status === "in_progress");
+    // This CLI release gives up on structured output silently: the turn's final
+    // result reads as a success that carries no `structured_output`.
+    const structuredOutputMissing =
+      message.subtype === "error_max_structured_output_retries" ||
+      (!pendingWork &&
+        this.outputFormat !== undefined &&
+        message.subtype === "success" &&
+        !message.is_error &&
+        message.structured_output === undefined);
+    const error =
+      claudeTurnError(message) ?? (structuredOutputMissing ? "internal_error" : undefined);
+    if (error) {
+      if (this.cancelling) return "abandoned";
+      if (structuredOutputMissing)
+        this.options.diagnostics(
+          "claude-code gave up on structured output: the model never produced a reply matching agent.text.format",
+        );
+      this.options.diagnostics(
+        `claude-code turn failed (${error}): ${JSON.stringify({
+          subtype: message.subtype,
+          terminal_reason: message.terminal_reason,
+          status: message.subtype === "success" ? message.api_error_status : undefined,
+          errors: message.subtype === "success" ? [message.result] : message.errors,
+        })}`,
+      );
+      this.lifecycle.fail(error);
+      input.close();
+      return "abandoned";
+    }
+    if (pendingWork) return undefined;
+    this.finalize(message);
+    this.finished = true;
+    input.close();
+    return "completed";
   }
   /** Waits, up to the exit grace, for the CLI to exit on its own after its input ended. */
   private cliExited(): Effect.Effect<void> {
@@ -584,6 +584,28 @@ export class ClaudeCodeJob extends ToolJob {
       openedAt: child.openedAt,
     });
   }
+  /** Only deployment-owned workspace tools, hosted search and (bounded) native subagents may run. */
+  private readonly canUseTool: NonNullable<Options["canUseTool"]> = async (name, toolInput) => {
+    if (name.startsWith("mcp__workspace__")) return { behavior: "allow", updatedInput: toolInput };
+    const webSearch = this.webSearch;
+    if (name === "WebSearch" && webSearch)
+      return {
+        behavior: "allow",
+        updatedInput: {
+          ...toolInput,
+          ...(webSearch.allowed_domains?.length
+            ? { allowed_domains: webSearch.allowed_domains }
+            : {}),
+        },
+      };
+    if ((name === "Task" || name === "Agent") && this.subagentsEnabled) {
+      const running = this.children.filter((child) => child.status === "in_progress").length;
+      if (running >= this.maxChildren)
+        return { behavior: "deny", message: "Concurrent subagent limit reached" };
+      return { behavior: "allow", updatedInput: toolInput };
+    }
+    return { behavior: "deny", message: "Only deployment-owned workspace tools are available" };
+  };
   private readonly onSubagentStart: HookCallback = async (input, toolUseID) => {
     if (input.hook_event_name === "SubagentStart") {
       const child = this.child({ agentId: input.agent_id, taskToolUseId: toolUseID });
@@ -799,7 +821,7 @@ export class ClaudeCodeJob extends ToolJob {
   }
   protected override steer(messages: InputMessage[]) {
     return Effect.gen(this, function* () {
-      const finished = () => new ApiError(409, "command_rejected", "Turn has already finished");
+      const finished = () => new CommandRejected({ reason: "Turn has already finished" });
       const input = this.input;
       if (!input || this.finished || input.closed) return yield* finished();
       const message = yield* io("claude.input", () => this.userMessage(messages));

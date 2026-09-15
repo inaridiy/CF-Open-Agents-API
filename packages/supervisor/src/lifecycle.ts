@@ -1,10 +1,8 @@
 import {
-  ApiError,
   canonicalJSON,
   OperationError,
   type RuntimeBatch,
   type RuntimeEvent,
-  type ServiceError,
 } from "cf-open-agents-api";
 import {
   Cause,
@@ -16,16 +14,43 @@ import {
   FiberId,
   MutableRef,
   Option,
+  Predicate,
   Ref,
   SynchronizedRef,
 } from "effect";
 
-/** Native failure detail for diagnostics; the public batch error stays a stable code. */
+/**
+ * Native failure detail for diagnostics; the public batch error stays a stable code.
+ * A wrapper that names its step (`OperationError`, `NativeStartupFailed`) is followed
+ * into its `cause`, so the line carries both.
+ */
 export function describeFailure(value: unknown): string {
   const squashed = Cause.isCause(value) ? Cause.squash(value) : value;
-  const reason = squashed instanceof OperationError ? squashed.cause : squashed;
-  return reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+  if (
+    squashed instanceof Error &&
+    Predicate.hasProperty(squashed, "cause") &&
+    squashed.cause !== undefined &&
+    squashed.cause !== squashed
+  )
+    return `${squashed.message}: ${describeFailure(squashed.cause)}`;
+  return squashed instanceof Error ? (squashed.stack ?? squashed.message) : String(squashed);
 }
+
+/**
+ * Every failure the supervisor yields is a `Data.TaggedError`; a raw throw from a
+ * native SDK or a Node API is not. The HTTP adapter maps tags to statuses; nothing
+ * below it knows a status.
+ */
+export interface TaggedFailure extends Error {
+  readonly _tag: string;
+}
+export const isTaggedFailure = (cause: unknown): cause is TaggedFailure =>
+  cause instanceof Error && Predicate.hasProperty(cause, "_tag") && Predicate.isString(cause._tag);
+/** A tagged failure reports itself; a raw throw is transient I/O of `operation`. */
+export const asFailure =
+  (operation: string) =>
+  (cause: unknown): TaggedFailure =>
+    isTaggedFailure(cause) ? cause : new OperationError({ operation, cause });
 
 /** The event cursor does not address the retained log. */
 export class InvalidCursor extends Data.TaggedError("InvalidCursor")<{}> {
@@ -51,6 +76,67 @@ export class CheckpointUnavailable extends Data.TaggedError("CheckpointUnavailab
 }> {
   override get message(): string {
     return this.reason;
+  }
+}
+/**
+ * A definite verdict: the command can never apply to this execution (the turn ended,
+ * the call is unknown, the harness cannot steer). The HarnessDO drops the command
+ * instead of retrying it.
+ */
+export class CommandRejected extends Data.TaggedError("CommandRejected")<{
+  readonly reason: string;
+}> {
+  override get message(): string {
+    return this.reason;
+  }
+}
+/** No job for that turn is owned here. */
+export class ExecutionMissing extends Data.TaggedError("ExecutionMissing")<{}> {
+  override get message(): string {
+    return "Execution is missing";
+  }
+}
+/** An operation or execution ID was reused with different input; the first outcome stands. */
+export class IdempotencyConflict extends Data.TaggedError("IdempotencyConflict")<{
+  readonly reason: string;
+}> {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
+// --- Ownership verdicts of the single job slot -----------------------------------------
+
+/** A start named a generation the slot has already moved past. */
+export class ExecutionSuperseded extends Data.TaggedError("ExecutionSuperseded")<{}> {
+  override get message(): string {
+    return "Execution was superseded";
+  }
+}
+/** A start named another session while this supervisor still belongs to one. */
+export class AssignmentConflict extends Data.TaggedError("AssignmentConflict")<{}> {
+  override get message(): string {
+    return "Supervisor belongs to another session";
+  }
+}
+/** A start arrived while the owned execution is still running. */
+export class ExecutionActive extends Data.TaggedError("ExecutionActive")<{}> {
+  override get message(): string {
+    return "An execution is still active";
+  }
+}
+/** A start repeated a turn whose job already failed; it cannot be replayed. */
+export class ExecutionAlreadyFailed extends Data.TaggedError("ExecutionAlreadyFailed")<{}> {
+  override get message(): string {
+    return "Execution failed; it cannot be replayed";
+  }
+}
+/** The execution names a harness this supervisor does not run. */
+export class UnsupportedHarness extends Data.TaggedError("UnsupportedHarness")<{
+  readonly harness: string;
+}> {
+  override get message(): string {
+    return "Unsupported harness";
   }
 }
 
@@ -249,9 +335,13 @@ export class JobLog {
 /** Memoize the entire outcome: an indeterminate write is never replayed on retry. */
 export class Operations {
   private readonly entries = Ref.unsafeMake(
-    new Map<string, { fingerprint: string; effect: Effect.Effect<void, ServiceError> }>(),
+    new Map<string, { fingerprint: string; effect: Effect.Effect<void, TaggedFailure> }>(),
   );
-  perform(id: string, input: unknown, effect: Effect.Effect<void, ServiceError>) {
+  perform(
+    id: string,
+    input: unknown,
+    effect: Effect.Effect<void, TaggedFailure>,
+  ): Effect.Effect<void, TaggedFailure> {
     return Effect.gen(this, function* () {
       const fingerprint = canonicalJSON(input);
       const cached = yield* Effect.cached(effect);
@@ -262,11 +352,9 @@ export class Operations {
         return [created, new Map(entries).set(id, created)] as const;
       });
       if (entry.fingerprint !== fingerprint)
-        return yield* new ApiError(
-          409,
-          "idempotency_conflict",
-          "Operation ID was used with different input",
-        );
+        return yield* new IdempotencyConflict({
+          reason: "Operation ID was used with different input",
+        });
       yield* entry.effect;
     });
   }

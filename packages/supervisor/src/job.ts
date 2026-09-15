@@ -10,12 +10,10 @@ import {
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  ApiError,
   type Execution,
   type InputMessage,
   io,
   type JsonValue,
-  OperationError,
   programmaticTool,
   type RuntimeBatch,
   type RuntimeCommand,
@@ -42,20 +40,30 @@ import { z } from "zod";
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
 import {
+  asFailure,
   CheckpointUnavailable,
+  CommandRejected,
   describeFailure,
   ExecutionStopped,
   type InvalidCursor,
   JobLog,
   once,
   Operations,
+  type TaggedFailure,
   Wake,
 } from "./lifecycle.js";
 import { imageContent } from "./media.js";
 import { ownProcess } from "./process.js";
-import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
+import {
+  CodeCallsOutstanding,
+  codeEnabled,
+  codeToolNames,
+  executeCode,
+  functionArguments,
+  UnknownFunctionTool,
+} from "./programmatic.js";
 import { RemoteTools } from "./remote-tools.js";
-import { executeWorkspace } from "./workspace.js";
+import { executeWorkspace, NoSandboxAssignment } from "./workspace.js";
 
 export type ToolResult = {
   content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
@@ -72,21 +80,38 @@ export interface ToolScope {
 export class ToolUnavailable extends Data.TaggedError("ToolUnavailable")<{
   readonly message: string;
 }> {}
-export type ToolError = ToolUnavailable | ServiceError;
+/** `cf_call_tool` named a deferred function that no `cf_tool_search` of this turn returned. */
+export class DeferredToolNotDiscovered extends Data.TaggedError("DeferredToolNotDiscovered")<{
+  readonly name: string;
+}> {
+  override get message(): string {
+    return "Discover the deferred tool before calling it";
+  }
+}
 
+/**
+ * Every failure is tagged. `CommandRejected` is the one definite verdict the HarnessDO
+ * acts on; anything else is transient for the route that carried it.
+ */
 export interface NativeJob {
   readonly execution: Execution;
   readonly status: RuntimeBatch["status"];
-  start(bundle?: unknown): Effect.Effect<void, ServiceError>;
+  start(bundle?: unknown): Effect.Effect<void, TaggedFailure>;
   /** Events after `after`; with `wait`, blocks up to that long for news unless the outcome is terminal. */
   poll(after: number, wait?: Duration.DurationInput): Effect.Effect<RuntimeBatch, InvalidCursor>;
-  control(operationId: string, command: RuntimeCommand): Effect.Effect<void, ServiceError>;
-  checkpoint(): Effect.Effect<NativeBundle, ServiceError>;
+  control(
+    operationId: string,
+    command: RuntimeCommand,
+  ): Effect.Effect<void, CommandRejected | TaggedFailure>;
+  checkpoint(): Effect.Effect<NativeBundle, CheckpointUnavailable | TaggedFailure>;
   stop(): Effect.Effect<void>;
-  failStart(error: unknown): void;
   mcp?(request: Request): Effect.Effect<Response, ServiceError>;
-  codeTool?(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError>;
-  codeTools?(invocation: string): Effect.Effect<string[], ToolError>;
+  codeTool?(
+    name: string,
+    args: unknown,
+    invocation: string,
+  ): Effect.Effect<JsonValue, TaggedFailure>;
+  codeTools?(invocation: string): Effect.Effect<string[], TaggedFailure>;
   workspace?(
     name: WorkspaceToolName,
     args: unknown,
@@ -109,11 +134,6 @@ export interface NativeOptions extends JobOptions {
   opencodeBinary: string;
   mediaUrl?: string;
 }
-
-const toServiceError =
-  (operation: string) =>
-  (cause: unknown): ServiceError =>
-    cause instanceof ApiError ? cause : new OperationError({ operation, cause });
 
 /**
  * Lifecycle shared by every native runtime. `start` creates the job's Scope and
@@ -201,7 +221,7 @@ export abstract class Job<Prepared = void> implements NativeJob {
     prepared: Prepared,
   ): Effect.Effect<void, unknown>;
 
-  start(bundle?: unknown): Effect.Effect<void, ServiceError> {
+  start(bundle?: unknown): Effect.Effect<void, TaggedFailure> {
     return this.transition.withPermits(1)(
       Effect.gen(this, function* () {
         if (this.closing) return yield* new ExecutionStopped();
@@ -218,7 +238,7 @@ export abstract class Job<Prepared = void> implements NativeJob {
         Effect.onError((cause) =>
           Effect.sync(() => this.failStart(cause)).pipe(Effect.zipRight(this.stopped)),
         ),
-        Effect.mapError(toServiceError("native.start")),
+        Effect.mapError(asFailure("native.start")),
       ),
     );
   }
@@ -334,12 +354,15 @@ export abstract class Job<Prepared = void> implements NativeJob {
       yield* this.stop();
       yield* this.beforeCapture();
       return yield* capture(this.home, thread);
-    }).pipe(Effect.mapError(toServiceError("native.checkpoint"))),
+    }).pipe(Effect.mapError(asFailure("native.checkpoint"))),
   );
-  checkpoint(): Effect.Effect<NativeBundle, ServiceError> {
+  checkpoint(): Effect.Effect<NativeBundle, CheckpointUnavailable | TaggedFailure> {
     return this.saved;
   }
-  control(operationId: string, command: RuntimeCommand): Effect.Effect<void, ServiceError> {
+  control(
+    operationId: string,
+    command: RuntimeCommand,
+  ): Effect.Effect<void, CommandRejected | TaggedFailure> {
     return Effect.gen(this, function* () {
       const prepared = yield* this.prepareCommand(command);
       yield* this.operations.perform(
@@ -347,7 +370,7 @@ export abstract class Job<Prepared = void> implements NativeJob {
         command,
         this.transition.withPermits(1)(
           this.apply(operationId, command, prepared).pipe(
-            Effect.mapError(toServiceError("native.control")),
+            Effect.mapError(asFailure("native.control")),
           ),
         ),
       );
@@ -361,7 +384,7 @@ export abstract class Job<Prepared = void> implements NativeJob {
     return this.lifecycle.poll(after, wait);
   }
   /** The public error is a stable code; the native reason goes to diagnostics. */
-  failStart(error: unknown): void {
+  protected failStart(error: unknown): void {
     this.options.diagnostics(`native_harness_failed: ${describeFailure(error)}`);
     this.lifecycle.fail("native_harness_failed");
   }
@@ -407,9 +430,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
    * `command_rejected` so the Worker re-queues the message as the next turn.
    */
   protected steer(_input: InputMessage[]): Effect.Effect<void, unknown> {
-    return Effect.fail(
-      new ApiError(409, "command_rejected", "This harness cannot steer an active turn"),
-    );
+    return new CommandRejected({ reason: "This harness cannot steer an active turn" });
   }
   protected acquire(bundle?: unknown) {
     return io("native.open", () => this.open(bundle));
@@ -443,7 +464,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     signal?: AbortSignal,
   ): Promise<{ text: string; exitCode: number | null }> {
     if (!this.execution.sandbox || this.closing || this.abort.signal.aborted)
-      throw new Error("No active sandbox assignment");
+      throw new NoSandboxAssignment();
     return executeWorkspace(
       this.options.sandboxUrl,
       name,
@@ -492,8 +513,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
         this.options.programmaticUrl,
         invocation,
       );
-      if (result.terminal || (result.isError && raised.size))
-        throw new Error("Code execution left unfinished tool calls");
+      if (result.terminal || (result.isError && raised.size)) throw new CodeCallsOutstanding();
       return result;
     } catch (error) {
       this.lifecycle.fail("programmatic_execution_uncertain");
@@ -508,16 +528,17 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     return Effect.suspend(() =>
       this.codeCalls.has(invocation)
         ? Effect.succeed([
-            ...(this.execution.agent.tools ?? []).flatMap((tool) =>
-              tool.type === "function" ? [tool.name] : [],
-            ),
-            ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
+            ...codeToolNames(this.execution),
             ...this.remoteTools.tools.map((tool) => tool.codeName),
           ])
         : new ToolUnavailable({ message: "No active code invocation" }),
     );
   }
-  codeTool(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError> {
+  codeTool(
+    name: string,
+    args: unknown,
+    invocation: string,
+  ): Effect.Effect<JsonValue, TaggedFailure> {
     return Effect.gen(this, function* () {
       if (!(yield* this.codeTools(invocation)).includes(name))
         return yield* new ToolUnavailable({
@@ -533,9 +554,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
         };
       }
       if (this.remoteTools.tools.some((tool) => tool.codeName === name))
-        return yield* this.remoteTools
-          .call(name, args)
-          .pipe(Effect.mapError(toServiceError("native.remoteTool")));
+        return yield* this.remoteTools.call(name, args);
       return yield* io("native.codeTool", () =>
         this.externalTool(name, functionArguments(this.execution, name, args), invocation),
       );
@@ -612,39 +631,13 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
    */
   protected async callTool(name: string, args: unknown, scope?: ToolScope) {
     if (scope && (name === programmaticTool.name || DELEGATION_TOOLS.has(name)))
-      throw new Error("This tool is not available to subagents");
+      throw new ToolUnavailable({ message: "This tool is not available to subagents" });
     if (name === programmaticTool.name && codeEnabled(this.execution))
       return this.executeCode(args);
     if (DELEGATION_TOOLS.has(name) && this.delegations.enabled)
       return this.perform(this.delegations.call(name, args));
-    if (name === "cf_tool_search") {
-      const { query } = z.object({ query: z.string().min(1).max(1000) }).parse(args);
-      const terms = query.toLowerCase().split(/\s+/);
-      const tools = (this.execution.agent.tools ?? [])
-        .filter(
-          (tool) =>
-            tool.type === "function" &&
-            tool.defer_loading &&
-            terms.some((term) => `${tool.name} ${tool.description}`.toLowerCase().includes(term)),
-        )
-        .slice(0, 20);
-      for (const tool of tools) if (tool.type === "function") this.discovered.add(tool.name);
-      return { content: [{ type: "text" as const, text: JSON.stringify(tools) }], isError: false };
-    }
-    if (name === "cf_call_tool") {
-      const input = z.object({ name: z.string(), arguments: z.json() }).parse(args);
-      const tool = this.execution.agent.tools?.find(
-        (candidate) => candidate.type === "function" && candidate.name === input.name,
-      );
-      if (tool?.type !== "function" || !this.discovered.has(tool.name))
-        throw new Error("Discover the deferred tool before calling it");
-      return this.externalTool(
-        tool.name,
-        z.fromJSONSchema(tool.parameters).parse(input.arguments),
-        undefined,
-        scope,
-      );
-    }
+    if (name === "cf_tool_search") return this.searchTools(args);
+    if (name === "cf_call_tool") return this.callDiscovered(args, scope);
     if (Object.hasOwn(workspaceTools, name)) {
       const result = await this.runWorkspace(name as WorkspaceToolName, args, scope);
       return {
@@ -656,9 +649,43 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       return CallToolResultSchema.parse(
         await this.perform(this.remoteTools.call(name, args, scope)),
       );
+    return this.callFunction(name, args, scope);
+  }
+  /** `cf_tool_search`: deferred functions matching any term become callable through `cf_call_tool`. */
+  private searchTools(args: unknown): ToolResult {
+    const { query } = z.object({ query: z.string().min(1).max(1000) }).parse(args);
+    const terms = query.toLowerCase().split(/\s+/);
+    const tools = (this.execution.agent.tools ?? [])
+      .filter(
+        (tool) =>
+          tool.type === "function" &&
+          tool.defer_loading &&
+          terms.some((term) => `${tool.name} ${tool.description}`.toLowerCase().includes(term)),
+      )
+      .slice(0, 20);
+    for (const tool of tools) if (tool.type === "function") this.discovered.add(tool.name);
+    return { content: [{ type: "text" as const, text: JSON.stringify(tools) }], isError: false };
+  }
+  /** `cf_call_tool`: a deferred function the model discovered in this turn. */
+  private callDiscovered(args: unknown, scope?: ToolScope): Promise<ToolResult> {
+    const input = z.object({ name: z.string(), arguments: z.json() }).parse(args);
+    const tool = this.execution.agent.tools?.find(
+      (candidate) => candidate.type === "function" && candidate.name === input.name,
+    );
+    if (tool?.type !== "function" || !this.discovered.has(tool.name))
+      throw new DeferredToolNotDiscovered({ name: input.name });
+    return this.externalTool(
+      tool.name,
+      z.fromJSONSchema(tool.parameters).parse(input.arguments),
+      undefined,
+      scope,
+    );
+  }
+  /** `function_N`: the eagerly loaded client function at that index of the agent's tools. */
+  private callFunction(name: string, args: unknown, scope?: ToolScope): Promise<ToolResult> {
     const index = /^function_(\d+)$/.exec(name)?.[1];
     const tool = index === undefined ? undefined : this.execution.agent.tools?.[Number(index)];
-    if (tool?.type !== "function" || tool.defer_loading) throw new Error("Unknown function tool");
+    if (tool?.type !== "function" || tool.defer_loading) throw new UnknownFunctionTool({ name });
     return this.externalTool(
       tool.name,
       z.fromJSONSchema(tool.parameters).parse(args),
@@ -712,7 +739,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
   }
   protected apply(operationId: string, command: RuntimeCommand, content: ToolResult["content"]) {
     return Effect.gen(this, function* () {
-      const rejected = (message: string) => new ApiError(409, "command_rejected", message);
+      const rejected = (reason: string) => new CommandRejected({ reason });
       if (command.type === "steer") {
         if (this.closing || !["running", "waiting"].includes(this.status))
           return yield* rejected("Turn is no longer active");

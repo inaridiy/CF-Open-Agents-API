@@ -1,30 +1,31 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { Execution, RuntimeCommand } from "cf-open-agents-api";
-import {
-  ApiError,
-  attempt,
-  io,
-  type JsonValue,
-  OperationError,
-  programmaticTool,
-  workspaceTools,
-} from "cf-open-agents-api";
+import type { Execution, RuntimeCommand, RuntimeEvent } from "cf-open-agents-api";
+import { attempt, io, type JsonValue, programmaticTool, workspaceTools } from "cf-open-agents-api";
 import { Deferred, Effect, type Scope, Stream } from "effect";
 import { z } from "zod";
 
 import { restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS } from "./delegation.js";
-import { Job, type JobOptions, type ToolError, ToolUnavailable } from "./job.js";
+import { Job, type JobOptions, ToolUnavailable } from "./job.js";
 import { AppServer, type RpcFailure, type RpcMessage } from "./json-rpc.js";
 import {
+  asFailure,
+  CommandRejected,
   describeFailure,
   ExecutionCancelled,
   ExecutionStopped,
+  type TaggedFailure,
   type TurnErrorCode,
 } from "./lifecycle.js";
-import { codeEnabled, executeCode, functionArguments } from "./programmatic.js";
+import {
+  CodeCallsOutstanding,
+  codeEnabled,
+  codeToolNames,
+  executeCode,
+  functionArguments,
+} from "./programmatic.js";
 import { executeWorkspace } from "./workspace.js";
 
 const threadResponse = z.object({ thread: z.object({ id: z.string() }) });
@@ -45,58 +46,56 @@ const userInputRequest = z.object({
     }),
   ),
 });
+/** Codex error variants with one public code each; transport variants are handled apart. */
+const CODEX_ERROR_CODES: ReadonlyMap<string, TurnErrorCode> = new Map([
+  ["contextWindowExceeded", "context_length_exceeded"],
+  ["sessionBudgetExceeded", "session_budget_exceeded"],
+  ["usageLimitExceeded", "usage_limit_exceeded"],
+  ["rateLimitExceeded", "rate_limit_exceeded"],
+  ["serverOverloaded", "server_overloaded"],
+  ["cyberPolicy", "cyber_policy"],
+  ["misalignmentPolicyViolation", "cyber_policy"],
+  ["internalServerError", "server_error"],
+  ["unauthorized", "authentication_error"],
+  ["badRequest", "invalid_request"],
+  ["sandboxError", "sandbox_error"],
+  ["activeTurnNotSteerable", "active_turn_not_steerable"],
+]);
 /**
- * Translate Codex's `TurnError.codexErrorInfo` (a camelCase enum string, or a
- * single-key object such as `{ httpConnectionFailed: { httpStatusCode } }`) to the
- * public `SessionTurnError.code` vocabulary. Unknown variants are `internal_error`.
+ * Transport variants: Codex reports the upstream HTTP status it gave up on, and
+ * that status is more informative than the wrapper (e.g. 429 after retries).
+ */
+const CONNECTION_VARIANTS = new Set([
+  "httpConnectionFailed",
+  "responseStreamConnectionFailed",
+  "responseStreamDisconnected",
+  "responseTooManyFailedAttempts",
+]);
+const variantDetail = z.object({ httpStatusCode: z.number().nullish() });
+/** `codexErrorInfo` is a camelCase enum string or a single-key object such as `{ httpConnectionFailed: { httpStatusCode } }`. */
+function errorVariant(info: unknown): { variant?: string; httpStatusCode?: number } {
+  if (typeof info === "string") return { variant: info };
+  if (!info || typeof info !== "object") return {};
+  const [variant] = Object.keys(info);
+  if (variant === undefined) return {};
+  const detail = variantDetail.safeParse((info as Record<string, unknown>)[variant]);
+  return {
+    variant,
+    httpStatusCode: detail.success ? (detail.data.httpStatusCode ?? undefined) : undefined,
+  };
+}
+/**
+ * Translate Codex's `TurnError.codexErrorInfo` to the public `SessionTurnError.code`
+ * vocabulary. Codex 0.154.0 classifies most provider HTTP failures as `other` and
+ * keeps the status and upstream body in the message, so unknown variants read the
+ * message before falling back to `internal_error`.
  */
 export function turnErrorCode(info: unknown, message = ""): TurnErrorCode {
-  const variant =
-    typeof info === "string"
-      ? info
-      : info && typeof info === "object"
-        ? Object.keys(info)[0]
-        : undefined;
-  const detail =
-    info && typeof info === "object" && variant
-      ? (info as Record<string, { httpStatusCode?: number | null } | undefined>)[variant]
-      : undefined;
-  switch (variant) {
-    case "contextWindowExceeded":
-      return "context_length_exceeded";
-    case "sessionBudgetExceeded":
-      return "session_budget_exceeded";
-    case "usageLimitExceeded":
-      return "usage_limit_exceeded";
-    case "rateLimitExceeded":
-      return "rate_limit_exceeded";
-    case "serverOverloaded":
-      return "server_overloaded";
-    case "cyberPolicy":
-    case "misalignmentPolicyViolation":
-      return "cyber_policy";
-    case "httpConnectionFailed":
-    case "responseStreamConnectionFailed":
-    case "responseStreamDisconnected":
-    case "responseTooManyFailedAttempts":
-      // Codex reports the upstream HTTP status it gave up on; that status is
-      // more informative than the transport wrapper (e.g. 429 after retries).
-      return httpStatusCode(detail?.httpStatusCode ?? undefined) ?? "connection_failed";
-    case "internalServerError":
-      return "server_error";
-    case "unauthorized":
-      return "authentication_error";
-    case "badRequest":
-      return "invalid_request";
-    case "sandboxError":
-      return "sandbox_error";
-    case "activeTurnNotSteerable":
-      return "active_turn_not_steerable";
-    default:
-      // Codex 0.154.0 classifies most provider HTTP failures as `other` and keeps
-      // the status and upstream body in the message; recover the public code from it.
-      return messageErrorCode(message) ?? "internal_error";
-  }
+  const { variant, httpStatusCode: status } = errorVariant(info);
+  if (variant !== undefined && CONNECTION_VARIANTS.has(variant))
+    return httpStatusCode(status) ?? "connection_failed";
+  const known = variant === undefined ? undefined : CODEX_ERROR_CODES.get(variant);
+  return known ?? messageErrorCode(message) ?? "internal_error";
 }
 function httpStatusCode(status: number | undefined): TurnErrorCode | undefined {
   if (status === undefined) return undefined;
@@ -163,8 +162,177 @@ const childStateSchema = z.object({
   turnId: z.string().optional(),
 });
 type ChildState = z.infer<typeof childStateSchema>;
+type CompletedItem = z.infer<typeof completedItem>["item"];
 const childId = (id: string) => `subagent_${id.replaceAll("-", "")}`;
 const childTurnId = (id: string) => `turn_${id.replaceAll("-", "")}`;
+
+// --- App-server notification shapes -----------------------------------------------------
+
+/** Where a notification comes from: the native thread it names and, for a child, its public scope. */
+interface Origin {
+  readonly nativeThread?: string;
+  readonly child?: ChildState;
+  readonly scope: { subagentId?: string; turnId?: string };
+}
+const originParams = z.object({ threadId: z.string().optional(), turnId: z.string().optional() });
+const threadStartedNotification = z.object({
+  thread: z.object({
+    id: z.string(),
+    parentThreadId: z.string().nullable(),
+    createdAt: z.number(),
+    agentNickname: z.string().nullable().optional(),
+  }),
+});
+const childTurnSchema = z.object({
+  turn: z.object({
+    id: z.string(),
+    status: z.string(),
+    startedAt: z.number().nullable(),
+    completedAt: z.number().nullable(),
+  }),
+});
+const rootTurnSchema = z.object({
+  turn: z.object({
+    status: z.string(),
+    error: z
+      .object({
+        message: z.string(),
+        codexErrorInfo: z.unknown().optional(),
+        additionalDetails: z.string().nullable().optional(),
+      })
+      .nullable()
+      .optional(),
+  }),
+});
+const tokenUsageUpdate = z.object({
+  turnId: z.string(),
+  tokenUsage: z.object({ last: tokenUsage, total: tokenUsage }),
+});
+const itemDeltaUpdate = z.object({ itemId: z.string(), delta: z.string() });
+const reasoningSummaryUpdate = z.object({
+  itemId: z.string(),
+  summaryIndex: z.number().int().nonnegative(),
+  delta: z.string().optional(),
+});
+const reasoningItem = z.object({
+  item: z.object({
+    type: z.literal("reasoning"),
+    id: z.string(),
+    summary: z.array(z.string()).default([]),
+  }),
+});
+const webSearchItem = z.object({
+  item: z.object({
+    type: z.literal("webSearch"),
+    id: z.string(),
+    query: z.string(),
+    action: z
+      .discriminatedUnion("type", [
+        z.object({
+          type: z.literal("search"),
+          query: z.string().nullable().optional(),
+          queries: z.array(z.string()).nullable().optional(),
+        }),
+        z.object({ type: z.literal("openPage"), url: z.string().nullable().optional() }),
+        z.object({
+          type: z.literal("findInPage"),
+          url: z.string().nullable().optional(),
+          pattern: z.string().nullable().optional(),
+        }),
+        z.object({ type: z.literal("other") }),
+      ])
+      .nullable()
+      .optional(),
+  }),
+});
+type WebSearchItem = z.infer<typeof webSearchItem>["item"];
+const collabItem = z.object({
+  item: z.object({
+    type: z.literal("collabAgentToolCall"),
+    id: z.string(),
+    tool: z.string(),
+    status: z.string(),
+    senderThreadId: z.string(),
+    receiverThreadIds: z.array(z.string()),
+    prompt: z.string().nullable(),
+    model: z.string().nullable(),
+    reasoningEffort: z.string().nullable(),
+  }),
+});
+type CollabItem = z.infer<typeof collabItem>["item"];
+const collaborationOperation = z.enum([
+  "spawnAgent",
+  "sendInput",
+  "resumeAgent",
+  "wait",
+  "closeAgent",
+  "sendMessage",
+  "followupTask",
+  "interruptAgent",
+]);
+
+function searchAction(
+  action: WebSearchItem["action"],
+): Extract<RuntimeEvent, { type: "web_search" }>["action"] {
+  if (!action) return null;
+  switch (action.type) {
+    case "search":
+      return { type: "search", query: action.query ?? null, queries: action.queries ?? null };
+    case "openPage":
+      return { type: "open_page", url: action.url ?? null };
+    case "findInPage":
+      return { type: "find_in_page", url: action.url ?? null, pattern: action.pattern ?? null };
+    case "other":
+      return { type: "other" };
+  }
+}
+const webSearchEvent = (
+  item: WebSearchItem,
+  status: "in_progress" | "completed",
+  scope: Origin["scope"],
+): RuntimeEvent => ({
+  ...scope,
+  type: "web_search",
+  id: item.id,
+  status,
+  action: searchAction(item.action),
+});
+/** A running child turn is in progress; a finished one reads Codex's own status. */
+function childTurnStatus(
+  active: boolean,
+  status: string,
+): "in_progress" | "completed" | "cancelled" | "failed" {
+  if (active) return "in_progress";
+  if (status === "completed") return "completed";
+  return status === "interrupted" ? "cancelled" : "failed";
+}
+/** Codex reports a status for declined and failed commands; otherwise the exit code decides. */
+function commandStatus(
+  item: Extract<CompletedItem, { type: "commandExecution" }>,
+): "completed" | "failed" | "incomplete" {
+  if (item.status === "completed") return "completed";
+  if (item.status === "declined" || item.status === "failed") return "failed";
+  if (item.exitCode === null || item.exitCode === undefined) return "incomplete";
+  return item.exitCode === 0 ? "completed" : "failed";
+}
+type WebSearchTool = Extract<
+  NonNullable<Execution["agent"]["tools"]>[number],
+  { type: "web_search" }
+>;
+/** A client tool result as Codex's `contentItems`. */
+const contentItems = (command: Extract<RuntimeCommand, { type: "tool_result" }>) =>
+  typeof command.output === "string"
+    ? [{ type: "inputText", text: command.output }]
+    : command.output.map((part) =>
+        part.type === "input_text"
+          ? { type: "inputText", text: part.text }
+          : { type: "inputImage", imageUrl: part.image_url },
+      );
+const searchConfig = (tool: WebSearchTool) => ({
+  context_size: tool.context_size ?? "medium",
+  ...(tool.allowed_domains == null ? {} : { allowed_domains: tool.allowed_domains }),
+  ...(tool.location == null ? {} : { location: tool.location }),
+});
 
 export interface CodexOptions extends JobOptions {
   binary: string;
@@ -335,12 +503,7 @@ export class CodexJob extends Job {
         writeFile(join(this.home, "config.toml"), this.config(searchMode)),
       );
       yield* io("codex.environments", () =>
-        writeFile(
-          join(this.home, "environments.toml"),
-          this.execution.sandbox
-            ? `default = "sandbox"\ninclude_local = false\n[[environments]]\nid = "sandbox"\nurl = ${JSON.stringify(this.options.sandboxUrl)}\n`
-            : 'default = "none"\ninclude_local = false\n',
-        ),
+        writeFile(join(this.home, "environments.toml"), this.environmentsToml()),
       );
       const server = yield* AppServer.acquire({
         binary: this.options.binary,
@@ -384,19 +547,7 @@ export class CodexJob extends Job {
         config: {
           mcp_servers: this.mcpServers(),
           web_search: searchMode,
-          ...(searchTool
-            ? {
-                tools: {
-                  web_search: {
-                    context_size: searchTool.context_size ?? "medium",
-                    ...(searchTool.allowed_domains == null
-                      ? {}
-                      : { allowed_domains: searchTool.allowed_domains }),
-                    ...(searchTool.location == null ? {} : { location: searchTool.location }),
-                  },
-                },
-              }
-            : {}),
+          ...(searchTool ? { tools: { web_search: searchConfig(searchTool) } } : {}),
         },
         selectedCapabilityRoots: (this.execution.capabilityRoots ?? []).map((path, index) => ({
           id: `capability_${index}`,
@@ -407,30 +558,8 @@ export class CodexJob extends Job {
         ? yield* server.request("thread/resume", { ...common, threadId: previousThread })
         : yield* server.request("thread/start", {
             ...common,
-            dynamicTools: [
-              ...(this.execution.agent.tools ?? [])
-                .filter((tool) => tool.type === "function")
-                .map((tool) => ({
-                  type: "function",
-                  name: tool.name,
-                  description: tool.description,
-                  inputSchema: tool.parameters,
-                  deferLoading: tool.defer_loading ?? false,
-                })),
-              ...(codeEnabled(this.execution)
-                ? [{ type: "function", ...programmaticTool, deferLoading: false }]
-                : []),
-              ...this.delegations.definitions().map((tool) => ({
-                type: "function",
-                name: tool.name,
-                description: tool.description,
-                inputSchema: tool.inputSchema,
-                deferLoading: false,
-              })),
-            ],
-            environments: this.execution.sandbox
-              ? [{ environmentId: "sandbox", cwd: "/workspace" }]
-              : [],
+            dynamicTools: this.dynamicTools(),
+            environments: this.environments,
           });
       this.threadId = yield* attempt("codex.thread", () => threadResponse.parse(result).thread.id);
       const turn = yield* server.request("turn/start", {
@@ -438,16 +567,53 @@ export class CodexJob extends Job {
         input: this.input(this.execution.input),
         effort: this.execution.agent.reasoning?.effort ?? null,
         summary: this.execution.agent.reasoning?.summary ?? null,
-        outputSchema:
-          this.execution.agent.text?.format?.type === "json_schema"
-            ? this.execution.agent.text.format.schema
-            : null,
-        environments: this.execution.sandbox
-          ? [{ environmentId: "sandbox", cwd: "/workspace" }]
-          : [],
+        outputSchema: this.outputSchema,
+        environments: this.environments,
       });
       this.nativeTurnId = yield* attempt("codex.turn", () => turnResponse.parse(turn).turn.id);
     });
+  }
+  /** The remote environment every thread and turn of this job runs in, when the execution has one. */
+  private get environments() {
+    return this.execution.sandbox ? [{ environmentId: "sandbox", cwd: "/workspace" }] : [];
+  }
+  private get outputSchema() {
+    const format = this.execution.agent.text?.format;
+    return format?.type === "json_schema" ? format.schema : null;
+  }
+  private environmentsToml(): string {
+    return this.execution.sandbox
+      ? `default = "sandbox"\ninclude_local = false\n[[environments]]\nid = "sandbox"\nurl = ${JSON.stringify(this.options.sandboxUrl)}\n`
+      : 'default = "none"\ninclude_local = false\n';
+  }
+  /** Client function tools, the programmatic tool and delegation tools, as Codex dynamic tools. */
+  private dynamicTools() {
+    const dynamic = (tool: {
+      name: string;
+      description: string | undefined;
+      inputSchema: unknown;
+      deferLoading?: boolean;
+    }) => ({ type: "function", deferLoading: false, ...tool });
+    return [
+      ...(this.execution.agent.tools ?? [])
+        .filter((tool) => tool.type === "function")
+        .map((tool) =>
+          dynamic({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.parameters,
+            deferLoading: tool.defer_loading ?? false,
+          }),
+        ),
+      ...(codeEnabled(this.execution) ? [dynamic(programmaticTool)] : []),
+      ...this.delegations.definitions().map((tool) =>
+        dynamic({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        }),
+      ),
+    ];
   }
   private input(messages: Execution["input"]) {
     return messages.flatMap((message) =>
@@ -458,430 +624,313 @@ export class CodexJob extends Job {
       ),
     );
   }
+  /**
+   * One app-server message. Server requests (they carry an `id`) are answered;
+   * notifications are dispatched by method. Both attribute their events to the
+   * native thread named in `params`, which is the root or a known child.
+   */
   private receive(message: RpcMessage): void {
     if (this.closing || !["running", "waiting"].includes(this.status)) return;
-    if (message.method === "thread/started") {
-      const parsed = z
-        .object({
-          thread: z.object({
-            id: z.string(),
-            parentThreadId: z.string().nullable(),
-            createdAt: z.number(),
-            agentNickname: z.string().nullable().optional(),
-          }),
-        })
-        .safeParse(message.params);
-      if (parsed.success && parsed.data.thread.parentThreadId) {
-        const thread = parsed.data.thread;
-        const parent = thread.parentThreadId;
-        if (parent && !this.children.has(thread.id)) {
-          const state: ChildState = {
-            parent,
-            name: thread.agentNickname ?? null,
-            instructions: null,
-            openedAt: thread.createdAt,
-            closed: false,
-            active: true,
-          };
-          this.children.set(thread.id, state);
-          this.emit({
-            type: "subagent",
-            id: childId(thread.id),
-            parentId: parent === this.threadId ? null : childId(parent),
-            name: state.name,
-            instructions: null,
-            openedAt: state.openedAt,
-            status: "active",
-          });
-        }
-      }
-      return;
-    }
-    const context = z
-      .object({ threadId: z.string().optional(), turnId: z.string().optional() })
-      .safeParse(message.params);
+    const { method, params } = message;
+    if (method === undefined) return;
+    const origin = this.origin(params);
+    if (message.id !== undefined) this.serverRequest(message.id, method, params, origin);
+    else this.notifications.get(method)?.(params, origin);
+  }
+  private origin(params: unknown): Origin {
+    const context = originParams.safeParse(params);
     const nativeThread = context.success ? context.data.threadId : undefined;
     const child = nativeThread ? this.children.get(nativeThread) : undefined;
-    const scope =
-      child && nativeThread
-        ? {
-            subagentId: childId(nativeThread),
-            turnId: childTurnId(
-              context.success && context.data.turnId
-                ? context.data.turnId
-                : (child.turnId ?? "pending"),
-            ),
-          }
-        : {};
-    if (message.method === "turn/started" && nativeThread === this.threadId) {
-      const started = turnResponse.safeParse(message.params);
-      if (started.success) this.nativeTurnId = started.data.turn.id;
+    if (!child || !nativeThread) return { nativeThread, scope: {} };
+    const turnId =
+      context.success && context.data.turnId ? context.data.turnId : (child.turnId ?? "pending");
+    return {
+      nativeThread,
+      child,
+      scope: { subagentId: childId(nativeThread), turnId: childTurnId(turnId) },
+    };
+  }
+  private readonly notifications = new Map<string, (params: unknown, origin: Origin) => void>([
+    ["thread/started", (params) => this.threadStarted(params)],
+    ["turn/started", (params, origin) => this.turnStarted(params, origin)],
+    ["turn/completed", (params, origin) => this.turnCompleted(params, origin)],
+    ["thread/tokenUsage/updated", (params, origin) => this.tokenUsage(params, origin)],
+    [
+      "item/reasoning/summaryTextDelta",
+      (params, origin) => this.reasoningSummary("reasoning_delta", params, origin),
+    ],
+    [
+      "item/reasoning/summaryPartAdded",
+      (params, origin) => this.reasoningSummary("reasoning_part", params, origin),
+    ],
+    [
+      "item/commandExecution/outputDelta",
+      (params, origin) => this.itemDelta("command_delta", params, origin),
+    ],
+    ["item/agentMessage/delta", (params, origin) => this.itemDelta("delta", params, origin)],
+    ["item/started", (params, origin) => this.itemStarted(params, origin)],
+    ["item/completed", (params, origin) => this.itemCompleted(params, origin)],
+  ]);
+  private itemDelta(type: "command_delta" | "delta", params: unknown, origin: Origin): void {
+    const parsed = itemDeltaUpdate.safeParse(params);
+    if (parsed.success)
+      this.emit({ ...origin.scope, type, id: parsed.data.itemId, text: parsed.data.delta });
+  }
+  private serverRequest(id: string | number, method: string, params: unknown, origin: Origin) {
+    if (method === "item/tool/call") {
+      this.toolCall(id, params, origin);
+      return;
     }
-    if (message.method === "thread/tokenUsage/updated") {
-      const parsed = z
-        .object({
-          turnId: z.string(),
-          tokenUsage: z.object({ last: tokenUsage, total: tokenUsage }),
-        })
-        .safeParse(message.params);
-      if (!parsed.success || (!child && parsed.data.turnId !== this.nativeTurnId)) return;
-      const key = `${nativeThread}:${parsed.data.turnId}`;
-      const total = JSON.stringify(parsed.data.tokenUsage.total);
-      const previous = this.usageByTurn.get(key);
-      if (previous?.lastTotal === total) return;
-      const last = parsed.data.tokenUsage.last;
-      const usage = {
-        inputTokens: (previous?.usage.inputTokens ?? 0) + last.inputTokens,
-        cachedInputTokens: (previous?.usage.cachedInputTokens ?? 0) + last.cachedInputTokens,
-        outputTokens: (previous?.usage.outputTokens ?? 0) + last.outputTokens,
-        reasoningOutputTokens:
-          (previous?.usage.reasoningOutputTokens ?? 0) + last.reasoningOutputTokens,
-        totalTokens: (previous?.usage.totalTokens ?? 0) + last.totalTokens,
+    if (method === "item/tool/requestUserInput") {
+      this.userInputRequest(id, params, origin);
+      return;
+    }
+    this.options.diagnostics(`Rejected unsupported app-server request: ${method}`);
+    this.server?.reject(id);
+  }
+  /** A native subagent thread opened; it is tracked from its first notification. */
+  private threadStarted(params: unknown): void {
+    const parsed = threadStartedNotification.safeParse(params);
+    if (!parsed.success) return;
+    const thread = parsed.data.thread;
+    const parent = thread.parentThreadId;
+    if (!parent || this.children.has(thread.id)) return;
+    const state: ChildState = {
+      parent,
+      name: thread.agentNickname ?? null,
+      instructions: null,
+      openedAt: thread.createdAt,
+      closed: false,
+      active: true,
+    };
+    this.children.set(thread.id, state);
+    this.emit({
+      type: "subagent",
+      id: childId(thread.id),
+      parentId: parent === this.threadId ? null : childId(parent),
+      name: state.name,
+      instructions: null,
+      openedAt: state.openedAt,
+      status: "active",
+    });
+  }
+  private turnStarted(params: unknown, origin: Origin): void {
+    if (origin.child && origin.nativeThread) {
+      this.childTurn(params, origin.nativeThread, origin.child, true);
+      return;
+    }
+    if (origin.nativeThread !== this.threadId) return;
+    const started = turnResponse.safeParse(params);
+    if (started.success) this.nativeTurnId = started.data.turn.id;
+  }
+  private turnCompleted(params: unknown, origin: Origin): void {
+    if (origin.child && origin.nativeThread) {
+      this.childTurn(params, origin.nativeThread, origin.child, false);
+      return;
+    }
+    if (origin.nativeThread && origin.nativeThread !== this.threadId) return;
+    this.rootTurnCompleted(params);
+  }
+  /** A child's turn started or ended; a cancel in flight interrupts a child that starts late. */
+  private childTurn(params: unknown, nativeThread: string, child: ChildState, started: boolean) {
+    const result = childTurnSchema.safeParse(params);
+    if (!result.success) {
+      this.lifecycle.fail("invalid_subagent_turn");
+      return;
+    }
+    const turn = result.data.turn;
+    child.turnId = turn.id;
+    child.active = started;
+    this.emit({
+      type: "subagent_turn",
+      id: childTurnId(turn.id),
+      subagentId: childId(nativeThread),
+      status: childTurnStatus(child.active, turn.status),
+      startedAt: turn.startedAt ?? child.openedAt,
+      completedAt: turn.completedAt,
+    });
+    if (child.active && this.cancelRequested)
+      void this.perform(this.interruptNative(nativeThread, turn.id)).catch((error) =>
+        this.lifecycle.fail(error instanceof Error ? error.message : "subagent_interrupt_failed"),
+      );
+    this.finishIfReady();
+  }
+  /** The root turn ended: the public outcome is decided, the native detail goes to diagnostics. */
+  private rootTurnCompleted(params: unknown): void {
+    const result = rootTurnSchema.safeParse(params);
+    if (!result.success) {
+      this.lifecycle.fail("invalid_turn_event");
+      return;
+    }
+    const turn = result.data.turn;
+    if (turn.status === "completed")
+      this.rootOutcome = this.cancelRequested ? "cancelled" : "completed";
+    else if (turn.status === "interrupted") this.rootOutcome = "cancelled";
+    else {
+      // The public error is a stable Agents API code; the native detail goes to diagnostics.
+      const error = turn.error;
+      const code = turnErrorCode(error?.codexErrorInfo, error?.message ?? "");
+      const details = error?.additionalDetails ? ` | ${error.additionalDetails}` : "";
+      this.options.diagnostics(
+        `native_turn_failed (${code}): ${error?.message ?? turn.status}${details} codexErrorInfo=${JSON.stringify(error?.codexErrorInfo ?? null)}`,
+      );
+      this.lifecycle.fail(code);
+    }
+    this.finishIfReady();
+  }
+  /** Codex reports cumulative totals per turn; the public usage is accumulated per thread turn. */
+  private tokenUsage(params: unknown, origin: Origin): void {
+    const parsed = tokenUsageUpdate.safeParse(params);
+    if (!parsed.success || (!origin.child && parsed.data.turnId !== this.nativeTurnId)) return;
+    const key = `${origin.nativeThread}:${parsed.data.turnId}`;
+    const total = JSON.stringify(parsed.data.tokenUsage.total);
+    const previous = this.usageByTurn.get(key);
+    if (previous?.lastTotal === total) return;
+    const last = parsed.data.tokenUsage.last;
+    const usage = {
+      inputTokens: (previous?.usage.inputTokens ?? 0) + last.inputTokens,
+      cachedInputTokens: (previous?.usage.cachedInputTokens ?? 0) + last.cachedInputTokens,
+      outputTokens: (previous?.usage.outputTokens ?? 0) + last.outputTokens,
+      reasoningOutputTokens:
+        (previous?.usage.reasoningOutputTokens ?? 0) + last.reasoningOutputTokens,
+      totalTokens: (previous?.usage.totalTokens ?? 0) + last.totalTokens,
+    };
+    this.usageByTurn.set(key, { lastTotal: total, usage });
+    this.emit({
+      ...origin.scope,
+      type: "usage",
+      id: key,
+      usage: {
+        input_tokens: usage.inputTokens,
+        input_tokens_details: { cached_tokens: usage.cachedInputTokens },
+        output_tokens: usage.outputTokens,
+        output_tokens_details: { reasoning_tokens: usage.reasoningOutputTokens },
+        total_tokens: usage.totalTokens,
+      },
+    });
+  }
+  private reasoningSummary(
+    type: "reasoning_delta" | "reasoning_part",
+    params: unknown,
+    origin: Origin,
+  ): void {
+    const parsed = reasoningSummaryUpdate.safeParse(params);
+    if (parsed.success)
+      this.emit({
+        ...origin.scope,
+        type,
+        id: parsed.data.itemId,
+        summaryIndex: parsed.data.summaryIndex,
+        text: parsed.data.delta ?? "",
+      });
+  }
+  /** Items of the kinds the API streams while they run; other kinds are reported once completed. */
+  private itemStarted(params: unknown, origin: Origin): void {
+    const reasoning = reasoningItem.safeParse(params);
+    if (reasoning.success) {
+      this.emit({
+        ...origin.scope,
+        type: "reasoning",
+        id: reasoning.data.item.id,
+        summary: reasoning.data.item.summary,
+        status: "in_progress",
+      });
+      return;
+    }
+    const search = webSearchItem.safeParse(params);
+    if (search.success) {
+      this.emit(webSearchEvent(search.data.item, "in_progress", origin.scope));
+      return;
+    }
+    const command = completedItem.safeParse(params);
+    if (command.success && command.data.item.type === "commandExecution")
+      this.emit({
+        ...origin.scope,
+        type: "command_start",
+        id: command.data.item.id,
+        command: command.data.item.command,
+        cwd: command.data.item.cwd ?? null,
+      });
+  }
+  private itemCompleted(params: unknown, origin: Origin): void {
+    const reasoning = reasoningItem.safeParse(params);
+    if (reasoning.success) {
+      this.emit({
+        ...origin.scope,
+        type: "reasoning",
+        id: reasoning.data.item.id,
+        summary: reasoning.data.item.summary,
+        status: "completed",
+      });
+      return;
+    }
+    const search = webSearchItem.safeParse(params);
+    if (search.success) {
+      this.emit(webSearchEvent(search.data.item, "completed", origin.scope));
+      return;
+    }
+    const collab = collabItem.safeParse(params);
+    if (collab.success) {
+      this.collaboration(collab.data.item, origin);
+      return;
+    }
+    const result = completedItem.safeParse(params);
+    if (result.success) this.completedItem(result.data.item, origin);
+  }
+  /** A multi-agent tool call: it opens, closes or resumes child records, then reads as a collaboration item. */
+  private collaboration(item: CollabItem, origin: Origin): void {
+    if (item.status === "completed")
+      for (const id of item.receiverThreadIds) this.trackChild(id, item);
+    const operation = collaborationOperation.safeParse(item.tool);
+    if (operation.success)
+      this.emit({
+        ...origin.scope,
+        type: "collaboration",
+        id: item.id,
+        operation: operation.data,
+        recipients: item.receiverThreadIds.map(childId),
+        prompt: item.prompt,
+        model: item.model,
+        effort: item.reasoningEffort,
+        success: item.status === "completed",
+      });
+  }
+  private trackChild(id: string, item: CollabItem): void {
+    let state = this.children.get(id);
+    if (!state && item.tool === "spawnAgent") {
+      state = {
+        parent: item.senderThreadId,
+        name: null,
+        instructions: item.prompt,
+        openedAt: Math.floor(Date.now() / 1000),
+        closed: false,
+        active: true,
       };
-      this.usageByTurn.set(key, { lastTotal: total, usage });
-      this.emit({
-        ...scope,
-        type: "usage",
-        id: key,
-        usage: {
-          input_tokens: usage.inputTokens,
-          input_tokens_details: { cached_tokens: usage.cachedInputTokens },
-          output_tokens: usage.outputTokens,
-          output_tokens_details: { reasoning_tokens: usage.reasoningOutputTokens },
-          total_tokens: usage.totalTokens,
-        },
-      });
-      return;
+      this.children.set(id, state);
     }
-    if (
-      message.method === "item/reasoning/summaryTextDelta" ||
-      message.method === "item/reasoning/summaryPartAdded"
-    ) {
-      const parsed = z
-        .object({
-          itemId: z.string(),
-          summaryIndex: z.number().int().nonnegative(),
-          delta: z.string().optional(),
-        })
-        .safeParse(message.params);
-      if (parsed.success)
-        this.emit({
-          ...scope,
-          type:
-            message.method === "item/reasoning/summaryTextDelta"
-              ? "reasoning_delta"
-              : "reasoning_part",
-          id: parsed.data.itemId,
-          summaryIndex: parsed.data.summaryIndex,
-          text: parsed.data.delta ?? "",
-        });
-      return;
+    if (!state) return;
+    if (item.tool === "spawnAgent") state.instructions = item.prompt;
+    if (item.tool === "closeAgent") {
+      state.closed = true;
+      state.active = false;
     }
-    if (message.method === "item/commandExecution/outputDelta") {
-      const parsed = z.object({ itemId: z.string(), delta: z.string() }).safeParse(message.params);
-      if (parsed.success)
+    if (item.tool === "resumeAgent" || item.tool === "sendInput" || item.tool === "followupTask")
+      state.closed = false;
+    this.emit({
+      type: "subagent",
+      id: childId(id),
+      parentId: state.parent === this.threadId ? null : childId(state.parent),
+      name: state.name,
+      instructions: state.instructions,
+      openedAt: state.openedAt,
+      status: state.closed ? "closed" : "active",
+    });
+  }
+  private completedItem(item: CompletedItem, origin: Origin): void {
+    switch (item.type) {
+      case "mcpToolCall":
         this.emit({
-          ...scope,
-          type: "command_delta",
-          id: parsed.data.itemId,
-          text: parsed.data.delta,
-        });
-      return;
-    }
-    if (message.method === "item/started" || message.method === "item/completed") {
-      const reasoning = z
-        .object({
-          item: z.object({
-            type: z.literal("reasoning"),
-            id: z.string(),
-            summary: z.array(z.string()).default([]),
-          }),
-        })
-        .safeParse(message.params);
-      if (reasoning.success) {
-        this.emit({
-          ...scope,
-          type: "reasoning",
-          id: reasoning.data.item.id,
-          summary: reasoning.data.item.summary,
-          status: message.method === "item/started" ? "in_progress" : "completed",
-        });
-        return;
-      }
-      const search = z
-        .object({
-          item: z.object({
-            type: z.literal("webSearch"),
-            id: z.string(),
-            query: z.string(),
-            action: z
-              .discriminatedUnion("type", [
-                z.object({
-                  type: z.literal("search"),
-                  query: z.string().nullable().optional(),
-                  queries: z.array(z.string()).nullable().optional(),
-                }),
-                z.object({ type: z.literal("openPage"), url: z.string().nullable().optional() }),
-                z.object({
-                  type: z.literal("findInPage"),
-                  url: z.string().nullable().optional(),
-                  pattern: z.string().nullable().optional(),
-                }),
-                z.object({ type: z.literal("other") }),
-              ])
-              .nullable()
-              .optional(),
-          }),
-        })
-        .safeParse(message.params);
-      if (search.success) {
-        const action = search.data.item.action;
-        this.emit({
-          ...scope,
-          type: "web_search",
-          id: search.data.item.id,
-          status: message.method === "item/started" ? "in_progress" : "completed",
-          action: !action
-            ? null
-            : action.type === "search"
-              ? { type: "search", query: action.query ?? null, queries: action.queries ?? null }
-              : action.type === "openPage"
-                ? { type: "open_page", url: action.url ?? null }
-                : action.type === "findInPage"
-                  ? {
-                      type: "find_in_page",
-                      url: action.url ?? null,
-                      pattern: action.pattern ?? null,
-                    }
-                  : { type: "other" },
-        });
-        return;
-      }
-      if (message.method === "item/started") {
-        const command = completedItem.safeParse(message.params);
-        if (command.success && command.data.item.type === "commandExecution")
-          this.emit({
-            ...scope,
-            type: "command_start",
-            id: command.data.item.id,
-            command: command.data.item.command,
-            cwd: command.data.item.cwd ?? null,
-          });
-      }
-    }
-    if (message.method === "item/completed") {
-      const collab = z
-        .object({
-          item: z.object({
-            type: z.literal("collabAgentToolCall"),
-            id: z.string(),
-            tool: z.string(),
-            status: z.string(),
-            senderThreadId: z.string(),
-            receiverThreadIds: z.array(z.string()),
-            prompt: z.string().nullable(),
-            model: z.string().nullable(),
-            reasoningEffort: z.string().nullable(),
-          }),
-        })
-        .safeParse(message.params);
-      if (collab.success && collab.data.item.status === "completed") {
-        const item = collab.data.item;
-        for (const id of item.receiverThreadIds) {
-          let state = this.children.get(id);
-          if (!state && item.tool === "spawnAgent") {
-            state = {
-              parent: item.senderThreadId,
-              name: null,
-              instructions: item.prompt,
-              openedAt: Math.floor(Date.now() / 1000),
-              closed: false,
-              active: true,
-            };
-            this.children.set(id, state);
-          }
-          if (state) {
-            if (item.tool === "spawnAgent") state.instructions = item.prompt;
-            if (item.tool === "closeAgent") {
-              state.closed = true;
-              state.active = false;
-            }
-            if (
-              item.tool === "resumeAgent" ||
-              item.tool === "sendInput" ||
-              item.tool === "followupTask"
-            )
-              state.closed = false;
-            this.emit({
-              type: "subagent",
-              id: childId(id),
-              parentId: state.parent === this.threadId ? null : childId(state.parent),
-              name: state.name,
-              instructions: state.instructions,
-              openedAt: state.openedAt,
-              status: state.closed ? "closed" : "active",
-            });
-          }
-        }
-      }
-      if (collab.success) {
-        const item = collab.data.item;
-        const operation = z
-          .enum([
-            "spawnAgent",
-            "sendInput",
-            "resumeAgent",
-            "wait",
-            "closeAgent",
-            "sendMessage",
-            "followupTask",
-            "interruptAgent",
-          ])
-          .safeParse(item.tool);
-        if (operation.success)
-          this.emit({
-            ...scope,
-            type: "collaboration",
-            id: item.id,
-            operation: operation.data,
-            recipients: item.receiverThreadIds.map(childId),
-            prompt: item.prompt,
-            model: item.model,
-            effort: item.reasoningEffort,
-            success: item.status === "completed",
-          });
-      }
-    }
-    if (
-      child &&
-      nativeThread &&
-      (message.method === "turn/started" || message.method === "turn/completed")
-    ) {
-      const result = z
-        .object({
-          turn: z.object({
-            id: z.string(),
-            status: z.string(),
-            startedAt: z.number().nullable(),
-            completedAt: z.number().nullable(),
-          }),
-        })
-        .safeParse(message.params);
-      if (!result.success) {
-        this.lifecycle.fail("invalid_subagent_turn");
-        return;
-      }
-      const turn = result.data.turn;
-      child.turnId = turn.id;
-      child.active = message.method === "turn/started";
-      this.emit({
-        type: "subagent_turn",
-        id: childTurnId(turn.id),
-        subagentId: childId(nativeThread),
-        status: child.active
-          ? "in_progress"
-          : turn.status === "completed"
-            ? "completed"
-            : turn.status === "interrupted"
-              ? "cancelled"
-              : "failed",
-        startedAt: turn.startedAt ?? child.openedAt,
-        completedAt: turn.completedAt,
-      });
-      if (child.active && this.cancelRequested)
-        void this.perform(this.interruptNative(nativeThread, turn.id)).catch((error) =>
-          this.lifecycle.fail(error instanceof Error ? error.message : "subagent_interrupt_failed"),
-        );
-      this.finishIfReady();
-      return;
-    }
-    if (message.id !== undefined && message.method) {
-      if (message.method === "item/tool/call") {
-        const parsed = toolCall.safeParse(message.params);
-        if (!parsed.success) {
-          this.server?.reject(message.id);
-          return;
-        }
-        if (parsed.data.tool === programmaticTool.name && codeEnabled(this.execution)) {
-          const requestId = message.id;
-          void this.respondCode(
-            requestId,
-            parsed.data.arguments,
-            nativeThread ?? this.threadId,
-            scope,
-          ).catch(() => this.lifecycle.fail("programmatic_execution_failed"));
-          return;
-        }
-        if (DELEGATION_TOOLS.has(parsed.data.tool) && this.delegations.enabled) {
-          const requestId = message.id;
-          void this.perform(this.delegations.call(parsed.data.tool, parsed.data.arguments))
-            .then((result) =>
-              this.server?.respond(requestId, {
-                success: !result.isError,
-                contentItems: result.content.map((part) => ({
-                  type: "inputText",
-                  text: part.text,
-                })),
-              }),
-            )
-            .catch(() => this.server?.reject(requestId));
-          return;
-        }
-        this.pendingTools.set(parsed.data.callId, message.id);
-        this.lifecycle.setStatus("waiting");
-        this.emit({
-          ...scope,
-          type: "function_call",
-          id: parsed.data.callId,
-          callId: parsed.data.callId,
-          name: parsed.data.tool,
-          arguments: parsed.data.arguments,
-        });
-      } else if (message.method === "item/tool/requestUserInput") {
-        // EXPERIMENTAL Codex tool: no interactive client sits behind this API.
-        // Surface the questions as commentary and decline each one so the model
-        // continues with its own judgment instead of failing the turn.
-        const parsed = userInputRequest.safeParse(message.params);
-        if (!parsed.success) {
-          this.server?.reject(message.id);
-          return;
-        }
-        const { itemId, questions } = parsed.data;
-        this.emit({
-          ...scope,
-          type: "text",
-          id: `user_input:${itemId}`,
-          phase: "commentary",
-          text: [
-            "The agent asked for user input; this API cannot collect it interactively, so every question was declined:",
-            ...questions.map((question) => {
-              const options = question.options?.length
-                ? ` Options: ${question.options.map((option) => option.label).join(", ")}.`
-                : "";
-              return `- ${question.header}: ${question.question}${options}`;
-            }),
-          ].join("\n"),
-        });
-        this.server?.respond(message.id, {
-          answers: Object.fromEntries(questions.map((question) => [question.id, { answers: [] }])),
-        });
-      } else {
-        this.options.diagnostics(`Rejected unsupported app-server request: ${message.method}`);
-        this.server?.reject(message.id);
-      }
-      return;
-    }
-    if (message.method === "item/agentMessage/delta") {
-      const delta = z.object({ itemId: z.string(), delta: z.string() }).safeParse(message.params);
-      if (delta.success)
-        this.emit({ ...scope, type: "delta", id: delta.data.itemId, text: delta.data.delta });
-    } else if (message.method === "item/completed") {
-      const result = completedItem.safeParse(message.params);
-      if (!result.success) return;
-      const item = result.data.item;
-      if (item.type === "mcpToolCall") {
-        this.emit({
-          ...scope,
+          ...origin.scope,
           type: "mcp",
           id: item.id,
           name: item.tool,
@@ -892,74 +941,97 @@ export class CodexJob extends Job {
           success: item.status === "completed",
         });
         return;
-      }
-      this.emit(
-        item.type === "agentMessage"
-          ? {
-              ...scope,
-              type: "text",
-              id: item.id,
-              text: item.text,
-              phase: item.phase ?? "final_answer",
-            }
-          : {
-              ...scope,
-              type: "command",
-              id: item.id,
-              command: item.command,
-              output: item.aggregatedOutput ?? "",
-              exitCode: item.exitCode ?? null,
-              cwd: item.cwd ?? null,
-              durationMs: item.durationMs ?? null,
-              status:
-                item.status === "completed"
-                  ? "completed"
-                  : item.status === "declined" || item.status === "failed"
-                    ? "failed"
-                    : item.exitCode === null || item.exitCode === undefined
-                      ? "incomplete"
-                      : item.exitCode === 0
-                        ? "completed"
-                        : "failed",
-            },
-      );
-    } else if (message.method === "turn/completed") {
-      if (nativeThread && nativeThread !== this.threadId) return;
-      const result = z
-        .object({
-          turn: z.object({
-            status: z.string(),
-            error: z
-              .object({
-                message: z.string(),
-                codexErrorInfo: z.unknown().optional(),
-                additionalDetails: z.string().nullable().optional(),
-              })
-              .nullable()
-              .optional(),
-          }),
-        })
-        .safeParse(message.params);
-      if (!result.success) {
-        this.lifecycle.fail("invalid_turn_event");
+      case "agentMessage":
+        this.emit({
+          ...origin.scope,
+          type: "text",
+          id: item.id,
+          text: item.text,
+          phase: item.phase ?? "final_answer",
+        });
         return;
-      }
-      if (result.data.turn.status === "completed")
-        this.rootOutcome = this.cancelRequested ? "cancelled" : "completed";
-      else if (result.data.turn.status === "interrupted") this.rootOutcome = "cancelled";
-      else {
-        // The public error is a stable Agents API code; the native detail goes to diagnostics.
-        const error = result.data.turn.error;
-        const code = turnErrorCode(error?.codexErrorInfo, error?.message ?? "");
-        this.options.diagnostics(
-          `native_turn_failed (${code}): ${error?.message ?? result.data.turn.status}${
-            error?.additionalDetails ? ` | ${error.additionalDetails}` : ""
-          } codexErrorInfo=${JSON.stringify(error?.codexErrorInfo ?? null)}`,
-        );
-        this.lifecycle.fail(code);
-      }
-      this.finishIfReady();
+      case "commandExecution":
+        this.emit({
+          ...origin.scope,
+          type: "command",
+          id: item.id,
+          command: item.command,
+          output: item.aggregatedOutput ?? "",
+          exitCode: item.exitCode ?? null,
+          cwd: item.cwd ?? null,
+          durationMs: item.durationMs ?? null,
+          status: commandStatus(item),
+        });
     }
+  }
+  /** A dynamic tool call: code and delegation are answered here; client functions wait for the Worker. */
+  private toolCall(requestId: string | number, params: unknown, origin: Origin): void {
+    const parsed = toolCall.safeParse(params);
+    if (!parsed.success) {
+      this.server?.reject(requestId);
+      return;
+    }
+    if (parsed.data.tool === programmaticTool.name && codeEnabled(this.execution)) {
+      void this.respondCode(
+        requestId,
+        parsed.data.arguments,
+        origin.nativeThread ?? this.threadId,
+        origin.scope,
+      ).catch(() => this.lifecycle.fail("programmatic_execution_failed"));
+      return;
+    }
+    if (DELEGATION_TOOLS.has(parsed.data.tool) && this.delegations.enabled) {
+      void this.perform(this.delegations.call(parsed.data.tool, parsed.data.arguments))
+        .then((result) =>
+          this.server?.respond(requestId, {
+            success: !result.isError,
+            contentItems: result.content.map((part) => ({ type: "inputText", text: part.text })),
+          }),
+        )
+        .catch(() => this.server?.reject(requestId));
+      return;
+    }
+    this.pendingTools.set(parsed.data.callId, requestId);
+    this.lifecycle.setStatus("waiting");
+    this.emit({
+      ...origin.scope,
+      type: "function_call",
+      id: parsed.data.callId,
+      callId: parsed.data.callId,
+      name: parsed.data.tool,
+      arguments: parsed.data.arguments,
+    });
+  }
+  /**
+   * EXPERIMENTAL Codex tool: no interactive client sits behind this API. Surface the
+   * questions as commentary and decline each one so the model continues with its
+   * own judgment instead of failing the turn.
+   */
+  private userInputRequest(requestId: string | number, params: unknown, origin: Origin): void {
+    const parsed = userInputRequest.safeParse(params);
+    if (!parsed.success) {
+      this.server?.reject(requestId);
+      return;
+    }
+    const { itemId, questions } = parsed.data;
+    this.emit({
+      ...origin.scope,
+      type: "text",
+      id: `user_input:${itemId}`,
+      phase: "commentary",
+      text: [
+        "The agent asked for user input; this API cannot collect it interactively, so every question was declined:",
+        ...questions.map((question) => {
+          const options = question.options?.length
+            ? ` Options: ${question.options.map((option) => option.label).join(", ")}.`
+            : "";
+          return `- ${question.header}: ${question.question}${options}`;
+        }),
+      ].join("\n"),
+    });
+    this.server?.respond(requestId, {
+      answers: Object.fromEntries(questions.map((question) => [question.id, { answers: [] }])),
+    });
   }
   private finishIfReady(): void {
     if (
@@ -979,88 +1051,91 @@ export class CodexJob extends Job {
   }
   protected apply(id: string, command: RuntimeCommand) {
     return Effect.gen(this, function* () {
-      const rejected = (message: string) => new ApiError(409, "command_rejected", message);
-      if (command.type === "cancel") {
-        // Idempotent: a terminal or unstarted job has nothing left to interrupt.
-        if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
-        this.cancelRequested = true;
-        // A finished root must read as cancelled before a settling child can seal the outcome.
-        this.lifecycle.requestCancel();
-        if (this.rootOutcome) this.rootOutcome = "cancelled";
-        // Children are told before the shared abort signal closes their route.
-        yield* this.delegations.cancelAll();
-        this.abort.abort();
-        for (const pending of this.pendingCode.values())
-          yield* Deferred.fail(pending, new ExecutionCancelled());
-        this.pendingCode.clear();
-        if (!this.rootOutcome) yield* this.interruptNative(this.threadId, this.nativeTurnId);
-        for (const [threadId, child] of this.children) {
-          if (child.active && child.turnId) yield* this.interruptNative(threadId, child.turnId);
-        }
-        this.finishIfReady();
-        return;
-      }
+      if (command.type === "cancel") return yield* this.cancelTurn();
       const server = this.server;
-      if (!server) return yield* rejected("App-server not started");
+      if (!server) return yield* new CommandRejected({ reason: "App-server not started" });
       if (this.closing || !["running", "waiting"].includes(this.status))
-        return yield* rejected("Turn is no longer active");
-      if (command.type === "steer") {
-        // Codex answered: the steer can never apply to this turn (it ended or
-        // moved on). Transport failures stay transient and are retried.
-        yield* server
-          .request("turn/steer", {
-            threadId: this.threadId,
-            expectedTurnId: this.nativeTurnId,
-            input: this.input(command.input),
-          })
-          .pipe(
-            Effect.catchTag("RpcError", (error) =>
-              rejected(`Codex rejected the steer: ${error.message}`),
-            ),
-          );
-        return;
-      }
+        return yield* new CommandRejected({ reason: "Turn is no longer active" });
+      if (command.type === "steer") return yield* this.steerTurn(server, command.input);
       const delegated = this.delegations.owns(command.callId);
-      if (delegated) {
-        yield* this.delegations.routeToolResult(delegated, id, command);
-        return;
-      }
+      if (delegated) return yield* this.delegations.routeToolResult(delegated, id, command);
       const codeResult = this.pendingCode.get(command.callId);
-      if (codeResult) {
-        this.pendingCode.delete(command.callId);
-        yield* Deferred.succeed(codeResult, {
-          content:
-            typeof command.output === "string"
-              ? [{ type: "text", text: command.output }]
-              : command.output.map((part): JsonValue => {
-                  if (part.type === "input_text") return { type: "text", text: part.text };
-                  return { type: "image", image_url: part.image_url };
-                }),
-          isError: !command.success,
-        });
-        this.lifecycle.setStatus(
-          this.pendingCode.size || this.pendingTools.size ? "waiting" : "running",
-        );
-        return;
-      }
+      if (codeResult) return yield* this.answerCode(command, codeResult);
       const requestId = this.pendingTools.get(command.callId);
-      if (requestId === undefined) return yield* rejected("Unknown tool call");
-      server.respond(requestId, {
-        success: command.success,
-        contentItems:
-          typeof command.output === "string"
-            ? [{ type: "inputText", text: command.output }]
-            : command.output.map((part) =>
-                part.type === "input_text"
-                  ? { type: "inputText", text: part.text }
-                  : { type: "inputImage", imageUrl: part.image_url },
-              ),
-      });
+      if (requestId === undefined)
+        return yield* new CommandRejected({ reason: "Unknown tool call" });
+      server.respond(requestId, { success: command.success, contentItems: contentItems(command) });
       this.pendingTools.delete(command.callId);
-      this.lifecycle.setStatus(
-        this.pendingTools.size || this.pendingCode.size ? "waiting" : "running",
-      );
+      this.settleWaiting();
     });
+  }
+  /** Idempotent: a terminal or unstarted job has nothing left to interrupt. */
+  private cancelTurn(): Effect.Effect<void, RpcFailure> {
+    return Effect.gen(this, function* () {
+      if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
+      this.cancelRequested = true;
+      // A finished root must read as cancelled before a settling child can seal the outcome.
+      this.lifecycle.requestCancel();
+      if (this.rootOutcome) this.rootOutcome = "cancelled";
+      // Children are told before the shared abort signal closes their route.
+      yield* this.delegations.cancelAll();
+      this.abort.abort();
+      for (const pending of this.pendingCode.values())
+        yield* Deferred.fail(pending, new ExecutionCancelled());
+      this.pendingCode.clear();
+      if (!this.rootOutcome) yield* this.interruptNative(this.threadId, this.nativeTurnId);
+      for (const [threadId, child] of this.children) {
+        if (child.active && child.turnId) yield* this.interruptNative(threadId, child.turnId);
+      }
+      this.finishIfReady();
+    });
+  }
+  /**
+   * Codex answered: the steer can never apply to this turn (it ended or moved on).
+   * Transport failures stay transient and are retried.
+   */
+  private steerTurn(
+    server: AppServer,
+    input: Execution["input"],
+  ): Effect.Effect<void, CommandRejected | RpcFailure> {
+    return server
+      .request("turn/steer", {
+        threadId: this.threadId,
+        expectedTurnId: this.nativeTurnId,
+        input: this.input(input),
+      })
+      .pipe(
+        Effect.asVoid,
+        Effect.catchTag(
+          "RpcError",
+          (error) => new CommandRejected({ reason: `Codex rejected the steer: ${error.message}` }),
+        ),
+      );
+  }
+  /** A client function result for a call that running code raised. */
+  private answerCode(
+    command: Extract<RuntimeCommand, { type: "tool_result" }>,
+    result: Deferred.Deferred<JsonValue, ExecutionStopped | ExecutionCancelled>,
+  ): Effect.Effect<void> {
+    return Effect.gen(this, function* () {
+      this.pendingCode.delete(command.callId);
+      const content: JsonValue =
+        typeof command.output === "string"
+          ? [{ type: "text", text: command.output }]
+          : command.output.map((part): JsonValue =>
+              part.type === "input_text"
+                ? { type: "text", text: part.text }
+                : { type: "image", image_url: part.image_url },
+            );
+      yield* Deferred.succeed(result, { content, isError: !command.success });
+      this.settleWaiting();
+    });
+  }
+  /** Waiting while any client call is open; running once the last one is answered. */
+  private settleWaiting(): void {
+    this.lifecycle.setStatus(
+      this.pendingCode.size || this.pendingTools.size ? "waiting" : "running",
+    );
   }
   private async respondCode(
     requestId: string | number,
@@ -1079,7 +1154,7 @@ export class CodexJob extends Job {
         invocation,
       );
       if (result.terminal || (result.isError && this.pendingCode.size))
-        throw new Error("Code execution left unfinished tool calls");
+        throw new CodeCallsOutstanding();
       this.server?.respond(requestId, {
         success: !result.isError,
         contentItems: result.content.map((part) => ({ type: "inputText", text: part.text })),
@@ -1104,7 +1179,7 @@ export class CodexJob extends Job {
     ),
     nextCursor: z.string().nullish(),
   });
-  codeTools(invocation: string): Effect.Effect<string[], ToolError> {
+  codeTools(invocation: string): Effect.Effect<string[], TaggedFailure> {
     return Effect.gen(this, function* () {
       const context = this.codeInvocations.get(invocation);
       const server = this.server;
@@ -1144,16 +1219,14 @@ export class CodexJob extends Job {
           return yield* new ToolUnavailable({ message: "MCP pagination did not advance" });
         if (cursor) seen.add(cursor);
       } while (cursor);
-      return [
-        ...(this.execution.agent.tools ?? []).flatMap((tool) =>
-          tool.type === "function" ? [tool.name] : [],
-        ),
-        ...(this.execution.sandbox ? Object.keys(workspaceTools) : []),
-        ...context.mcp.keys(),
-      ];
-    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTools")));
+      return [...codeToolNames(this.execution), ...context.mcp.keys()];
+    }).pipe(Effect.mapError(asFailure("codex.codeTools")));
   }
-  codeTool(name: string, args: unknown, invocation: string): Effect.Effect<JsonValue, ToolError> {
+  codeTool(
+    name: string,
+    args: unknown,
+    invocation: string,
+  ): Effect.Effect<JsonValue, TaggedFailure> {
     return Effect.gen(this, function* () {
       const context = this.codeInvocations.get(invocation);
       if (!context) return yield* new ToolUnavailable({ message: "No active code invocation" });
@@ -1231,7 +1304,7 @@ export class CodexJob extends Job {
       });
       this.lifecycle.setStatus("waiting");
       return yield* Deferred.await(result);
-    }).pipe(Effect.mapError(rpcToServiceError("codex.codeTool")));
+    }).pipe(Effect.mapError(asFailure("codex.codeTool")));
   }
   private interruptNative(threadId: string, turnId: string): Effect.Effect<void, RpcFailure> {
     return this.server
@@ -1246,10 +1319,3 @@ export class CodexJob extends Job {
       : Effect.void;
   }
 }
-/** Tool-path failures keep their tag; everything else is transient I/O for the route. */
-const rpcToServiceError =
-  (operation: string) =>
-  (cause: unknown): ToolError =>
-    cause instanceof ToolUnavailable || cause instanceof ApiError || cause instanceof OperationError
-      ? cause
-      : new OperationError({ operation, cause });
