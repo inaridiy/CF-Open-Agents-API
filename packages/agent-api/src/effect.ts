@@ -38,11 +38,14 @@ export const io = <A>(operation: string, f: (signal: AbortSignal) => PromiseLike
 export const attempt = <A>(operation: string, f: () => A) =>
   Effect.try({ try: f, catch: (cause) => failure(operation, cause) });
 
-/** Preserve API errors across Workers RPC instead of exporting FiberFailure wrappers. */
-export async function runPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
-  const exit = await Effect.runPromiseExit(effect);
+/** Every boundary runner settles the same way: the value, or the squashed cause thrown as itself. */
+export function settle<A, E>(exit: Exit.Exit<A, E>): A {
   if (Exit.isSuccess(exit)) return exit.value;
   throw Cause.squash(exit.cause);
+}
+/** Preserve API errors across Workers RPC instead of exporting FiberFailure wrappers. */
+export async function runPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
+  return settle(await Effect.runPromiseExit(effect));
 }
 
 /**
