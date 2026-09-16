@@ -1,12 +1,24 @@
 # Deployment and verification
 
-The example in `examples/worker` is one Worker that exports every class: `AgentWorker`, `SessionDO`, `TenantCatalogDO`, `HarnessDO`, `SandboxDO`, `ContainerProxy` and the `Models` entrypoint. It binds two Container images, two R2 buckets, a loopback Service Binding to `Models`, a `CODE_LOADER` worker loader and the `AI` binding. `HarnessDO` uses the `basic` instance type and `SandboxDO` uses `standard-1`; tune both after measurement. The Sandbox package and its image both pin `0.13.0-next.751.1`.
+The example in `examples/worker` is one Worker that exports every class: `Agents` (the API, also the default export), `SessionDO`, `TenantCatalogDO`, `HarnessDO`, `SandboxDO`, `ContainerProxy` and the `Models` entrypoint. It binds two Container images, two R2 buckets, a loopback Service Binding to `Models`, a `CODE_LOADER` worker loader and the `AI` binding. `HarnessDO` uses the `basic` instance type and `SandboxDO` uses `standard-1`; tune both after measurement. The Sandbox package and its image both pin `0.13.0-next.751.1`.
 
-Running any harness needs this repository's Docker images: `docker/Harness.Dockerfile` (the supervisor, Codex and OpenCode on Node 24) and `docker/Sandbox.Dockerfile` (Cloudflare's sandbox image plus `python3` and Codex `exec-server`). Wrangler builds them from `examples/worker/wrangler.jsonc`.
+Running any harness needs this repository's Docker images: `docker/Harness.Dockerfile` (the supervisor, Codex and OpenCode on Node 24) and `docker/Sandbox.Dockerfile` (Cloudflare's sandbox image plus `python3` and Codex `exec-server`). Wrangler builds them from `examples/worker/wrangler.jsonc`; a project set up by the [CLI](../packages/create-cf-open-agents-api/README.md) builds the same Dockerfiles from its `.cf-open-agents-api/` snapshot.
 
-## Production walkthrough
+## Production walkthrough with the CLI
 
-1. Create the R2 buckets, or rename them in `examples/worker/wrangler.jsonc` (`BACKUP_BUCKET_NAME` must equal the `BACKUP_BUCKET` binding's bucket name; `pnpm check:docs` verifies that):
+In a project the CLI set up, provisioning is two commands; `doctor` checks the toolchain, the binding agreement rules and the local token first:
+
+```sh
+pnpm dlx create-cf-open-agents-api@alpha doctor
+pnpm dlx create-cf-open-agents-api@alpha setup     # wrangler r2 bucket create ×2, wrangler secret bulk with every secret
+pnpm exec wrangler deploy
+```
+
+`setup` prompts for the values (or reads them from the environment with `--from-env`) and tells you when it needs the R2 API token from the dashboard. The manual steps below are what it runs.
+
+## Production walkthrough by hand
+
+1. Create the R2 buckets, or rename them in `examples/worker/wrangler.jsonc` (`BACKUP_BUCKET_NAME` must equal the `BACKUP_BUCKET` binding's bucket name; `pnpm check:docs` verifies that in the repository, `create-cf-open-agents-api doctor` in your project):
 
    ```sh
    pnpm exec wrangler r2 bucket create cf-open-agents-api-checkpoints

@@ -4,50 +4,45 @@ A deployment chooses the native harness and the model separately. Clients name p
 
 ## Presets, harnesses and the model gateway
 
-This is the composition in [examples/worker/src/index.ts](../examples/worker/src/index.ts):
+This is the composition in [examples/worker/src/index.ts](../examples/worker/src/index.ts), which the setup CLI also generates:
 
 ```ts
 import { createOpenAI } from "@ai-sdk/openai";
-import {
-  bearerTenant,
-  containerEnvironments,
-  containerHarnesses,
-  createAgentService,
-} from "cf-open-agents-api/cloudflare";
-import { aiSDKModel, createModelGateway, nativeModel } from "cf-open-agents-api/models";
+import { bearerTenant, defineAgentWorker } from "cf-open-agents-api/cloudflare";
+import { aiSDKModel, nativeModel } from "cf-open-agents-api/models";
 import { createWorkersAI } from "workers-ai-provider";
 
-const service = createAgentService<Bindings>({
-  agents: {
-    coding: {
-      harness: "codex",
-      model: "codex",
-      delegates: ["claude", "opencode"],
-      webSearch: true,
+export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
+  defineAgentWorker<Bindings>({
+    agents: {
+      coding: {
+        harness: "codex",
+        model: "codex",
+        delegates: ["claude", "opencode"],
+        webSearch: true,
+      },
+      claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
+      opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
+      workers: { harness: "codex", model: "workers" },
     },
-    claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
-    opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
-    workers: { harness: "codex", model: "workers" },
-  },
-  harnesses: containerHarnesses,
-  objects: (env) => env.CHECKPOINTS,
-  environments: containerEnvironments,
-  authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
-});
-// Registry entries may be factories; a preset is built only when a session selects it.
-const gateway = createModelGateway<Bindings>((env) => ({
-  codex: () =>
-    nativeModel({
-      protocol: "responses",
-      baseURL: "https://api.openai.com/v1",
-      apiKey: env.OPENAI_API_KEY,
-      model: "gpt-6-astra",
+    // Registry entries may be factories; a preset is built only when a session selects it.
+    models: (env) => ({
+      codex: () =>
+        nativeModel({
+          protocol: "responses",
+          baseURL: "https://api.openai.com/v1",
+          apiKey: env.OPENAI_API_KEY,
+          model: "gpt-6-astra",
+        }),
+      primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+      workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
     }),
-  primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-  workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
-}));
-// A private WorkerEntrypoint named Models delegates fetch(request) to gateway.fetch(request, this.env).
+    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
+  });
+export default Agents;
 ```
+
+The `Models` entrypoint is the private model gateway; `MODEL_GATEWAY` binds it from the same Worker. See the [library API](library-api.md#composition) for every option and for `createAgentService`, the lower-level factory.
 
 Each preset (`AgentRegistration`) has:
 
@@ -184,9 +179,9 @@ const Harness = createHarness<Bindings>(async (sandbox, execution, env) => {
   const reference = await yourSkillCatalog(env, execution.agent.model);
   await installSkill(env.CHECKPOINTS, reference, sandbox);
 });
-export { Harness as HarnessDO };
+export const { HarnessDO, ...rest } = defineAgentWorker<Bindings>({ ...options, harness: Harness });
 ```
 
-The hook runs once per fresh workspace, before `exec-server` and the first model call. A reused or restored sandbox skips it. Export the returned class directly: outbound handlers are registered by concrete class name through the Container SDK's static setter, and an unregistered subclass does not inherit them.
+The hook runs once per fresh workspace, before `exec-server` and the first model call. A reused or restored sandbox skips it. Export the returned class directly (`defineAgentWorker` returns it unchanged as `HarnessDO`): outbound handlers are registered by concrete class name through the Container SDK's static setter, and an unregistered subclass does not inherit them.
 
 Knowledge indexing stays application-owned. `knowledgeSearch` accepts AI Search, Vectorize or any retrieval provider that returns the common result shape.

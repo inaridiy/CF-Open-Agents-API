@@ -6,7 +6,8 @@
     ".agents/PLANS.md",
     "SECURITY.md",
     "CHANGELOG.md",
-    "packages/agent-api/README.md"
+    "packages/agent-api/README.md",
+    "packages/create-cf-open-agents-api/README.md"
   ],
   "localSkills": ["native-harness-change"]
 }
