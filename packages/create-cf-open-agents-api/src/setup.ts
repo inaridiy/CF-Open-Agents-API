@@ -197,6 +197,6 @@ export async function runSetup(options: SetupOptions): Promise<Plan> {
   plan.note(
     `Deploy with ${wrangler.describe(["deploy"])}; the first deploy pushes both images and takes several minutes.`,
   );
-  reporter.outro(plan.render(options.dryRun ? "Dry run: nothing was changed" : "Done"));
+  reporter.plan(plan, options.dryRun ? "Dry run: nothing was changed" : "Done");
   return plan;
 }

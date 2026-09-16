@@ -49,6 +49,7 @@ export const silent = (): Reporter => ({
   warn() {},
   spin: (_label, work) => work(),
   note() {},
+  plan() {},
   outro() {},
 });
 

@@ -1,6 +1,6 @@
 import * as clack from "@clack/prompts";
 
-import { CliError } from "./plan.js";
+import { CliError, type Plan } from "./plan.js";
 
 export interface Choice<T extends string> {
   value: T;
@@ -28,6 +28,8 @@ export interface Reporter {
   /** Runs a slow step with a spinner; the label is replaced by the result. */
   spin<T>(label: string, work: () => Promise<T>, done: (result: T) => string): Promise<T>;
   note(message: string, title: string): void;
+  /** The final report: what was created, updated and skipped, under a one-line verdict. */
+  plan(plan: Plan, title: string): void;
   outro(message: string): void;
 }
 
@@ -97,6 +99,10 @@ export function clackReporter(): Reporter {
       }
     },
     note: (message, title) => clack.note(message, title),
+    plan: (plan, title) => {
+      clack.note(plan.body(), title);
+      clack.outro(title);
+    },
     outro: (message) => clack.outro(message),
   };
 }
@@ -115,6 +121,7 @@ export function plainReporter(
       return result;
     },
     note: (message, title) => write(`\n${title}\n${message}`),
+    plan: (plan, title) => write(`\n${plan.render(title)}`),
     outro: (message) => write(`\n${message}`),
   };
 }

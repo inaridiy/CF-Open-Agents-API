@@ -32,10 +32,13 @@ export class Plan {
 
   /** The Created/Updated/Skipped/Notes report, one bullet per file. */
   render(title: string): string {
+    return `${title}\n${this.body()}`;
+  }
+
+  body(): string {
     const block = (heading: string, items: readonly string[]) =>
-      items.length === 0 ? [] : ["", heading, ...items.map((item) => `  - ${item}`)];
+      items.length === 0 ? [] : [heading, ...items.map((item) => `  - ${item}`)];
     return [
-      title,
       ...block("Created", this.created),
       ...block("Updated", this.updated),
       ...block("Skipped", this.skipped),

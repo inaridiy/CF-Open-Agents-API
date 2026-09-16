@@ -117,7 +117,7 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
     );
   if (answers.install && !options.dryRun) await install(project, reporter, options.runner ?? run);
   reporter.note(nextSteps(project, answers, agentsPath), "Next steps");
-  reporter.outro(plan.render(options.dryRun ? "Dry run: nothing was written" : "Done"));
+  reporter.plan(plan, options.dryRun ? "Dry run: nothing was written" : "Done");
   return { project, answers, plan, agentsPath };
 }
 
