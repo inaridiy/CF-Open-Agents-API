@@ -7,10 +7,21 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const directory = await mkdtemp(join(tmpdir(), "cf-package-consumer-"));
-const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-const library = JSON.parse(
-  await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
-);
+const manifest =
+  /** @type {{ packageManager: string, devDependencies: Record<string, string> }} */ (
+    JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  );
+const library =
+  /** @type {{ name: string, version: string, dependencies: Record<string, string>, peerDependencies: Record<string, string> }} */ (
+    JSON.parse(
+      await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
+    )
+  );
+/**
+ * @param {string} command
+ * @param {readonly string[]} args
+ * @param {string} cwd
+ */
 const run = (command, args, cwd) => execFileSync(command, args, { cwd, stdio: "inherit" });
 try {
   run("pnpm", ["--filter", library.name, "pack", "--pack-destination", directory], root);
@@ -49,7 +60,7 @@ try {
     `
 import { Effect, Schema } from "effect";
 import { type RuntimeDriver, runPromise } from "cf-open-agents-api";
-import { createAgentService } from "cf-open-agents-api/cloudflare";
+import { type AgentRPC, createAgentService } from "cf-open-agents-api/cloudflare";
 import { modelAdapter } from "cf-open-agents-api/models";
 import { defineTool } from "cf-open-agents-api/tools";
 const driver: RuntimeDriver = {
@@ -59,6 +70,12 @@ const driver: RuntimeDriver = {
   checkpoint: () => Effect.succeed({ version: 1, driver: "consumer", revision: "1", native: "test" }),
 };
 void createAgentService;
+declare const rpc: AgentRPC;
+void rpc.listSessions("tenant");
+void rpc.listItems("tenant", "sess_example", { limit: 1 });
+void rpc.listTurns("tenant", "sess_example");
+void rpc.retrieveTurn("tenant", "sess_example", "turn_example");
+void rpc.deleteSession("tenant", "sess_example");
 void driver;
 const adapter = modelAdapter(() => Effect.succeed(new Response("ok")));
 const tool = defineTool({ name: "echo", description: "Consumer tool", input: Schema.Struct({ text: Schema.String }), output: Schema.String, effects: "read", retry: "safe", execute: ({ text }) => Effect.succeed(text) });

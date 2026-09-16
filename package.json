@@ -1,50 +1,58 @@
 {
   "name": "cf-open-agents-api-workspace",
   "private": true,
-  "type": "module",
-  "packageManager": "pnpm@11.1.2",
-  "engines": {
-    "node": ">=24"
-  },
-  "scripts": {
-    "build": "pnpm -r --if-present build",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check .",
-    "format": "biome check --write .",
-    "test": "vitest run",
-    "test:codex": "vitest run --config vitest.codex.config.ts",
-    "check": "pnpm check:docs && pnpm check:harness && pnpm test:scripts && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
-    "dev": "wrangler dev --config examples/worker/wrangler.jsonc",
-    "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts",
-    "deploy:check": "wrangler deploy --dry-run --config examples/worker/wrangler.jsonc",
-    "test:containers": "node scripts/test-containers.mjs",
-    "check:docs": "node scripts/check-docs.mjs",
-    "check:harness": "node scripts/check-harness.mjs",
-    "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts",
-    "test:scripts": "node --test scripts/*.test.mjs",
-    "test:package": "pnpm build && node scripts/test-package.mjs"
-  },
-  "devDependencies": {
-    "@ai-sdk/openai": "4.0.65",
-    "@anthropic-ai/sdk": "0.125.0",
-    "@biomejs/biome": "2.5.13",
-    "@cloudflare/vitest-pool-workers": "0.22.0",
-    "@cloudflare/workers-types": "5.20260911.1",
-    "@types/node": "24.13.4",
-    "ai": "7.0.97",
-    "effect": "3.22.2",
-    "openai": "7.15.0",
-    "opencode-ai": "1.18.30",
-    "typescript": "7.0.2",
-    "vitest": "4.1.11",
-    "wrangler": "4.131.1"
+  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
+  "bugs": {
+    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/inaridiy/CF-Open-Agents-API.git"
   },
-  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
-  "bugs": {
-    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
-  }
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "typecheck": "tsc --noEmit",
+    "lint": "ultracite check --type-aware",
+    "format": "ultracite fix --type-aware",
+    "test": "vitest run",
+    "test:codex": "vitest run --config vitest.codex.config.ts",
+    "check": "pnpm check:docs && pnpm check:harness && pnpm typecheck && pnpm lint && pnpm build && pnpm test:scripts && pnpm test",
+    "dev": "wrangler dev --config examples/worker/wrangler.jsonc",
+    "dev:caller": "wrangler dev --config examples/caller/wrangler.jsonc --config examples/worker/wrangler.jsonc --port 8788",
+    "types": "wrangler types --config examples/worker/wrangler.jsonc examples/worker/env.d.ts && wrangler types --config examples/caller/wrangler.jsonc --env-interface CallerEnv examples/caller/env.d.ts",
+    "deploy:check": "wrangler deploy --dry-run --config examples/worker/wrangler.jsonc && wrangler deploy --dry-run --config examples/caller/wrangler.jsonc",
+    "test:containers": "node scripts/test-containers.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check:harness": "node scripts/check-harness.mjs",
+    "test:harnesses": "pnpm build && vitest run --config vitest.harnesses.config.ts",
+    "test:scripts": "node --test scripts/*.test.mjs scripts/lint/*.test.mjs",
+    "test:package": "pnpm build && node scripts/test-package.mjs",
+    "effect:diagnostics": "effect-tsgo diagnostics --project tsconfig.json --format text",
+    "prepare": "effect-tsgo patch --typescript --oxlint"
+  },
+  "devDependencies": {
+    "@ai-sdk/openai": "4.0.65",
+    "@anthropic-ai/sdk": "0.125.0",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20260911.1",
+    "@effect/tsgo": "0.45.0",
+    "@types/node": "24.13.4",
+    "ai": "7.0.97",
+    "effect": "3.22.2",
+    "fflate": "0.8.3",
+    "openai": "7.15.0",
+    "opencode-ai": "1.18.30",
+    "oxfmt": "0.67.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "typescript": "7.0.2",
+    "ultracite": "7.11.0",
+    "vitest": "4.1.11",
+    "wrangler": "4.131.1"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.1.2"
 }

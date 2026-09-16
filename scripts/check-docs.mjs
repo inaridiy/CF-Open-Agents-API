@@ -2,12 +2,21 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
-const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+const manifest =
+  /** @type {{ scripts: Record<string, string>, devDependencies: Record<string, string> }} */ (
+    JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
+  );
+// npm lifecycle hooks run on install and are not commands a developer types.
+const lifecycle = new Set(["prepare", "prepack", "postinstall", "preinstall", "prepublishOnly"]);
 for (const command of Object.keys(manifest.scripts))
-  assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
-const library = JSON.parse(
-  await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
-);
+  if (!lifecycle.has(command))
+    assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
+const library =
+  /** @type {{ name: string, repository: { url: string }, exports: Record<string, unknown>, dependencies: Record<string, string> }} */ (
+    JSON.parse(
+      await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
+    )
+  );
 const repositoryName = new URL(library.repository.url.replace(/^git\+/, "")).pathname
   .split("/")
   .at(-1)
@@ -23,7 +32,10 @@ for (const entrypoint of Object.keys(library.exports)) {
   assert(packageReadme.includes(`\`${specifier}\``), `Document the ${specifier} entrypoint`);
 }
 for (const file of ["examples/worker/wrangler.jsonc", "tests/containers/wrangler.jsonc"]) {
-  const config = JSON.parse(await readFile(new URL(`../${file}`, import.meta.url), "utf8"));
+  const config =
+    /** @type {{ name: string, services: { binding: string, service: string }[], vars: Record<string, string>, r2_buckets: { binding: string, bucket_name: string }[] }} */ (
+      JSON.parse(await readFile(new URL(`../${file}`, import.meta.url), "utf8"))
+    );
   assert.equal(
     config.services.find((service) => service.binding === "MODEL_GATEWAY").service,
     config.name,
@@ -40,8 +52,10 @@ assert(
   dockerfile.includes(`cloudflare/sandbox:${library.dependencies["@cloudflare/sandbox"]}\n`),
   "Sandbox package and Docker image versions must match",
 );
-const supervisor = JSON.parse(
-  await readFile(new URL("../packages/supervisor/package.json", import.meta.url), "utf8"),
+const supervisor = /** @type {{ dependencies: Record<string, string> }} */ (
+  JSON.parse(
+    await readFile(new URL("../packages/supervisor/package.json", import.meta.url), "utf8"),
+  )
 );
 const harnessSource = await readFile(
   new URL("../packages/agent-api/src/harnesses.ts", import.meta.url),

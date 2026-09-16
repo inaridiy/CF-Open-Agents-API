@@ -9,14 +9,17 @@ import {
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
+import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
   namespace Cloudflare {
     interface Env extends TestEnv {}
     interface GlobalProps {
-      mainModule: typeof import("./worker.js");
+      mainModule: typeof WorkerModule;
     }
   }
 }
@@ -51,7 +54,7 @@ it("the official SDK creates, runs, pages and retrieves a persisted session", as
   expect((await api.beta.agents.sessions.retrieve(session.id)).status).toBe("idle");
   const persisted = await runInDurableObject<SessionDO, SessionRecord>(
     stub(session.id),
-    (instance) => instance.db.require<SessionRecord>("state", "session"),
+    (instance) => instance.db.require(SessionKinds.state, "session"),
   );
   expect(persisted.checkpoint?.native).toContain("checkpoint/");
   expect((await api.beta.agents.sessions.list()).data).toHaveLength(1);
@@ -87,7 +90,11 @@ it("rolls back all inputs when a later event in the batch fails validation", asy
         },
       ],
     }),
-  ).rejects.toMatchObject({ status: 409 });
+  ).rejects.toMatchObject({
+    status: 400,
+    code: "invalid_request_error",
+    message: expect.stringContaining("Unknown pending tool call: missing") as string,
+  });
   expect((await api.beta.agents.sessions.retrieve(session.id)).status).toBe("idle");
   expect((await api.beta.agents.sessions.turns.list(session.id)).data).toHaveLength(0);
 });
@@ -127,7 +134,7 @@ it("never starts a missing acknowledged execution again", async () => {
     .poll(() =>
       runInDurableObject<SessionDO, string>(
         stub(session.id),
-        (instance) => instance.db.require<SessionRecord>("state", "session").phase,
+        (instance) => instance.db.require(SessionKinds.state, "session").phase,
       ),
     )
     .toBe("running");
@@ -147,13 +154,100 @@ it("isolates tenants and validates unsupported features before creating state", 
   await expect(client("tenant-b").beta.agents.sessions.retrieve(session.id)).rejects.toMatchObject({
     status: 404,
   });
-  await expect(
-    client().beta.agents.sessions.create({
-      ...params,
-      agent: { model: "test", multi_agent: { enabled: true } },
-    }),
-  ).rejects.toMatchObject({ status: 400 });
+  const unsupported = [
+    { multi_agent: { enabled: true } },
+    { tools: [{ type: "tool_search" as const }] },
+    { tools: [{ type: "web_search" as const }] },
+    {
+      tools: [
+        {
+          type: "mcp" as const,
+          server_label: "docs",
+          transport: { type: "http" as const, server_url: "https://mcp.example/mcp" },
+        },
+      ],
+    },
+    {
+      tools: [
+        {
+          type: "function" as const,
+          name: "later",
+          description: "Deferred",
+          parameters: { type: "object" },
+          defer_loading: true,
+        },
+      ],
+    },
+  ];
+  for (const agent of unsupported) {
+    await expect(
+      client().beta.agents.sessions.create({ ...params, agent: { model: "test", ...agent } }),
+    ).rejects.toMatchObject({ status: 422, code: "unsupported_capability" });
+    await expect(client().beta.agents.create({ model: "test", ...agent })).rejects.toMatchObject({
+      status: 422,
+      code: "unsupported_capability",
+    });
+  }
   expect((await client().beta.agents.sessions.list()).data).toHaveLength(1);
+  expect((await client().beta.agents.list()).data).toHaveLength(0);
+  // Capability flags, not harness names, decide acceptance.
+  const capable = await client().beta.agents.sessions.create({
+    ...params,
+    agent: {
+      model: "test-tools",
+      tools: [
+        { type: "tool_search" },
+        {
+          type: "mcp",
+          server_label: "docs",
+          transport: { type: "http", server_url: "https://mcp.example/mcp" },
+        },
+      ],
+    },
+    input: "hello",
+  });
+  await runDurableObjectAlarm(stub(capable.id));
+  expect((await client().beta.agents.sessions.retrieve(capable.id)).status).toBe("idle");
+});
+
+it("resolves deployment-owned delegation targets when subagents are enabled", async () => {
+  const api = client();
+  await expect(
+    api.beta.agents.sessions.create({
+      ...params,
+      agent: { model: "test-misconfigured", multi_agent: { enabled: true } },
+    }),
+  ).rejects.toMatchObject({ status: 503, code: "delegate_unavailable" });
+  const plain = await api.beta.agents.sessions.create({
+    ...params,
+    agent: { model: "test-lead" },
+    input: "hello",
+  });
+  await runDurableObjectAlarm(stub(plain.id));
+  const plainTurn = (await api.beta.agents.sessions.turns.list(plain.id)).data[0];
+  expect(JSON.parse(await env.SCRIPTED.getByName(plainTurn?.id ?? "").started())).toMatchObject({
+    delegates: null,
+  });
+  const lead = await api.beta.agents.sessions.create({
+    ...params,
+    agent: { model: "test-lead", multi_agent: { enabled: true, max_concurrent_subagents: 2 } },
+    input: "hello",
+  });
+  expect(lead.agent.multi_agent).toEqual({ enabled: true, max_concurrent_subagents: 2 });
+  await runDurableObjectAlarm(stub(lead.id));
+  const leadTurn = (await api.beta.agents.sessions.turns.list(lead.id)).data[0];
+  expect(JSON.parse(await env.SCRIPTED.getByName(leadTurn?.id ?? "").started())).toMatchObject({
+    delegates: [{ alias: "test-tools", harness: "fixture-tools", model: "fixture-model" }],
+    maxConcurrentSubagents: 2,
+  });
+  const capabilities = await (
+    await exports.default.fetch(
+      new Request("https://api.test/cf/v1/capabilities", {
+        headers: { authorization: "Bearer tenant-a" },
+      }),
+    )
+  ).json<{ agents: Record<string, { delegates?: string[] }> }>();
+  expect(capabilities.agents["test-lead"]?.delegates).toEqual(["test-tools"]);
 });
 
 it("provides durable replay through a separate extension", async () => {
@@ -166,9 +260,7 @@ it("provides durable replay through a separate extension", async () => {
   );
   const events = await response.json<{ seq: number; event: { type: string } }[]>();
   expect(events.some(({ event }) => event.type === "agent.session.turn.completed")).toBe(true);
-  expect(events.map(({ seq }) => seq)).toEqual(
-    [...events.map(({ seq }) => seq)].sort((a, b) => a - b),
-  );
+  expect(events.map(({ seq }) => seq)).toEqual(events.map(({ seq }) => seq).sort((a, b) => a - b));
 });
 
 it("the official SDK stream helper observes a complete ordered turn", async () => {
@@ -177,6 +269,7 @@ it("the official SDK stream helper observes a complete ordered turn", async () =
   const types: string[] = [];
   let text = "";
   for await (const event of api.beta.agents.sessions.stream(session.id, { input: "hello" })) {
+    if (event.type === "agent.session.turn.item.added" && event.output_index === null) continue;
     types.push(event.type);
     if (event.type === "agent.session.turn.output_text.delta") text += event.delta;
   }

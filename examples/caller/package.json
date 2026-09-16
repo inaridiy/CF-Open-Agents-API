@@ -1,0 +1,9 @@
+{
+  "name": "cf-open-agents-api-example-caller",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "cf-open-agents-api": "workspace:*",
+    "openai": "7.15.0"
+  }
+}

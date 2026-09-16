@@ -1,115 +1,289 @@
 import { DurableObject } from "cloudflare:workers";
-import { Context, Effect, Layer, Schema } from "effect";
-import { attempt, io, runPromise } from "./effect.js";
+import {
+  Clock,
+  type Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  FiberId,
+  Option,
+  PubSub,
+  Queue,
+  Schedule,
+  Schema,
+  Stream,
+} from "effect";
+import type { AgentSessionEnvironmentState, Subagent } from "openai/resources/beta/agents/agents";
 
+import { attempt, runSync, settle } from "./effect.js";
+import type { EnvironmentSpec } from "./environments.js";
+import {
+  encodeRpc,
+  ExecutorVersionIncompatible,
+  rpcEnvelope,
+  type StorageFailure,
+  StreamLimitExceeded,
+  SubagentTurnMismatch,
+  TurnActive,
+} from "./errors.js";
+import { SessionKinds } from "./persistence/session-kinds.js";
+import { type ArtifactRecord, migrate, type SessionRecord } from "./persistence/session-record.js";
+import {
+  makeSessionRepo,
+  type SessionRepo,
+  type SessionTxError,
+} from "./persistence/session-repo.js";
+import { makeSessionTx, type SessionTx } from "./persistence/session-tx.js";
 import type {
   AgentConfig,
   AgentSession,
   AgentSessionEvent,
   AgentSessionItem,
   InputEvent,
-  InputMessage,
   PageQuery,
   Turn,
 } from "./protocol.js";
-import { ApiError, canonicalJSON, identifier, type RpcResult, rpcFailure } from "./protocol.js";
+import { identifier } from "./protocol.js";
+import type { Checkpoint, RuntimeDriver } from "./runtime.js";
+import { reconcileTick } from "./session-reconcile.js";
 import {
-  type Checkpoint,
-  type Execution,
-  executionSchema,
-  type RuntimeCommand,
-  type RuntimeDriver,
-} from "./runtime.js";
-import { acceptRuntimeEvent, recordToolResult } from "./session-events.js";
+  Alarm,
+  alarmFromStorage,
+  Drivers,
+  driversFrom,
+  makeSessionRuntime,
+  Repo,
+  type SessionDependencies,
+  type SessionServices,
+} from "./session-services.js";
+import {
+  acceptInput,
+  applyEnvironmentStatus,
+  type Deleted,
+  markDeleted,
+  purgeRecords,
+  type TurnConfig,
+} from "./session-state.js";
 import { SqlStore } from "./storage.js";
 
-interface SessionBase {
-  readonly tenant: string;
-  readonly session: Readonly<AgentSession>;
-  readonly agent: AgentConfig;
-  readonly driver: string;
-  readonly revision: string;
-  readonly model: string;
-  readonly generation: number;
-  readonly checkpoint: Checkpoint | null;
-  readonly cursor: number;
-  readonly deleted: boolean;
+export type {
+  ActiveSession,
+  ArtifactRecord,
+  Fenced,
+  SessionRecord,
+} from "./persistence/session-record.js";
+export type { SessionDependencies } from "./session-services.js";
+export { isIndeterminate, transcriptMessage } from "./session-state.js";
+
+/** Committed state another session can continue from. */
+export interface ForkSource {
+  session: AgentSession;
+  agent: AgentConfig;
+  driver: string;
+  revision: string;
+  model: string;
+  checkpoint: Checkpoint | null;
+  environmentSpec?: EnvironmentSpec;
+  lastTurnId: string | null;
+  transcript: string;
 }
-/** The persisted shape is unchanged; impossible phase/execution pairs are unrepresentable. */
-const executionState = Schema.Union(
-  Schema.Struct({ phase: Schema.Literal("idle", "failed"), execution: Schema.Null }),
-  Schema.Struct({
-    phase: Schema.Literal("starting", "running", "checkpointing"),
-    execution: executionSchema,
-  }),
+const forkSourceSchema = Schema.declare<ForkSource>(
+  (input): input is ForkSource =>
+    typeof input === "object" && input !== null && "session" in input && "transcript" in input,
 );
-export type SessionRecord = SessionBase & typeof executionState.Type;
-export type ActiveSession = Extract<SessionRecord, { execution: Execution }>;
-interface Command {
-  id: string;
-  turnId: string;
-  command: RuntimeCommand;
+/** String carrier: the RPC type of the public session shape is too deep for the stub. */
+export const ForkSourceResult = Schema.parseJson(rpcEnvelope(forkSourceSchema));
+export const SubmitResult = rpcEnvelope(Schema.Null);
+/** Leading input of a fork's first turn; the harness reads it as ordinary context. */
+export const TRANSCRIPT_LIMIT = 96_000;
+const TRANSCRIPT_ENTRY_LIMIT = 4_000;
+const clip = (text: string) =>
+  text.length > TRANSCRIPT_ENTRY_LIMIT
+    ? `${text.slice(0, TRANSCRIPT_ENTRY_LIMIT)}… [truncated]`
+    : text;
+const json = (value: unknown) => clip(typeof value === "string" ? value : JSON.stringify(value));
+/** Text parts verbatim, images as a placeholder, anything else (files, refusals) omitted. */
+function transcriptPart(
+  part: Extract<AgentSessionItem, { type: "message" }>["content"][number],
+): string {
+  if (part.type === "input_text" || part.type === "output_text") return part.text;
+  return part.type === "input_image" ? "[image]" : "";
 }
-export interface SessionDependencies {
-  drivers: Record<string, RuntimeDriver>;
-  maxTurnMs: number;
-  pollIntervalMs: number;
-}
-
-class Reconciliation extends Context.Tag("agent-api/Reconciliation")<
-  Reconciliation,
-  SessionDependencies
->() {}
-
-export class SessionObject<Env = unknown> extends DurableObject<Env> {
-  readonly db: SqlStore;
-  private readonly reconciliation = Effect.unsafeMakeSemaphore(1);
-  private readonly listeners = new Map<ReadableStreamDefaultController<Uint8Array>, number>();
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.db = new SqlStore(ctx.storage);
+function transcriptEntry(item: AgentSessionItem): string | undefined {
+  switch (item.type) {
+    case "message": {
+      const text = item.content.map(transcriptPart).join("\n");
+      return `${item.role === "user" ? "User" : "Assistant"}: ${clip(text)}`;
+    }
+    case "function_call":
+      return `Assistant called ${item.name}(${json(item.arguments)})`;
+    case "function_call_output":
+      return `Function result (${item.status}): ${json(item.output ?? item.error ?? null)}`;
+    case "command_execution":
+      return `Command${item.cwd ? ` in ${item.cwd}` : ""}: ${clip(item.command)}\nExit code: ${item.exit_code ?? "none"}\n${clip(item.output ?? "")}`;
+    case "mcp_call":
+      return `MCP ${item.server_label}/${item.name}(${json(item.arguments)}) → ${json(item.output ?? item.error ?? null)}`;
+    case "web_search_call":
+      return `Web search: ${json(item.action)}`;
+    default:
+      // Reasoning and collaboration items are private to the original runtime.
+      return undefined;
   }
+}
+/** Accumulates items page by page and only ever retains the bounded tail. */
+export class TranscriptBuilder {
+  private readonly entries: string[] = [];
+  private total = 0;
+  private omitted = 0;
+  private get joined(): number {
+    return this.total + 2 * Math.max(0, this.entries.length - 1);
+  }
+  add(items: readonly AgentSessionItem[]): void {
+    for (const item of items) {
+      const entry = transcriptEntry(item);
+      if (entry === undefined) continue;
+      this.entries.push(entry);
+      this.total += entry.length;
+      while (this.joined > TRANSCRIPT_LIMIT && this.entries.length > 1) {
+        this.total -= this.entries.shift()?.length ?? 0;
+        this.omitted++;
+      }
+    }
+  }
+  render(): string {
+    let rendered = this.entries.join("\n\n");
+    if (rendered.length > TRANSCRIPT_LIMIT) rendered = rendered.slice(-TRANSCRIPT_LIMIT);
+    return this.omitted ? `[${this.omitted} earlier entries omitted]\n\n${rendered}` : rendered;
+  }
+}
+export function renderTranscript(items: readonly AgentSessionItem[]): string {
+  const builder = new TranscriptBuilder();
+  builder.add(items);
+  return builder.render();
+}
+/** The deployment must still register the session's harness at its original revision. */
+function requireDriver(
+  drivers: Context.Tag.Service<Drivers>,
+  record: SessionRecord,
+): RuntimeDriver {
+  const driver = Option.getOrUndefined(drivers.get(record.driver));
+  if (!driver || driver.revision !== record.revision)
+    throw new ExecutorVersionIncompatible({ harness: record.driver, revision: record.revision });
+  return driver;
+}
+/** Persist the wakeup first; the synchronous input transaction then cannot be orphaned. */
+const submitProgram = (events: InputEvent[], key: string) =>
+  Effect.gen(function* () {
+    const alarm = yield* Alarm;
+    const drivers = yield* Drivers;
+    const repo = yield* Repo;
+    yield* alarm.arm(1);
+    const config: TurnConfig = { maxTurnMs: drivers.maxTurnMs, agents: drivers.agents };
+    yield* repo.transaction((tx) =>
+      acceptInput(tx, config, (record) => requireDriver(drivers, record), events, key),
+    );
+    return null;
+  });
+/** Live SSE listeners per session object; the 65th request is refused with `stream_limit`. */
+const LISTENER_LIMIT = 64;
+/** Events a listener reads from SQLite per pull; the ReadableStream queue bounds the bytes. */
+const EVENT_PAGE = 64;
+const SSE_HEADERS = {
+  "content-type": "text/event-stream",
+  "cache-control": "no-cache",
+  "x-accel-buffering": "no",
+};
+const frame = ({ seq, event }: { seq: number; event: AgentSessionEvent }) =>
+  `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+const KEEPALIVE = ": keepalive\n\n";
+/**
+ * Every commit through the repository wakes the live streams. The wake is a sliding
+ * `PubSub` of capacity one: publishing never suspends, and a listener that lagged sees at
+ * most one pending tick, which is enough because it reads events from SQLite by cursor.
+ */
+const wakeAfterCommit = (repo: SessionRepo, wake: PubSub.PubSub<void>): SessionRepo => ({
+  transaction: (f) => repo.transaction(f).pipe(Effect.tap(() => PubSub.publish(wake, void 0))),
+  read: repo.read,
+});
+export class SessionObject<Env = unknown> extends DurableObject<Env> {
+  /** The durable store; tests read it through `SessionKinds`. */
+  readonly db = new SqlStore(this.ctx.storage);
+  /** Synchronous typed view for the plain RPC reads. */
+  private readonly tx: SessionTx = makeSessionTx(this.db);
+  /** Post-commit wake for live streams; see `wakeAfterCommit`. */
+  // lint: entrypoint
+  private readonly wake = runSync(PubSub.sliding<void>(1), "session.wake");
+  /** Effect edge of the seam: one `transactionSync` per `transaction`, then a wake. */
+  private readonly repo: SessionRepo = wakeAfterCommit(
+    makeSessionRepo(this.db, this.ctx.storage),
+    this.wake,
+  );
+  /**
+   * One runtime per object with exactly three services; every asynchronous entrypoint
+   * runs its program here and nothing below an entrypoint calls `Effect.run*`.
+   */
+  private readonly runtime = makeSessionRuntime({
+    repo: this.repo,
+    alarm: alarmFromStorage(this.ctx.storage),
+    drivers: driversFrom(() => this.dependencies()),
+  });
+  private readonly reconciliation = Effect.unsafeMakeSemaphore(1);
+  /** One permit per live stream, held by the stream's scope until it ends or is cancelled. */
+  private readonly listeners = Effect.unsafeMakeSemaphore(LISTENER_LIMIT);
+  /** Completed by `delete` and `purge`: every live stream ends, as the listeners did before. */
+  private readonly closed = Deferred.unsafeMake<void>(FiberId.none);
   protected dependencies(): SessionDependencies {
     throw new Error("SessionObject must be configured through createAgentService");
   }
+  /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
+  private run<A, E>(program: Effect.Effect<A, E, SessionServices>): Promise<A> {
+    // lint: entrypoint
+    return this.runtime.runPromiseExit(program).then(settle);
+  }
+  private readonly close = Deferred.done(this.closed, Exit.void);
   initialize(record: SessionRecord): AgentSession {
-    const existing = this.db.get<SessionRecord>("state", "session");
+    const existing = this.db.get(SessionKinds.state, "session");
     if (existing) return existing.session;
+    let migrated = record;
     this.db.transaction(() => {
-      this.save(record);
+      migrated = migrate(record);
+      this.save(migrated);
       this.emit({
         event_id: identifier("evt"),
         type: "agent.session.created",
-        session: record.session,
+        session: migrated.session,
       });
     });
-    return record.session;
+    // The one synchronous wake: this entrypoint is plain, and publishing to a sliding
+    // PubSub never suspends, so `runSync` cannot leave a fiber behind.
+    // lint: entrypoint
+    runSync(PubSub.publish(this.wake, void 0), "session.wake");
+    return migrated.session;
   }
   private record(): SessionRecord {
-    const record = this.db.require<SessionRecord>("state", "session");
-    this.validate(record);
-    if (record.deleted) throw new ApiError(404, "not_found", "Session not found");
-    return record;
-  }
-  private validate(record: SessionRecord): void {
-    if (
-      !Schema.is(executionState)(record) ||
-      (record.execution &&
-        (record.execution.generation !== record.generation ||
-          record.execution.sessionId !== record.session.id))
-    )
-      throw new ApiError(409, "invalid_session_state", "Persisted execution state is inconsistent");
+    return this.tx.requireSession();
   }
   private save(record: SessionRecord): void {
-    this.validate(record);
-    this.db.put("state", "session", record);
+    this.tx.save(record);
   }
   private emit(event: AgentSessionEvent): void {
-    this.db.append(event);
+    this.tx.emit(event);
   }
   retrieve(): AgentSession {
     return this.record().session;
   }
+  environmentStatus(status: AgentSessionEnvironmentState["status"]): Promise<void> {
+    return this.run(
+      Effect.flatMap(Repo, (repo) => repo.transaction((tx) => applyEnvironmentStatus(tx, status))),
+    );
+  }
+  /**
+   * Unfenced by design: the read and the write are one synchronous step of a serialized
+   * RPC call, so no reconciler transaction can move the record on in between, and a fenced
+   * transition that follows re-reads the metadata from the store rather than from its own
+   * earlier read.
+   */
   update(metadata: Record<string, string>): AgentSession {
     const record = this.record();
     const next = { ...record, session: { ...record.session, metadata } };
@@ -118,497 +292,231 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   items(query: PageQuery) {
     this.record();
-    return this.db.list<AgentSessionItem>("item", query);
+    return this.db.list(SessionKinds.item, query);
   }
   turns(query: PageQuery) {
-    this.record();
-    return this.db.list<Turn>("turn", query);
+    const record = this.record();
+    return this.db.list(SessionKinds.turn, query, {
+      field: "agent_id",
+      value: record.session.agent.id,
+    });
   }
   turn(id: string): Turn {
     this.record();
-    return this.db.require<Turn>("turn", id);
+    return this.tx.requireTurn(id);
+  }
+  subagents(query: PageQuery) {
+    this.record();
+    return this.db.list(SessionKinds.subagent, query);
+  }
+  subagent(id: string): Subagent {
+    this.record();
+    return this.db.require(SessionKinds.subagent, id);
+  }
+  subagentItems(id: string, query: PageQuery, turnId?: string) {
+    this.subagent(id);
+    if (turnId) this.subagentTurn(id, turnId);
+    return this.db.list(
+      SessionKinds.subagentItem(id),
+      query,
+      turnId ? { field: "turn_id", value: turnId } : undefined,
+    );
+  }
+  subagentTurns(id: string, query: PageQuery) {
+    this.subagent(id);
+    return this.db.list(SessionKinds.turn, query, { field: "agent_id", value: id });
+  }
+  subagentTurn(id: string, turnId: string): Turn {
+    this.subagent(id);
+    const turn = this.turn(turnId);
+    if (turn.subagent_id !== id) throw new SubagentTurnMismatch({ subagentId: id, turnId });
+    return turn;
+  }
+  artifacts(query: PageQuery, environmentId?: string) {
+    this.record();
+    const page = this.db.list(
+      SessionKinds.artifact,
+      query,
+      environmentId ? { field: "environment_id", value: environmentId } : undefined,
+    );
+    return { ...page, data: page.data.map(({ key: _key, ...resource }) => resource) };
+  }
+  artifact(id: string): ArtifactRecord {
+    this.record();
+    return this.db.require(SessionKinds.artifact, id);
+  }
+  deleteArtifact(id: string): string {
+    const artifact = this.artifact(id);
+    this.db.remove(SessionKinds.artifact, id);
+    return artifact.key;
   }
   replay(after: number) {
     this.record();
-    return this.db.events<AgentSessionEvent>(after);
+    return this.db.events(after);
+  }
+  /** Committed state only: an active turn has no consistent checkpoint yet. */
+  forkSource(): string {
+    // lint: entrypoint
+    return runSync(
+      encodeRpc(
+        ForkSourceResult,
+        attempt("session.forkSource", () => this.source()),
+      ),
+      "session.forkSource",
+    );
+  }
+  private source(): ForkSource {
+    const record = this.record();
+    if (record.execution) throw new TurnActive({ action: "fork" });
+    // Pages are folded into the bounded transcript as they are read, never held together.
+    const transcript = new TranscriptBuilder();
+    let after: string | undefined;
+    do {
+      const page = this.db.list(SessionKinds.item, { order: "asc", limit: 100, after });
+      transcript.add(page.data);
+      after = page.has_more ? (page.last_id ?? undefined) : undefined;
+    } while (after);
+    const lastTurn = this.db.list(SessionKinds.turn, { order: "desc", limit: 1 }).data[0];
+    return {
+      session: record.session,
+      agent: record.agent,
+      driver: record.driver,
+      revision: record.revision,
+      model: record.model,
+      checkpoint: record.checkpoint,
+      ...(record.environmentSpec ? { environmentSpec: record.environmentSpec } : {}),
+      lastTurnId: lastTurn?.id ?? null,
+      transcript: transcript.render(),
+    };
   }
 
-  submit(events: InputEvent[], key: string): Promise<RpcResult<null>> {
-    return runPromise(
-      Effect.gen(this, function* () {
-        // Persist the wakeup first; the synchronous input transaction then cannot be orphaned.
-        yield* io("session.arm", () => this.ctx.storage.setAlarm(Date.now() + 1));
-        yield* attempt("session.submit", () =>
-          this.db.transaction(() => {
-            let record = this.record();
-            const fingerprint = canonicalJSON(events);
-            const previous = this.db.get<string>("idempotency", key);
-            if (previous) {
-              if (previous !== fingerprint)
-                throw new ApiError(
-                  409,
-                  "idempotency_conflict",
-                  "Key was used with different input",
-                );
-              return;
-            }
-            if (record.phase === "failed")
-              throw new ApiError(
-                409,
-                "session_failed",
-                "Fork or create a new session after an indeterminate execution",
-              );
-            if (record.phase === "checkpointing")
-              throw new ApiError(
-                409,
-                "turn_checkpointing",
-                "Wait for the current turn to become idle",
-              );
-            const driver = this.driver(record);
-            for (const event of events) {
-              switch (event.type) {
-                case "agent.session.input.message": {
-                  if (record.execution) {
-                    if (!driver.capabilities.steer)
-                      throw new ApiError(
-                        409,
-                        "active_turn_not_steerable",
-                        "This harness cannot steer an active turn",
-                      );
-                    this.enqueue(record, { type: "steer", input: event.input });
-                  } else record = this.begin(record, event.input);
-                  this.addInput(record, event.input);
-                  break;
-                }
-                case "agent.session.input.cancel":
-                  if (record.execution) this.enqueue(record, { type: "cancel" });
-                  break;
-                case "agent.session.input.tool_result": {
-                  const action = record.session.required_actions.find(
-                    (action) =>
-                      action.type === "function_call" &&
-                      action.call_id === event.call_id &&
-                      action.turn_id === event.turn_id,
-                  );
-                  if (!action || !record.execution)
-                    throw new ApiError(409, "invalid_tool_result", "No matching required action");
-                  recordToolResult(this.db, record, event);
-                  this.enqueue(record, {
-                    type: "tool_result",
-                    callId: event.call_id,
-                    success: event.success,
-                    output: event.success ? (event.output ?? "") : (event.error ?? "Tool failed"),
-                  });
-                  const required_actions = record.session.required_actions.filter(
-                    (value) => value !== action,
-                  );
-                  record = {
-                    ...record,
-                    session: {
-                      ...record.session,
-                      required_actions,
-                      status: required_actions.length ? "requires_action" : "in_progress",
-                    },
-                  };
-                  if (!required_actions.length) {
-                    const turn = this.turn(event.turn_id);
-                    this.db.put("turn", turn.id, { ...turn, status: "in_progress" });
-                    this.emit({
-                      type: "agent.session.in_progress",
-                      event_id: identifier("evt"),
-                      session: record.session,
-                    });
-                  }
-                  break;
-                }
-              }
-            }
-            this.db.put("idempotency", key, fingerprint);
-            this.save(record);
-          }),
-        );
-        this.flush();
-        return { ok: true, value: null } as const;
-      }).pipe(Effect.catchTag("ApiError", (error) => Effect.succeed(rpcFailure(error)))),
-    );
+  submit(events: InputEvent[], key: string): Promise<typeof SubmitResult.Encoded> {
+    return this.run(encodeRpc(SubmitResult, submitProgram(events, key)));
   }
-  private driver(record: SessionRecord): RuntimeDriver {
-    const driver = this.dependencies().drivers[record.driver];
-    if (!driver || driver.revision !== record.revision)
-      throw new ApiError(
-        503,
-        "executor_version_incompatible",
-        "Session requires its original harness revision",
-      );
-    return driver;
-  }
-  private begin(record: SessionRecord, input: InputMessage[]): ActiveSession {
-    const now = Math.floor(Date.now() / 1_000);
-    const id = identifier("turn");
-    const next: ActiveSession = {
-      ...record,
-      generation: record.generation + 1,
-      execution: {
-        sessionId: record.session.id,
-        turnId: id,
-        generation: record.generation + 1,
-        agent: record.agent,
-        harness: record.driver,
-        model: record.model,
-        input,
-        checkpoint: record.checkpoint,
-        deadline: Date.now() + this.dependencies().maxTurnMs,
-        sandbox: record.session.environment.type !== "none",
-      },
-      cursor: 0,
-      phase: "starting",
-      session: { ...record.session, status: "in_progress", last_active_at: now },
-    };
-    const turn: Turn = {
-      id,
-      object: "agent.session.turn",
-      agent_id: record.session.agent.id,
-      session_id: record.session.id,
-      status: "queued",
-      created_at: now,
-      started_at: null,
-      completed_at: null,
-      error: null,
-      subagent_id: null,
-      usage: null,
-    };
-    this.db.put("turn", id, turn);
-    this.emit({
-      event_id: identifier("evt"),
-      type: "agent.session.turn.created",
-      session_id: record.session.id,
-      turn_id: id,
-      turn,
-    });
-    this.emit({
-      event_id: identifier("evt"),
-      type: "agent.session.in_progress",
-      session: next.session,
-    });
-    return next;
-  }
-  private addInput(record: ActiveSession, input: InputMessage[]): void {
-    for (const message of input) {
-      const item = {
-        ...message,
-        id: identifier("msg"),
-        type: "message" as const,
-        turn_id: record.execution.turnId,
-        phase: null,
-        status: "completed" as const,
-      };
-      this.db.put("item", item.id, item);
-    }
-  }
-  private enqueue(record: ActiveSession, command: RuntimeCommand): void {
-    if (command.type === "cancel") {
-      if (!this.db.get("cancellation", record.execution.turnId))
-        this.db.put("cancellation", record.execution.turnId, {
-          id: identifier("op"),
-          turnId: record.execution.turnId,
-          command,
-        } satisfies Command);
-      return;
-    }
-    const id = identifier("op");
-    this.db.put("command", id, { id, turnId: record.execution.turnId, command } satisfies Command);
+  private active(): boolean {
+    return !!this.db.get(SessionKinds.state, "session")?.execution;
   }
   override alarm(): Promise<void> {
-    const arm = io("session.arm", () =>
-      this.ctx.storage.setAlarm(Date.now() + this.dependencies().pollIntervalMs),
-    );
-    const reconcile = this.advance().pipe(
-      Effect.catchAllCause((cause) => Effect.logError("Session reconciliation failed", cause)),
-      Effect.ensuring(
-        Effect.gen(this, function* () {
-          this.flush();
-          if (this.db.get<SessionRecord>("state", "session")?.execution)
-            yield* arm.pipe(Effect.orDie);
-        }),
+    return this.run(this.alarmProgram());
+  }
+  /**
+   * The platform clears a fired alarm. While a turn is active, re-arm before the permit
+   * check so a busy reconciler cannot consume the only wake-up; the tick then runs under
+   * the object's single permit and re-arms once it settles, for one interval after this
+   * alarm fired, or at once when the tick (a long poll, a slow start) outlasted it.
+   */
+  private alarmProgram() {
+    return Effect.gen(this, function* () {
+      const alarm = yield* Alarm;
+      const drivers = yield* Drivers;
+      const started = yield* Clock.currentTimeMillis;
+      const arm = (inMs: number) =>
+        Effect.suspend(() => (this.active() ? alarm.arm(inMs).pipe(Effect.orDie) : Effect.void));
+      const rearm = Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => arm(Math.max(0, started + drivers.pollIntervalMs - now))),
+      );
+      const tick = reconcileTick().pipe(
+        Effect.catchAllCause((cause) => Effect.logError("Session reconciliation failed", cause)),
+        Effect.ensuring(rearm),
+      );
+      yield* arm(drivers.pollIntervalMs);
+      yield* this.reconciliation.withPermitsIfAvailable(1)(tick);
+    }).pipe(Effect.asVoid);
+  }
+  delete(): Promise<Deleted> {
+    return this.run(
+      Effect.flatMap(Repo, (repo) => repo.transaction(markDeleted)).pipe(
+        Effect.tap(() => this.close),
       ),
     );
-    return runPromise(
-      this.reconciliation
-        .withPermitsIfAvailable(1)(reconcile)
-        .pipe(Effect.asVoid, Effect.provide(Layer.succeed(Reconciliation, this.dependencies()))),
-    );
   }
-  /** Every post-I/O transition compares the full durable execution identity. */
-  private current(execution: Execution): ActiveSession | undefined {
-    const record = this.db.get<SessionRecord>("state", "session");
-    return record &&
-      !record.deleted &&
-      record.execution?.generation === execution.generation &&
-      record.execution.turnId === execution.turnId
-      ? (record as ActiveSession)
-      : undefined;
-  }
-  private transition<A>(execution: Execution, f: (record: ActiveSession) => A) {
-    return attempt("session.transition", () =>
-      this.db.transaction(() => {
-        const record = this.current(execution);
-        return record ? f(record) : undefined;
+  purge(): Promise<void> {
+    return this.run(
+      Effect.gen(this, function* () {
+        const repo = yield* Repo;
+        if (!(yield* repo.transaction(purgeRecords))) return;
+        yield* this.close;
+        yield* (yield* Alarm).clear;
       }),
     );
   }
-  private advance() {
-    return Effect.gen(this, function* () {
-      const dependencies = yield* Reconciliation;
-      const initial = this.db.get<SessionRecord>("state", "session");
-      if (!initial?.execution || initial.deleted) return;
-      yield* attempt("session.validate", () => this.validate(initial));
-      const execution = initial.execution;
-      yield* io("session.arm", () =>
-        this.ctx.storage.setAlarm(Date.now() + dependencies.pollIntervalMs),
-      );
-      const driver = dependencies.drivers[initial.driver];
-      if (!driver) return; // Cannot claim containment when its original executor is unavailable.
-      if (driver.revision !== initial.revision) {
-        yield* driver.stop(execution);
-        yield* this.finish(execution, "failed", "executor_version_incompatible");
-        return;
-      }
-      // Once completion is durable, recover the checkpoint directly, even if compute vanished.
-      if (initial.phase === "checkpointing") {
-        yield* this.checkpoint(driver, execution);
-        return;
-      }
-      if (Date.now() >= execution.deadline) {
-        yield* driver.stop(execution);
-        yield* this.finish(execution, "failed", "request_timeout");
-        return;
-      }
-      if (initial.phase === "starting") {
-        yield* driver.start(execution, `${execution.turnId}:start`);
-        yield* this.transition(execution, (record) => {
-          this.save({ ...record, phase: "running" });
-          const turn = {
-            ...this.turn(execution.turnId),
-            status: "in_progress" as const,
-            started_at: Math.floor(Date.now() / 1000),
-          };
-          this.db.put("turn", turn.id, turn);
-          this.emit({
-            type: "agent.session.turn.in_progress",
-            event_id: identifier("evt"),
-            session_id: execution.sessionId,
-            turn_id: turn.id,
-            turn,
-          });
-        });
-      }
-      while (this.current(execution)) {
-        if (Date.now() >= execution.deadline) {
-          yield* driver.stop(execution);
-          yield* this.finish(execution, "failed", "request_timeout");
-          return;
-        }
-        // Cancellation supersedes queued input. Keep its operation ID until the
-        // native terminal outcome is durable, including across lost responses.
-        const cancellation = this.db.get<Command>("cancellation", execution.turnId);
-        // Also accept cancellation records written by the previous implementation.
-        const queued = this.db.list<Command>("command", { order: "asc", limit: 100 }).data;
-        const legacyCancellation = queued.find((operation) => operation.command.type === "cancel");
-        const cancel = cancellation ?? legacyCancellation;
-        if (cancel && !cancellation)
-          yield* this.transition(execution, () =>
-            this.db.put("cancellation", execution.turnId, cancel),
-          );
-        const commands = cancel ? [cancel] : queued;
-        for (const operation of commands) {
-          if (!this.current(execution)) return;
-          if (operation.turnId === execution.turnId)
-            yield* driver
-              .control(execution, operation.id, operation.command)
-              .pipe(
-                Effect.catchAll((error) =>
-                  cancel
-                    ? Effect.logWarning(
-                        "Cancellation delivery failed; reconciling native outcome",
-                        error,
-                      )
-                    : Effect.fail(error),
-                ),
-              );
-          if (!cancel)
-            yield* this.transition(execution, () => this.db.remove("command", operation.id));
-        }
-        const current = this.current(execution);
-        if (!current) return;
-        const batch = yield* driver.poll(execution, current.cursor);
-        const phase = yield* this.transition(execution, (record) => {
-          let next = record;
-          for (const entry of batch.events) {
-            if (entry.seq <= next.cursor) continue;
-            if (entry.seq !== next.cursor + 1)
-              throw new ApiError(
-                409,
-                "invalid_runtime_cursor",
-                "Runtime events must be contiguous",
-              );
-            next = { ...acceptRuntimeEvent(this.db, next, entry.event), cursor: entry.seq };
-          }
-          // A command accepted during poll must be delivered before sealing completion.
-          const pending =
-            !cancel && this.db.list<Command>("command", { order: "asc", limit: 1 }).data.length > 0;
-          if (batch.status === "completed" && !pending) next = { ...next, phase: "checkpointing" };
-          this.save(next);
-          return pending ? "commands" : next.phase;
-        });
-        if (!phase) return;
-        if (phase === "checkpointing") {
-          yield* this.checkpoint(driver, execution);
-          return;
-        }
-        if (batch.status === "failed" || batch.status === "missing") {
-          yield* driver.stop(execution);
-          yield* this.finish(
-            execution,
-            "failed",
-            batch.status === "missing" ? "outcome_unknown" : (batch.error ?? "executor_failed"),
-          );
-          return;
-        }
-        if (batch.status === "cancelled") {
-          yield* driver.stop(execution);
-          yield* this.finish(execution, "cancelled");
-          return;
-        }
-        if (phase !== "commands") return;
-      }
-    });
-  }
-  private checkpoint(driver: RuntimeDriver, execution: Execution) {
-    return Effect.gen(this, function* () {
-      const checkpoint = yield* driver.checkpoint(execution);
-      yield* this.transition(execution, (record) => {
-        if (checkpoint.driver !== record.driver || checkpoint.revision !== record.revision)
-          throw new ApiError(
-            409,
-            "invalid_checkpoint",
-            "Checkpoint has an incompatible harness revision",
-          );
-        this.complete({ ...record, checkpoint }, "completed");
-      });
-    }).pipe(
-      Effect.catchAll((error) => {
-        if (error._tag === "ApiError" || Date.now() >= execution.deadline) {
-          return driver
-            .stop(execution)
-            .pipe(
-              Effect.zipRight(
-                this.finish(
-                  execution,
-                  "failed",
-                  error._tag === "ApiError" ? error.code : "checkpoint_unavailable",
-                ),
-              ),
-              Effect.asVoid,
-            );
-        }
-        return Effect.fail(error);
-      }),
-    );
-  }
-  private finish(execution: Execution, status: "cancelled" | "failed", error?: string) {
-    return this.transition(execution, (record) => this.complete(record, status, error));
-  }
-  /** Must run in the transition transaction, together with the checkpoint and event log. */
-  private complete(
-    record: ActiveSession,
-    status: "completed" | "cancelled" | "failed",
-    error?: string,
-  ): void {
-    const turn: Turn = {
-      ...this.turn(record.execution.turnId),
-      status,
-      completed_at: Math.floor(Date.now() / 1000),
-      error: error ? { code: "internal_error", message: error } : null,
-    };
-    this.db.put("turn", turn.id, turn);
-    this.db.clear("command");
-    this.db.clear("cancellation");
-    const next: SessionRecord = {
-      ...record,
-      execution: null,
-      phase: status === "failed" ? "failed" : "idle",
-      session: {
-        ...record.session,
-        status: status === "failed" ? "failed" : "idle",
-        error: error ?? null,
-        required_actions: [],
-      },
-    };
-    this.save(next);
-    this.emit({
-      type: `agent.session.turn.${status}`,
-      event_id: identifier("evt"),
-      session_id: record.session.id,
-      turn_id: turn.id,
-      turn,
-      usage: null,
-    });
-    this.emit({
-      type: status === "failed" ? "agent.session.failed" : "agent.session.idle",
-      event_id: identifier("evt"),
-      session: next.session,
-    });
-  }
-  async delete(): Promise<{ id: string; object: "agent.session.deleted"; deleted: true }> {
-    const record = this.db.require<SessionRecord>("state", "session");
-    if (record.execution)
-      throw new ApiError(409, "active_turn", "Cancel the active turn before deleting the session");
-    this.save({ ...record, deleted: true });
-    for (const listener of this.listeners.keys()) listener.close();
-    this.listeners.clear();
-    return { id: record.session.id, object: "agent.session.deleted", deleted: true };
-  }
-  stream(after?: number): Response {
+  /**
+   * Server-sent events from `after` (default: the current tail) as a `Stream` run by the
+   * object's runtime. The ReadableStream owns the fiber: back-pressure is its 64 KiB
+   * queue, and cancelling it (the client went away) interrupts the fiber, which releases
+   * the listener permit and the wake subscription through their scope.
+   */
+  stream(after?: number, options: { initial?: boolean } = {}): Response {
     this.record();
-    if (this.listeners.size >= 64)
-      throw new ApiError(429, "stream_limit", "Too many live streams for this session");
-    const cursor = after ?? this.db.lastEvent();
-    let controller: ReadableStreamDefaultController<Uint8Array>;
-    const stream = new ReadableStream<Uint8Array>(
-      {
-        start: (value) => {
-          controller = value;
-          this.listeners.set(value, cursor);
-          this.flush();
-        },
-        pull: () => this.flush(),
-        cancel: () => {
-          this.listeners.delete(controller);
-        },
-      },
-      { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength },
+    // The cap is checked here, synchronously, and the permit is held by the stream's scope.
+    // RPC serializes calls to this object, so the stream's fiber (which starts on the next
+    // task) takes the permit the probe saw. The probe takes and releases without suspending.
+    // lint: entrypoint
+    const free = runSync(this.listeners.withPermitsIfAvailable(1)(Effect.void), "session.stream");
+    if (Option.isNone(free)) throw new StreamLimitExceeded({ limit: LISTENER_LIMIT });
+    // The stream's fiber starts on the object's runtime; obtaining it is synchronous once
+    // the layers are built, and they hold no resources.
+    // lint: entrypoint
+    const runtime = this.runtime.runSync(this.runtime.runtimeEffect);
+    const body = Stream.toReadableStreamRuntime(
+      this.events(after ?? this.db.lastEvent(), !!options.initial),
+      runtime,
+      { strategy: { highWaterMark: 64 * 1024, size: (chunk) => chunk.byteLength } },
     );
-    return new Response(stream, {
-      headers: {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        "x-accel-buffering": "no",
-      },
-    });
+    return new Response(body, { headers: SSE_HEADERS });
   }
-  private flush(): void {
-    for (const [listener, cursor] of this.listeners) {
-      if ((listener.desiredSize ?? 0) <= 0) continue;
-      const entries = this.db.events<AgentSessionEvent>(cursor, 64);
-      for (const { seq, event } of entries) {
-        if ((listener.desiredSize ?? 0) <= 0) break;
-        listener.enqueue(
-          new TextEncoder().encode(
-            `id: ${seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+  /**
+   * One listener: pages of events read from SQLite by cursor, pulled on demand and woken
+   * by commits, merged with a keepalive comment while the turn is quiet. A creation
+   * stream ends when the initial turn settles, or right after `created` without input.
+   */
+  private events(
+    cursor: number,
+    initial: boolean,
+  ): Stream.Stream<Uint8Array, SessionTxError | StorageFailure, Drivers> {
+    return Stream.unwrapScoped(
+      Effect.gen(this, function* () {
+        yield* Effect.acquireRelease(this.listeners.take(1), () => this.listeners.release(1));
+        const drivers = yield* Drivers;
+        // Subscribed before the first read: a commit between a read and the wait is not missed.
+        const ticks = yield* PubSub.subscribe(this.wake);
+        const page = (after: number) =>
+          Effect.gen(this, function* () {
+            let rows = yield* this.repo.read((tx) => tx.store.events(after, EVENT_PAGE));
+            while (rows.length === 0) {
+              yield* Queue.take(ticks);
+              rows = yield* this.repo.read((tx) => tx.store.events(after, EVENT_PAGE));
+            }
+            return [rows, Option.some(rows.at(-1)?.seq ?? after)] as const;
+          });
+        const events = Stream.paginateEffect(cursor, page).pipe(
+          Stream.flattenIterables,
+          Stream.takeUntilEffect(({ event }) =>
+            initial ? this.initialSettled(event) : Effect.succeed(false),
           ),
+          Stream.map(frame),
         );
-        this.listeners.set(listener, seq);
-      }
-    }
+        const keepalive = Stream.fromSchedule(
+          Schedule.spaced(Duration.millis(drivers.keepaliveMs)),
+        ).pipe(Stream.as(KEEPALIVE));
+        return Stream.merge(events, keepalive, { haltStrategy: "left" }).pipe(
+          Stream.interruptWhen(Deferred.await(this.closed)),
+          // One event per chunk, so the queue's byte budget is checked before each one.
+          Stream.rechunk(1),
+          Stream.encodeText,
+        );
+      }),
+    );
+  }
+  /** A creation stream covers the initial turn only, or nothing when no input was given. */
+  private initialSettled(event: AgentSessionEvent) {
+    if (event.type === "agent.session.idle" || event.type === "agent.session.failed")
+      return Effect.succeed(true);
+    if (event.type !== "agent.session.created") return Effect.succeed(false);
+    return this.repo.read(
+      (tx) =>
+        !tx.store.get(SessionKinds.state, "session")?.execution &&
+        tx.store.list(SessionKinds.turn, { order: "asc", limit: 1 }).data.length === 0,
+    );
   }
 }

@@ -1,8 +1,10 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { Effect } from "effect";
 import { expect, it } from "vitest";
+
 import {
   type Execution,
   io,
@@ -10,6 +12,7 @@ import {
   type RuntimeCommand,
   runPromise,
 } from "../../packages/agent-api/src/index.js";
+import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { type NativeJob, type NativeOptions, ToolJob } from "../../packages/supervisor/src/job.js";
 import { Operations } from "../../packages/supervisor/src/lifecycle.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
@@ -46,19 +49,26 @@ class FakeJob implements NativeJob {
   commands: RuntimeCommand[] = [];
   stopped = false;
   snapshot = async () => ({ version: 1 as const, threadId: "native", files: {} });
-  constructor(readonly execution: Execution) {}
-  async start() {}
-  poll(): RuntimeBatch {
-    return { status: this.status, events: [], cursor: 0 };
+  readonly execution: Execution;
+  constructor(startedExecution: Execution) {
+    this.execution = startedExecution;
   }
-  async control(_id: string, command: RuntimeCommand) {
+  start() {
+    return Effect.void;
+  }
+  poll(): Effect.Effect<RuntimeBatch> {
+    return Effect.succeed({ status: this.status, events: [], cursor: 0 });
+  }
+  control(_id: string, command: RuntimeCommand) {
     this.commands.push(command);
+    return Effect.void;
   }
   checkpoint() {
-    return this.snapshot();
+    return Effect.promise(() => this.snapshot());
   }
-  async stop() {
+  stop() {
     this.stopped = true;
+    return Effect.void;
   }
   failStart() {
     this.status = "failed";
@@ -67,8 +77,8 @@ class FakeJob implements NativeJob {
 
 it("a control body delayed across replacement never targets the new job", async () => {
   const jobs: FakeJob[] = [];
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     jobs.push(job);
     return job;
   });
@@ -111,8 +121,8 @@ it("checkpoint holds ownership until capture finishes before a replacement start
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const jobs: FakeJob[] = [];
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     jobs.push(job);
     return job;
   });
@@ -157,7 +167,7 @@ it("duplicate operation IDs share both success and uncertain failures and reject
   expect(outcomes.every((result) => result.status === "rejected")).toBe(true);
   await expect(
     runPromise(operations.perform("op", { output: "changed" }, Effect.void)),
-  ).rejects.toMatchObject({ code: "idempotency_conflict" });
+  ).rejects.toMatchObject({ _tag: "IdempotencyConflict" });
   await expect(runPromise(operations.perform("op", { output: "first" }, write))).rejects.toThrow();
   expect(writes).toBe(1);
 });
@@ -167,17 +177,19 @@ class WaitingJob extends ToolJob {
   readonly opening = Promise.withResolvers<void>();
   readonly release = Promise.withResolvers<void>();
   closes = 0;
-  constructor(options: NativeOptions) {
-    super(execution, options);
-    this.home = options.directory;
+  constructor(nativeOptions: NativeOptions) {
+    super(execution, nativeOptions);
+    this.home = nativeOptions.directory;
   }
   protected async open() {
     this.opening.resolve();
     await this.release.promise;
     this.sessionId = "native";
   }
-  protected async closeRuntime() {
-    this.closes++;
+  protected closeRuntime() {
+    return Effect.sync(() => {
+      this.closes++;
+    });
   }
   call() {
     return this.externalTool("lookup", {});
@@ -192,9 +204,9 @@ class WaitingJob extends ToolJob {
 
 it("stop waits for resource acquisition, joins concurrent callers, and cannot be undone", async () => {
   const job = new WaitingJob(options);
-  const start = job.start();
+  const start = runPromise(job.start());
   await job.opening.promise;
-  const stops = [job.stop(), job.stop()];
+  const stops = [runPromise(job.stop()), runPromise(job.stop())];
   expect(job.closes).toBe(0);
   job.release.resolve();
   await start;
@@ -202,31 +214,33 @@ it("stop waits for resource acquisition, joins concurrent callers, and cannot be
   expect(job.closes).toBe(1);
   job.complete();
   job.lateFailure();
-  expect(job.poll(0).status).toBe("cancelled");
-  await expect(job.start()).rejects.toThrow();
+  expect((await runPromise(job.poll(0))).status).toBe("cancelled");
+  await expect(runPromise(job.start())).rejects.toThrow();
 });
 
 it("cancellation settles pending tools without allowing late results to resurrect the job", async () => {
   const job = new WaitingJob(options);
   job.release.resolve();
-  await job.start();
+  await runPromise(job.start());
   const result = job.call();
   const rejection = expect(result).rejects.toThrow("Execution stopped");
-  const call = job.poll(0).events[0]?.event;
+  const call = (await runPromise(job.poll(0))).events[0]?.event;
   if (call?.type !== "function_call") throw new Error("Missing function call");
-  await job.control("cancel", { type: "cancel" });
+  await runPromise(job.control("cancel", { type: "cancel" }));
   await rejection;
   await expect(
-    job.control("result", {
-      type: "tool_result",
-      callId: call.callId,
-      success: true,
-      output: "late",
-    }),
+    runPromise(
+      job.control("result", {
+        type: "tool_result",
+        callId: call.callId,
+        success: true,
+        output: "late",
+      }),
+    ),
   ).rejects.toThrow();
   job.complete();
   job.lateFailure();
-  expect(job.poll(0).status).toBe("cancelled");
+  expect((await runPromise(job.poll(0))).status).toBe("cancelled");
   expect(job.closes).toBe(1);
 });
 
@@ -236,26 +250,30 @@ it("concurrent checkpoints capture one quiescent home and share the saved bundle
   try {
     await writeFile(join(directory, "history.json"), "history");
     job.release.resolve();
-    await job.start();
+    await runPromise(job.start());
     job.complete();
-    const bundles = await Promise.all([job.checkpoint(), job.checkpoint(), job.checkpoint()]);
+    const bundles = await Promise.all([
+      runPromise(job.checkpoint()),
+      runPromise(job.checkpoint()),
+      runPromise(job.checkpoint()),
+    ]);
     expect(bundles[0]?.files["history.json"]).toBe(Buffer.from("history").toString("base64"));
     expect(bundles[1]).toBe(bundles[0]);
     expect(bundles[2]).toBe(bundles[0]);
     expect(job.closes).toBe(1);
     job.lateFailure();
-    expect(job.poll(0).status).toBe("completed");
+    expect((await runPromise(job.poll(0))).status).toBe("completed");
   } finally {
-    await job.stop();
+    await runPromise(job.stop());
     await rm(directory, { recursive: true, force: true });
   }
 });
 
 it("retained event pages do not hide completion from ownership replacement", async () => {
-  const supervisor = createSupervisor(options, (execution) => {
-    const job = new FakeJob(execution);
+  const supervisor = createSupervisor(options, (startedExecution) => {
+    const job = new FakeJob(startedExecution);
     // Pagination can still advertise running while older events remain to be read.
-    job.poll = () => ({ status: "running", events: [], cursor: 0 });
+    job.poll = () => Effect.succeed({ status: "running", events: [], cursor: 0 });
     return job;
   });
   expect((await post(supervisor.app, "/jobs", { execution, operationId: "first" })).status).toBe(
@@ -279,10 +297,10 @@ it("startup failure remains failed after resource cleanup", async () => {
     }
   }
   const job = new BrokenJob(options);
-  await expect(job.start()).rejects.toThrow();
+  await expect(runPromise(job.start())).rejects.toThrow();
   expect(job.status).toBe("failed");
   expect(job.closes).toBe(1);
-  await job.stop();
+  await runPromise(job.stop());
   expect(job.status).toBe("failed");
   expect(job.closes).toBe(1);
 });

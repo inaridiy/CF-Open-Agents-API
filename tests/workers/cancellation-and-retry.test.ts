@@ -3,8 +3,9 @@ import { reset, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
+
+import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
-import type { SessionRecord } from "../../packages/agent-api/src/session.js";
 import type { SessionDO, TestEnv } from "./worker.js";
 
 declare global {
@@ -101,11 +102,11 @@ it.each([false, true])(
         const afterCancel = {
           status: instance.retrieve().status,
           polls,
-          pending: instance.db.list("command", { order: "asc", limit: 100 }).data.length,
+          pending: instance.db.list(SessionKinds.command, { order: "asc", limit: 100 }).data.length,
         };
-        const state = instance.db.require<SessionRecord>("state", "session");
+        const state = instance.db.require(SessionKinds.state, "session");
         if (state.execution)
-          instance.db.put("state", "session", {
+          instance.db.put(SessionKinds.state, "session", {
             ...state,
             execution: { ...state.execution, deadline: Date.now() - 1 },
           });
@@ -119,7 +120,7 @@ it.each([false, true])(
       },
     );
     expect(result).toMatchObject({
-      accepted: { ok: true },
+      accepted: { _tag: "Right" },
       afterCancel: { status: "idle", pending: 0 },
       final: "idle",
       turn: "cancelled",

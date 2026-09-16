@@ -1,4 +1,3 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
 import { createOpenAI } from "@ai-sdk/openai";
 import {
   type AgentBindings,
@@ -6,12 +5,14 @@ import {
   CatalogObject,
   type ContainerBindings,
   ContainerProxy,
+  containerEnvironments,
   containerHarnesses,
   createAgentService,
   HarnessContainer,
   SandboxContainer,
 } from "cf-open-agents-api/cloudflare";
-import { aiSDKModel, createModelGateway } from "cf-open-agents-api/models";
+import { aiSDKModel, createModelGateway, nativeModel } from "cf-open-agents-api/models";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { createWorkersAI } from "workers-ai-provider";
 
 interface Bindings extends AgentBindings, ContainerBindings {
@@ -21,18 +22,37 @@ interface Bindings extends AgentBindings, ContainerBindings {
 }
 const service = createAgentService<Bindings>({
   agents: {
-    coding: { harness: "codex", model: "primary" },
-    claude: { harness: "claude-code", model: "primary" },
-    opencode: { harness: "opencode", model: "primary" },
+    // `delegates` lists the presets a session may start subagents on when
+    // multi_agent is enabled; children share the parent's sandbox.
+    // `webSearch` declares that the alias's model connection provides hosted web search.
+    coding: {
+      harness: "codex",
+      model: "codex",
+      delegates: ["claude", "opencode"],
+      webSearch: true,
+    },
+    claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
+    opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
     workers: { harness: "codex", model: "workers" },
   },
   harnesses: containerHarnesses,
+  objects: (env) => env.CHECKPOINTS,
+  environments: containerEnvironments,
   authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
 });
 
+// Each entry is a factory: a preset is built only when a session selects it, so a
+// deployment without an OpenAI key can still serve the Workers AI preset.
 const gateway = createModelGateway<Bindings>((env) => ({
-  primary: aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-  workers: aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+  codex: () =>
+    nativeModel({
+      protocol: "responses",
+      baseURL: "https://api.openai.com/v1",
+      apiKey: env.OPENAI_API_KEY,
+      model: "gpt-6-astra",
+    }),
+  primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+  workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
 }));
 
 export class SessionDO extends service.SessionDO {}

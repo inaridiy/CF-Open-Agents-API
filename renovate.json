@@ -1,0 +1,51 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommitsDisabled"],
+  "timezone": "Asia/Tokyo",
+  "schedule": ["before 6am on monday"],
+  "minimumReleaseAge": "1 day",
+  "internalChecksFilter": "strict",
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  },
+  "packageRules": [
+    {
+      "description": "Native runtime pins define resumable state formats; bump them deliberately with the docs, Dockerfiles and harnesses.ts.",
+      "matchPackageNames": [
+        "@openai/codex",
+        "@anthropic-ai/claude-agent-sdk",
+        "opencode-ai",
+        "@opencode-ai/sdk"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The Sandbox SDK and its Docker image must stay on the same preview build.",
+      "matchPackageNames": ["@cloudflare/sandbox"],
+      "enabled": false
+    },
+    {
+      "description": "Effect is a shared peer; upgrade it with the consumer test.",
+      "matchPackageNames": ["effect"],
+      "groupName": "effect"
+    },
+    {
+      "description": "Cloudflare local runtime moves together.",
+      "matchPackageNames": [
+        "wrangler",
+        "miniflare",
+        "workerd",
+        "@cloudflare/workers-types",
+        "@cloudflare/vitest-pool-workers"
+      ],
+      "groupName": "cloudflare-runtime"
+    },
+    {
+      "description": "GitHub Actions are pinned by commit SHA.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    }
+  ]
+}
