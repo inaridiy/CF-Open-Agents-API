@@ -96,6 +96,8 @@ const asWarning = (rules: Record<string, unknown>) =>
 
 export default defineConfig({
   plugins: ["eslint", "typescript", "unicorn", "oxc", "import", "promise"],
+  /** Repository rules for the Effect house rules; see the plugin header and `docs/effect.md`. */
+  jsPlugins: ["./scripts/lint/agent-api-plugin.mjs"],
   rules: {
     ...pick(core, ERRORS),
     ...pick(core, PROMOTED),
@@ -106,7 +108,19 @@ export default defineConfig({
     ],
     // `== null` is the idiomatic nullish check; everything else must be strict.
     eqeqeq: ["error", "always", { null: "ignore" }],
+    // A transaction callback is one synchronous SQLite step, in tests and fakes too.
+    "agent-api/no-run-in-transaction": "error",
   } satisfies RuleMap,
+  overrides: [
+    {
+      // The Worker package: runners only at the marked entrypoints, ApiError only in the error modules.
+      files: ["packages/agent-api/src/**"],
+      rules: {
+        "agent-api/no-run-below-entrypoint": "error",
+        "agent-api/no-api-error-construction": "error",
+      },
+    },
+  ],
   ignorePatterns: [
     ...(core.ignorePatterns ?? []),
     "**/.agents/**",

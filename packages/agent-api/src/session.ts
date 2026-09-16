@@ -213,6 +213,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   /** Synchronous typed view for the plain RPC reads. */
   private readonly tx: SessionTx = makeSessionTx(this.db);
   /** Post-commit wake for live streams; see `wakeAfterCommit`. */
+  // lint: entrypoint
   private readonly wake = runSync(PubSub.sliding<void>(1), "session.wake");
   /** Effect edge of the seam: one `transactionSync` per `transaction`, then a wake. */
   private readonly repo: SessionRepo = wakeAfterCommit(
@@ -238,6 +239,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
   private run<A, E>(program: Effect.Effect<A, E, SessionServices>): Promise<A> {
+    // lint: entrypoint
     return this.runtime.runPromiseExit(program).then(settle);
   }
   private readonly close = Deferred.done(this.closed, Exit.void);
@@ -256,6 +258,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     });
     // The one synchronous wake: this entrypoint is plain, and publishing to a sliding
     // PubSub never suspends, so `runSync` cannot leave a fiber behind.
+    // lint: entrypoint
     runSync(PubSub.publish(this.wake, void 0), "session.wake");
     return migrated.session;
   }
@@ -354,6 +357,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Committed state only: an active turn has no consistent checkpoint yet. */
   forkSource(): string {
+    // lint: entrypoint
     return runSync(
       encodeRpc(
         ForkSourceResult,
@@ -448,10 +452,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     // The cap is checked here, synchronously, and the permit is held by the stream's scope.
     // RPC serializes calls to this object, so the stream's fiber (which starts on the next
     // task) takes the permit the probe saw. The probe takes and releases without suspending.
+    // lint: entrypoint
     const free = runSync(this.listeners.withPermitsIfAvailable(1)(Effect.void), "session.stream");
     if (Option.isNone(free)) throw new StreamLimitExceeded({ limit: LISTENER_LIMIT });
     // The stream's fiber starts on the object's runtime; obtaining it is synchronous once
     // the layers are built, and they hold no resources.
+    // lint: entrypoint
     const runtime = this.runtime.runSync(this.runtime.runtimeEffect);
     const body = Stream.toReadableStreamRuntime(
       this.events(after ?? this.db.lastEvent(), !!options.initial),

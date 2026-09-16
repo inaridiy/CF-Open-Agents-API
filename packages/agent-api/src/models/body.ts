@@ -1,6 +1,6 @@
 import { Effect } from "effect";
 
-import { io, runPromise } from "../effect.js";
+import { io } from "../effect.js";
 import { ModelInputMissing, ModelInputTooLarge } from "../errors.js";
 
 /** Bound the stream before parsing or cloning it across a Service Binding. */
@@ -39,5 +39,3 @@ export const readModelBodyEffect = (request: Request) =>
       return bytes;
     }),
   );
-export const readModelBody = (request: Request): Promise<Uint8Array<ArrayBuffer>> =>
-  runPromise(readModelBodyEffect(request));

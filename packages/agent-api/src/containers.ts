@@ -28,7 +28,7 @@ import { copyKnownLength } from "./files.js";
 import { HARNESSES, type HarnessName } from "./harnesses.js";
 import { proxyMcp } from "./mcp.js";
 import { fetchAssignedImage } from "./media.js";
-import { readModelBody } from "./models/body.js";
+import { readModelBodyEffect } from "./models/body.js";
 import { constrainCodexSearch } from "./models/codex-search.js";
 import type { Assignment, SandboxState } from "./persistence/harness-kinds.js";
 import {
@@ -255,6 +255,7 @@ export class HarnessContainer<
   private readonly codeExecutions = new Set<AbortController>();
   /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
   private run<A, E>(program: Effect.Effect<A, E, HarnessServices>): Promise<A> {
+    // lint: entrypoint
     return this.runtime.runPromiseExit(program).then(settle);
   }
   private abortCodeExecutions(): void {
@@ -715,7 +716,7 @@ export class HarnessContainer<
         const url = new URL(request.url);
         if (request.method !== "POST" || url.pathname !== HARNESSES[current.harness].protocol)
           return new Response("Unsupported model request", { status: 403 });
-        const bytes = yield* io("modelRequest", () => readModelBody(request));
+        const bytes = yield* readModelBodyEffect(request);
         const body = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
         if (!body || body.model !== current.model)
           return new Response("Model is not assigned to this execution", { status: 403 });

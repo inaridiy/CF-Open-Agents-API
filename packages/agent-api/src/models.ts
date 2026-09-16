@@ -31,6 +31,7 @@ export interface EffectModelAdapter extends ModelAdapter {
 }
 export const modelAdapter = (effect: EffectModelAdapter["effect"]): EffectModelAdapter => ({
   effect,
+  // lint: entrypoint
   fetch: (request) => runPromise(effect(request)),
 });
 
@@ -324,6 +325,7 @@ export function createModelGateway<Env>(models: (env: Env) => Record<string, Mod
 } {
   return {
     fetch: (request, env) =>
+      // lint: entrypoint
       runPromise(
         Effect.gen(function* () {
           if (request.method !== "POST") return new Response(null, { status: 405 });

@@ -135,6 +135,7 @@ export function createAgentService<Env extends AgentBindings>(
       return this.env.CATALOG.getByName(tenant);
     }
     private session(tenant: string, id: string) {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           if (!(yield* io("api.session", () => this.catalog(tenant).owns(id))))
@@ -282,6 +283,7 @@ export function createAgentService<Env extends AgentBindings>(
       parameters: CreateSession,
       idempotencyKey = identifier("key"),
     ): Promise<AgentSession> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const input = yield* parseEffect(createSessionSchema, parameters);
@@ -508,6 +510,7 @@ export function createAgentService<Env extends AgentBindings>(
       parameters: ForkSession = {},
       idempotencyKey = identifier("key"),
     ): Promise<AgentSession> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const input = yield* parseEffect(forkSessionSchema, parameters);
@@ -650,6 +653,7 @@ export function createAgentService<Env extends AgentBindings>(
       );
     }
     retrieveSession(tenant: string, id: string): Promise<AgentSession> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const stub = yield* io("api.retrieveSession", () => this.session(tenant, id));
@@ -658,6 +662,7 @@ export function createAgentService<Env extends AgentBindings>(
       );
     }
     submitEvents(tenant: string, id: string, events: InputEvent[], key = identifier("key")) {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const parsed = yield* parseEffect(eventsSchema, { events });
@@ -674,6 +679,7 @@ export function createAgentService<Env extends AgentBindings>(
       tenant: string,
       query: Partial<PageQuery> & { agent_id?: string } = {},
     ): Promise<ListPage<AgentSession>> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const parsed = yield* parseEffect(sessionPageSchema, query);
@@ -705,6 +711,7 @@ export function createAgentService<Env extends AgentBindings>(
       id: string,
       query: Partial<PageQuery> = {},
     ): Promise<ListPage<AgentSessionItem>> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const page = yield* parseEffect(pageSchema, query);
@@ -714,6 +721,7 @@ export function createAgentService<Env extends AgentBindings>(
       );
     }
     listTurns(tenant: string, id: string, query: Partial<PageQuery> = {}): Promise<ListPage<Turn>> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const page = yield* parseEffect(pageSchema, query);
@@ -723,6 +731,7 @@ export function createAgentService<Env extends AgentBindings>(
       );
     }
     retrieveTurn(tenant: string, id: string, turnId: string): Promise<Turn> {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           const stub = yield* io("api.retrieveTurn", () => this.session(tenant, id));
@@ -731,6 +740,7 @@ export function createAgentService<Env extends AgentBindings>(
       );
     }
     deleteSession(tenant: string, id: string) {
+      // lint: entrypoint
       return runPromise(
         Effect.gen(this, function* () {
           // The object is addressed directly: a retry after discovery was removed still
