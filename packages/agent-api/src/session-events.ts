@@ -6,6 +6,7 @@ import type { RecordStore } from "./persistence/record-store.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import type {
   ActiveSession,
+  Fenced,
   OutputItem,
   OutputPosition,
   SessionRecord,
@@ -27,12 +28,12 @@ function runtimeRecord<T>(store: RecordStore, kind: Kind<T>, id: string): T {
 }
 type AssistantMessage = Extract<OutputItem, { type: "message" }>;
 
-/** Called inside the SessionDO transition transaction. Emits no network I/O. */
+/** Called inside the SessionDO transition transaction, on the fenced record. Emits no network I/O. */
 export function acceptRuntimeEvent(
   tx: SessionTx,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   event: RuntimeEvent,
-): ActiveSession {
+): Fenced<ActiveSession> {
   const db = tx.store;
   if (event.type === "subagent") {
     const previous = db.get(SessionKinds.subagent, event.id);
@@ -509,7 +510,7 @@ export function acceptRuntimeEvent(
             arguments: event.arguments,
           },
         ];
-    const next: ActiveSession = {
+    const next: Fenced<ActiveSession> = {
       ...record,
       session: { ...record.session, required_actions, status: "requires_action" },
     };
@@ -559,7 +560,7 @@ export function recordToolResult(
 /** Close partial streamed output before publishing a terminal turn, including cancellation. */
 export function finishOutputItems(
   tx: SessionTx,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   turnId: string,
   itemKind: Kind<AgentSessionItem>,
 ): void {

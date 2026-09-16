@@ -67,7 +67,12 @@ import {
 } from "./session-state.js";
 import { SqlStore } from "./storage.js";
 
-export type { ActiveSession, ArtifactRecord, SessionRecord } from "./persistence/session-record.js";
+export type {
+  ActiveSession,
+  ArtifactRecord,
+  Fenced,
+  SessionRecord,
+} from "./persistence/session-record.js";
 export type { SessionDependencies } from "./session-services.js";
 export { isIndeterminate, transcriptMessage } from "./session-state.js";
 
@@ -271,6 +276,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       Effect.flatMap(Repo, (repo) => repo.transaction((tx) => applyEnvironmentStatus(tx, status))),
     );
   }
+  /**
+   * Unfenced by design: the read and the write are one synchronous step of a serialized
+   * RPC call, so no reconciler transaction can move the record on in between, and a fenced
+   * transition that follows re-reads the metadata from the store rather than from its own
+   * earlier read.
+   */
   update(metadata: Record<string, string>): AgentSession {
     const record = this.record();
     const next = { ...record, session: { ...record.session, metadata } };
