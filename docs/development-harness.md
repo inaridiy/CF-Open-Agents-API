@@ -4,14 +4,25 @@
 
 ## Toolchain
 
-| Command                   | What runs                                                                                                      |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `pnpm lint`               | `ultracite check --type-aware`: oxlint with type-aware rules and an oxfmt formatting check                     |
-| `pnpm format`             | `ultracite fix --type-aware`: applies safe lint fixes and formats                                              |
-| `pnpm typecheck`          | `tsc --noEmit` on TypeScript 7, patched by `@effect/tsgo` so Effect language-service diagnostics appear inline |
-| `pnpm effect:diagnostics` | The Effect language-service diagnostics alone, as text                                                         |
+| Command                   | What runs                                                                                                                        |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm lint`               | `ultracite check --type-aware`: oxlint with type-aware rules, the repository plugin and an oxfmt formatting check                |
+| `pnpm format`             | `ultracite fix --type-aware`: applies safe lint fixes and formats                                                                |
+| `pnpm typecheck`          | `tsc --noEmit` on TypeScript 7, patched by `@effect/tsgo` so Effect language-service diagnostics appear inline                   |
+| `pnpm effect:diagnostics` | The Effect language-service diagnostics alone, as text                                                                           |
+| `pnpm test:scripts`       | `node --test` over the checker scripts, the container smoke helpers and the lint plugin's rule tests (`scripts/lint/*.test.mjs`) |
 
 `prepare` runs `effect-tsgo patch --typescript --oxlint` on install; a fresh `pnpm install --frozen-lockfile` is enough. Lint rules live in `oxlint.config.ts` and formatting in `oxfmt.config.ts` (100 columns, Markdown prose wrapping preserved, no trailing commas in JSON so `JSON.parse` readers keep working). Format only the files you touch: `pnpm exec oxfmt <files>`.
+
+`oxlint.config.ts` picks a subset of Ultracite's core preset rather than the whole of it: the correctness rules, the promoted `no-shadow`, `no-unsafe-*` and `no-useless-undefined` families, and the `complexity` and `no-nested-ternary` quality rules are all errors everywhere; `pnpm lint` reports zero findings on a clean tree. The repository plugin `scripts/lint/agent-api-plugin.mjs` is loaded through `jsPlugins` and adds three rules that enforce the [Effect house rules](effect.md#the-five-house-rules) the type checker cannot see:
+
+| Rule                                  | Scope                    | What it rejects                                                                                                                                                                                                                               |
+| ------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent-api/no-run-in-transaction`     | Every file               | `Effect.run*`, `runPromise`, `runSync` or `runtime.run*` inside a callback passed to `transaction`, `transactionSync` or a repository's `read`. The callback type already rejects an Effect result; this catches a runner hidden in the body. |
+| `agent-api/no-run-below-entrypoint`   | `packages/agent-api/src` | A runner outside the allow-listed entrypoint files (`effect.ts`, `service.ts`, `http/*.ts`, `session.ts`, `containers.ts`, `catalog.ts`, `models.ts`, `tools.ts`), or inside one without `// lint: entrypoint` on the line above.             |
+| `agent-api/no-api-error-construction` | `packages/agent-api/src` | `new ApiError(...)` outside `errors.ts` and `api-error.ts`; fail with a tagged domain error and let `toApiError` project it.                                                                                                                  |
+
+The marker convention makes every boundary runner visible in a diff and a grep: `grep -rn "lint: entrypoint" packages/agent-api/src` lists them. The rules are syntactic; a transaction callback passed by reference is not followed.
 
 ## Vendored skills
 
@@ -32,6 +43,6 @@ The vendored Effect skill includes bootstrap examples for other releases. This w
 
 ## Checks and generated files
 
-`pnpm check:harness` runs `scripts/check-harness.mjs`: relative Markdown links in the documents listed in `.agents/harness.json` and every file under `docs/` must resolve, `CLAUDE.md` must import `AGENTS.md`, and the skill rules above must hold. `pnpm check:docs` runs `scripts/check-docs.mjs`: every non-lifecycle `package.json` script appears in README, the README title matches the repository name, the package README names every export entrypoint, the gateway binds its own Worker, the backup variable matches the R2 binding, and the Sandbox, Codex, OpenCode and Claude Agent SDK pins agree across manifests, Dockerfiles and `harnesses.ts`. Run `pnpm test:scripts` when changing either checker. Neither downloads anything.
+`pnpm check:harness` runs `scripts/check-harness.mjs`: relative Markdown links in the documents listed in `.agents/harness.json` and every file under `docs/` must resolve, `CLAUDE.md` must import `AGENTS.md`, and the skill rules above must hold. `pnpm check:docs` runs `scripts/check-docs.mjs`: every non-lifecycle `package.json` script appears in README, the README title matches the repository name, the package README names every export entrypoint, the gateway binds its own Worker, the backup variable matches the R2 binding, and the Sandbox, Codex, OpenCode and Claude Agent SDK pins agree across manifests, Dockerfiles and `harnesses.ts`. Run `pnpm test:scripts` when changing either checker or the lint plugin. Neither checker downloads anything.
 
 `dist/`, `examples/worker/env.d.ts` and `examples/caller/env.d.ts` are generated and ignored. Build them with `pnpm build` and `pnpm types`; edit their sources instead. Keep validation fixtures under `tests/` and out of the published package.

@@ -12,12 +12,12 @@ Running any harness needs the Docker images in the repository's `docker/` direct
 
 The recommended connection is another Worker handing its Service Binding to the OpenAI client as a custom `fetch`: [Service Binding guide](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/service-binding.md). [Direct RPC](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/rpc.md) and [hosted HTTP](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/http-api.md) are the other paths.
 
-| Import                          | Purpose                                                                                       |
-| ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `cf-open-agents-api`            | Wire schemas, types, `ApiError`, `remoteApiError`, runtime driver contracts, Effect helpers   |
-| `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentRPC`, `bearerTenant`, DO and Container classes, container drivers |
-| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `createModelGateway`                    |
-| `cf-open-agents-api/tools`      | `defineTool`, search presets and immutable skill helpers                                      |
+| Import                          | Purpose                                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `cf-open-agents-api`            | Wire schemas, types, tagged error classes, `ApiError`, runtime driver contracts, Effect helpers |
+| `cf-open-agents-api/cloudflare` | `createAgentService`, `AgentRPC`, `bearerTenant`, DO and Container classes, container drivers   |
+| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `createModelGateway`                      |
+| `cf-open-agents-api/tools`      | `defineTool`, search presets and immutable skill helpers                                        |
 
 See the [library API](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/library-api.md) for factory options, RPC methods, peers and installation from a source checkout. The workspace examples run without an npm publication. Peers: `effect@3.22.2`, `openai@7.15.0`, and `ai@7.0.97` for the model entrypoint. Container support pins `@cloudflare/sandbox@0.13.0-next.751.1` with its matching image.
 

@@ -4,12 +4,14 @@ Use Node 24 and the pinned pnpm (`11.1.2`). Run `pnpm install --frozen-lockfile`
 
 ## Toolchain
 
-| Command                   | Purpose                                                           |
-| ------------------------- | ----------------------------------------------------------------- |
-| `pnpm lint`               | Type-aware oxlint rules and an oxfmt formatting check (ultracite) |
-| `pnpm format`             | Apply safe lint fixes and format                                  |
-| `pnpm typecheck`          | TypeScript 7 with Effect diagnostics through `@effect/tsgo`       |
-| `pnpm effect:diagnostics` | Effect language-service diagnostics alone                         |
+| Command                   | Purpose                                                                                       |
+| ------------------------- | --------------------------------------------------------------------------------------------- |
+| `pnpm lint`               | Type-aware oxlint rules, the repository lint plugin and an oxfmt formatting check (ultracite) |
+| `pnpm format`             | Apply safe lint fixes and format                                                              |
+| `pnpm typecheck`          | TypeScript 7 with Effect diagnostics through `@effect/tsgo`                                   |
+| `pnpm effect:diagnostics` | Effect language-service diagnostics alone                                                     |
+
+Every lint finding is an error: the correctness subset, the promoted `no-shadow` and `no-unsafe-*` families, and the `complexity` and `no-nested-ternary` quality rules apply to packages, tests and examples alike. The repository plugin in `scripts/lint/agent-api-plugin.mjs` enforces the parts of the [Effect house rules](docs/effect.md#the-five-house-rules) the type checker cannot see: `agent-api/no-run-in-transaction` everywhere, and for the Worker package `agent-api/no-run-below-entrypoint` (a runner is allowed only in the allow-listed entrypoint files and only on a line preceded by `// lint: entrypoint`) and `agent-api/no-api-error-construction`. `pnpm test:scripts` runs the plugin's rule tests.
 
 Format only the files you change: `pnpm exec oxfmt <files>`. Markdown is formatted too, with prose wrapping preserved. Do not reformat unrelated files in a change.
 
@@ -29,7 +31,7 @@ Run commands from the repository root. Pick the rows that match the change; CI r
 
 What each suite covers:
 
-- `pnpm test` (`tests/workers`): the production composition in workerd with SQLite Durable Objects and a scripted runtime driver. API and wire shapes, Service Binding RPC, session liveness (alarm re-arm, command delivery, fail-fast), cancellation and retry, recovery after lost responses, forks, environments, skills, programmatic tools, assets and the Effect boundaries.
+- `pnpm test` (`tests/workers`): the production composition in workerd with SQLite Durable Objects and a scripted runtime driver. API and wire shapes, Service Binding RPC, session liveness (alarm re-arm, command delivery, fail-fast), cancellation and retry, recovery after lost responses, forks, environments, skills, programmatic tools, assets, the error projection of every tag, the repository seam and the reconciler's policy on the in-memory store, streaming and the Effect boundaries. `tests/workers/state-contracts.ts` holds the compile-time contracts (synchronous transactions, fenced transitions).
 - `pnpm test:codex` (`tests/codex`): real Codex app-server and exec-server with a scripted Responses endpoint. Turn error mapping, user-input requests, native subagents, compatibility of the Codex protocol.
 - `pnpm test:harnesses` (`tests/harnesses`): all three native runtimes through the supervisor with scripted models, the model gateway through the official OpenAI and Anthropic clients, MCP, media and usage, delegation, workspace tools, supervisor lifecycle and concurrency, history restored after the original home is removed. Needs Codex `0.154.0` on `PATH`.
 - `pnpm test:containers` (`scripts/test-containers.mjs`, `tests/containers`): the real Worker, Container and R2 path in Wrangler's local emulation with Docker. Needs Docker and `python3`; see [deployment](docs/deployment.md#local-runtime-notes) for the rootless recipe.
@@ -40,19 +42,21 @@ Match recurring diagnostics against [known issues](docs/known-issues.md). See [s
 
 ## Code map
 
-- `packages/agent-api/src/protocol.ts`: wire schemas, public types, `ApiError`, limits such as the image cap.
-- `service.ts`, `catalog.ts`, `session.ts`: HTTP and RPC routes, tenant catalog, durable session state and the reconciler.
-- `session-events.ts`: projection of runtime events into public items and events.
-- `storage.ts`: Kysely queries executed synchronously in SQLite, row and page budgets.
-- `runtime.ts`: Effect schemas and the `RuntimeDriver` contract; `effect.ts`: `io`, `attempt`, boundary runners.
-- `containers.ts`: HarnessDO and SandboxDO, sandbox reuse, model and tool egress, delegated children, checkpoints.
+- `packages/agent-api/src/protocol.ts`: wire schemas, public types, `parse` and `parseEffect`, limits such as the image cap.
+- `errors.ts`: the layered tagged error vocabulary, `toApiError` (the only status and code table), `isPermanent`, the RPC envelope; `api-error.ts`: the `ApiError` projection; `effect.ts`: `io`, `attempt`, `OperationError`, the boundary runners.
+- `service.ts`: the composition root, the `AgentWorker` RPC methods, the Hono app and its error handler; `http/`: one route module per resource (sessions, agents, environments, files, skills, vaults, capabilities).
+- `session.ts`: `SessionObject`, its runtime, the synchronous RPC reads and the SSE stream; `session-services.ts`: the `Drivers`, `Alarm` and `Repo` services; `session-state.ts`: the synchronous state machine; `session-reconcile.ts`: the reconciler tick; `session-events.ts`: projection of runtime events into public items and events.
+- `persistence/`: the repository seam (`Kind`, `RecordStore`, `MemoryStore`, `Repo`, `SessionTx` and `SessionRepo`, `HarnessTx`, `Fenced`); `storage.ts`: `SqlStore`, Kysely queries executed synchronously in SQLite, row and page budgets.
+- `catalog.ts`: the tenant catalog; `runtime.ts`: Effect schemas, the `RuntimeDriver` contract and `fromPromiseDriver`.
+- `containers.ts`: HarnessDO and SandboxDO, sandbox reuse, model and tool egress, delegated children, checkpoints, the container drivers.
 - `container-environments.ts`, `environment-config.ts`, `environments.ts`: hosted environment setup, uploads, inheritance.
 - `skills.ts`, `skill-zip.ts`, `capability-archive.ts`, `files.ts`, `vaults.ts`: tenant-owned skills, input files and credentials.
 - `programmatic.ts`, `programmatic-contract.ts`: isolated code execution and its tool bridge.
 - `models.ts`, `models/`: model adapters, protocol translation, error sanitizing.
 - `workspace.ts`, `sandbox-tools.ts`, `portable-capabilities.ts`: workspace tool contracts, sandbox execution, skill and plugin discovery.
 - `tools.ts`: tool contracts, search presets and immutable asset helpers.
-- `packages/supervisor/src`: `server.ts` (the container HTTP API), `job.ts` and `lifecycle.ts` (job state, event log, steer and cancel), `codex.ts`, `claude-code.ts`, `opencode.ts` (adapters), `delegation.ts` (cross-runtime children), `remote-tools.ts` (MCP bridge), `checkpoint.ts`.
+- `packages/supervisor/src`: `server.ts` (the container HTTP API and its one status table), `main.ts`, `job.ts` (the `Job` lifecycle, finalizer-ordered stop), `lifecycle.ts` (`JobLog`, `Operations`, `once`, the tagged failures), `process.ts` (process acquisition, readiness and termination), `json-rpc.ts` (the Codex app-server transport), `codex.ts`, `claude-code.ts`, `opencode.ts` (adapters), `delegation.ts` (cross-runtime children), `remote-tools.ts` (MCP bridge), `checkpoint.ts`.
+- `scripts/lint/agent-api-plugin.mjs`: the repository lint rules and their tests.
 - `examples/worker`: deployable composition; no test fixture enters this build. `examples/caller`: a consuming Worker.
 - `docker/`: the harness and sandbox images.
 
@@ -60,7 +64,7 @@ Match recurring diagnostics against [known issues](docs/known-issues.md). See [s
 
 For a proposed public wire, persistent record, checkpoint format or minimum-provider change, describe the trigger, observable behavior and the compatibility and recovery plan before implementation. An explicit request approving that change is the decision; no further approval round is needed. Small fixes and documentation improvements need no proposal.
 
-Keep validation at boundaries. Never put model or provider credentials in a sandbox, serialize an AI SDK model instance, or retry a write whose outcome is unknown. Queries belong in typed repositories. Durable Object transactions stay synchronous: compile Kysely queries and execute them inside `transactionSync`; do not replace that with an async `BEGIN`/`COMMIT` or hold a concurrency permit across network I/O. Follow the [Effect house rules](docs/effect.md).
+Keep validation at boundaries. Never put model or provider credentials in a sandbox, serialize an AI SDK model instance, or retry a write whose outcome is unknown. Queries belong in typed repositories: declare a `Kind` for every record and go through a `SessionTx` or `HarnessTx`. Durable Object transactions stay synchronous: a transition is a plain function of the transaction view, compiled Kysely queries execute inside `transactionSync`, and a transition after I/O takes a `Fenced` record; do not replace that with an async `BEGIN`/`COMMIT` or hold a concurrency permit across network I/O. New failures are tagged classes in `errors.ts` with a row in the `WIRE` table, never `new ApiError(...)`. Follow the [Effect house rules](docs/effect.md).
 
 Add a behavioral regression test for a correctness fix. Use the smallest useful layer, but use real workerd for SQLite, RPC and alarm changes and real Codex for protocol changes. Tests must not read a developer's OpenAI or Codex credentials.
 

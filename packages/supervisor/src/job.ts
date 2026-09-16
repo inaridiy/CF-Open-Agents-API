@@ -142,8 +142,8 @@ export interface NativeOptions extends JobOptions {
  * order below is the only definition of shutdown:
  *
  *   requestCancel → delegations.cancelAll → interruptTurn → log sealed → abort →
- *   pending calls failed → teardown (remote tools, runtime closed) → resources closed
- *   (task and relay fibers interrupted and awaited, processes terminated).
+ *   pending calls failed → teardown (runtime closed) → resources closed (task and relay
+ *   fibers interrupted and awaited, MCP clients released, processes terminated).
  *
  * Native SDK callbacks run outside any fiber; `perform` hands their Effects to a
  * worker fiber the resource scope owns, so stopping interrupts them for real.

@@ -42,7 +42,7 @@ sequenceDiagram
     N->>G: model request
     N->>X: bash / read / write / edit
     S->>H: pollExecution
-    H->>N: GET /jobs/{turn}?after=
+    H->>N: GET /jobs/{turn}?after=&wait=
     N-->>S: events
     S-->>C: SSE, required_actions
     C->>S: tool_result or steer
@@ -56,15 +56,15 @@ sequenceDiagram
 
 ## Durable execution
 
-SessionDO stores records and an ordered event log in SQLite. Kysely compiles the SQL; a small bridge runs it synchronously inside `transactionSync`, so input validation, turn creation, queued commands and emitted events commit together. Network I/O runs outside those transactions, which is why new input can arrive while the reconciler is polling.
+SessionDO stores records and an ordered event log in SQLite behind a typed repository seam: Kysely compiles the SQL, `SqlStore` executes it synchronously, and every state transition is a synchronous function of a `SessionTx` that runs inside one `transactionSync`, so input validation, turn creation, queued commands and emitted events commit together and a thrown rule rolls them back as one. Network I/O runs outside those transactions as Effect programs on the object's runtime, which is why new input can arrive while the reconciler is waiting on the runtime.
 
-Every execution carries a session ID, a turn ID and an increasing generation. Each state change after I/O rechecks that identity against the durable record. A Durable Object alarm drives the reconciler. While a turn is active the alarm is re-armed before the reconciler takes its permit, so a busy reconciler can never consume the only wake-up. SQLite stays authoritative after eviction.
+Every execution carries a session ID, a turn ID and an increasing generation. A transition that follows I/O takes a `Fenced<ActiveSession>`: the record as the writing transaction re-read it and matched it to the execution. A stale identity fails with `Superseded` and the tick ends silently; a transition on a record read before the I/O does not compile. A Durable Object alarm drives the reconciler. While a turn is active the alarm is re-armed before the reconciler takes its permit, so a busy reconciler can never consume the only wake-up, and again once the tick settles, one interval after the alarm fired. Within a tick the reconciler long-polls the runtime for the rest of its interval and keeps polling while events arrive, so streaming latency follows the runtime rather than the alarm (`pollIntervalMs`, 5 seconds by default). SQLite stays authoritative after eviction.
 
-Start and control operations use stable operation IDs. HarnessDO writes a dispatch marker before it hands a job to the supervisor; a retry can inspect a lost job but never replay it. A job that was acknowledged and then vanished fails with `outcome_unknown`, because the input log does not prove whether side effects already happened.
+Start and control operations use stable operation IDs. HarnessDO writes a dispatch marker and posts the job to the supervisor as one uninterruptible step; a retry can inspect a lost job but never replay it. A job that was acknowledged and then vanished fails with `outcome_unknown`, because the input log does not prove whether side effects already happened.
 
-Queued commands never block polling. A command the runtime refuses for good (`command_rejected`) is dropped: a refused steer becomes the next turn's input, a refused tool result is discarded. A transient delivery failure is retried after the next poll, so a turn the runtime already finished can still be sealed. Cancellation has its own durable record and supersedes queued steers and tool results.
+Queued commands never block polling. A command the runtime refuses for good (`CommandRejected`, `ExecutionMissing`) is dropped: a refused steer becomes the next turn's input, a refused tool result is discarded. A transient delivery failure (`TransportFailure`) is retried after the next poll, so a turn the runtime already finished can still be sealed. Cancellation has its own durable record and supersedes queued steers and tool results.
 
-The reconciler fails fast on a runtime protocol violation, an executor the deployment no longer registers, a harness revision mismatch, or a typed start rejection. It keeps retrying plain I/O failures until the turn deadline (`request_timeout`).
+The reconciler's error policy is a type. A definite answer (`RuntimeRejected`, a runtime protocol violation, an unstorable record, an executor the deployment no longer registers, a harness revision mismatch) fails the turn at once with the code it projects to. A transport or storage failure propagates to the alarm, which logs it and retries on the next interval until the turn deadline (`request_timeout`). The program itself, its services and the fence are described in [effect.md](effect.md#the-reconciler-tick).
 
 ## Turn outcomes
 
@@ -74,9 +74,9 @@ Only an indeterminate outcome leaves the session `failed`: `outcome_unknown`, `p
 
 ## Checkpoints and recovery
 
-A finished turn enters `checkpointing`. The supervisor stops the native process, then captures its home directory (history databases, transcripts, native subagent state). HarnessDO stores that snapshot in R2 under an immutable per-generation key, backs up `/workspace`, publishes `/workspace/outputs` as artifacts, and records the checkpoint locally. SessionDO exposes `completed` only after both references are committed.
+A finished turn enters `checkpointing`. The supervisor stops the native process, then captures its home directory (history databases, transcripts, native subagent state). HarnessDO stores that snapshot in R2 under an immutable per-generation key, backs up `/workspace`, publishes `/workspace/outputs` as artifacts (a manifest committed before any upload, then four files at a time, each copy interruptible on its own), and records the checkpoint locally. The R2 puts a durable record will name are uninterruptible, so an interrupted fiber observes their outcome instead of leaving it unknown. SessionDO commits the checkpoint references under the fence and exposes `completed` only after they are committed.
 
-Checkpoint retries read the recorded checkpoint directly and do not poll a native process that may be gone, so a lost response is recovered even after the container disappears. A checkpoint is attempted after the deadline as well, since the result may already be committed. The harness revision is checked before a checkpoint is restored. Codex uses a stable home path because its database stores absolute rollout paths. Checkpoints hold files, not processes, sockets or external effects.
+Checkpoint retries read the recorded checkpoint directly and do not poll a native process that may be gone, so a lost response is recovered even after the container disappears. A checkpoint is attempted after the deadline as well, since the result may already be committed; only a failure to answer after the deadline fails the turn with `checkpoint_unavailable`. The harness revision is checked before a checkpoint is restored. Codex uses a stable home path because its database stores absolute rollout paths. Checkpoints hold files, not processes, sockets or external effects.
 
 ## Sandbox reuse
 
@@ -98,14 +98,14 @@ Skills are immutable, integrity-checked R2 bundles. They are input to untrusted 
 
 ## Streaming and limits
 
-Live SSE reads persisted events under backpressure with a bounded buffer per listener, sends a keepalive comment every 15 seconds, and delivers each event once. A creation request with `stream: true` returns a stream that ends when the initial turn settles, or right after `agent.session.created` when no input was given. Disconnecting never cancels a turn. `/cf/v1` exposes explicit event replay.
+Live SSE is one Effect `Stream` per listener, run by the session object's runtime and owned by the `ReadableStream` it feeds: pages of persisted events read from SQLite by cursor, woken by every committed transaction, merged with a keepalive comment every 15 seconds, and delivered each once. Back-pressure is the response's 64 KiB queue; a session holds at most 64 listeners. A creation request with `stream: true` returns a stream that ends when the initial turn settles, or right after `agent.session.created` when no input was given. Disconnecting cancels the response stream, which releases the listener and never cancels the turn. `/cf/v1` exposes explicit event replay. The stream's construction is in [effect.md](effect.md#sse-streaming).
 
-HTTP body size and serialized storage size are separate limits. Records include internal state and may repeat client fields, so SQL writes enforce a conservative row budget before execution; an oversized record is a structured 413 and its transaction rolls back. List pages stop growing past 4 MiB of serialized records. The values are in [compatibility](compatibility.md#durability-and-limits).
+HTTP body size and serialized storage size are separate limits. Records include internal state and may repeat client fields, so SQL writes enforce a conservative row budget before execution; an oversized record is a structured 413 (`RecordTooLarge`) and its transaction rolls back. List pages stop growing past 4 MiB of serialized records. The values are in [compatibility](compatibility.md#durability-and-limits).
 
 ## Subagents and delegation
 
-Subagents have their own items and turns. Native subagents run inside the runtime's own process: Codex threads, Claude Code's `Task` tool, OpenCode's `task` tool. Delegated children run on another preset's harness in a child HarnessDO and container named after the parent's subagent ID, share the parent's sandbox without resetting it, and are never checkpointed. The parent supervisor relays child events into its own ordered stream under the child's subagent and turn IDs, routes client function results to the child, and finishes only after its children stop. The parent HarnessDO records each child's terminal batch durably before it stops the child container, and stops every child before it releases the shared sandbox. Delegation does not nest.
+Subagents have their own items and turns. Native subagents run inside the runtime's own process: Codex threads, Claude Code's `Task` tool, OpenCode's `task` tool. Delegated children run on another preset's harness in a child HarnessDO and container named after the parent's subagent ID, share the parent's sandbox without resetting it, and are never checkpointed. The parent supervisor relays child events into its own ordered stream under the child's subagent and turn IDs, routes client function results to the child, and finishes only after its children stop. Each relay is a fiber of the parent job's scope, and stopping a job is one ordered sequence of finalizers: cancellation is requested, children are cancelled, the runtime's turn is interrupted, the log is sealed, pending tool calls fail, the runtime client is closed, and only then are MCP clients released, fibers interrupted and processes terminated ([effect.md](effect.md#the-supervisor)). The parent HarnessDO records each child's terminal batch durably before it stops the child container, and stops every child before it releases the shared sandbox. Delegation does not nest.
 
 ## Effect
 
-Internals compose Effect programs behind the platform entrypoints. The five house rules and the state of the ongoing migration are in [effect.md](effect.md).
+Internals compose Effect programs behind the platform entrypoints. The five house rules, the layered error vocabulary, the repository seam, the per-object runtimes and the supervisor's scopes are in [effect.md](effect.md).

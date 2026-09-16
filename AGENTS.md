@@ -7,7 +7,7 @@ This is a pnpm TypeScript workspace: a Workers API with SQLite Durable Objects, 
 | Setup, commands, test selection                   | [CONTRIBUTING.md](CONTRIBUTING.md#validation) and [README.md](README.md#develop)        |
 | Service boundaries or durable execution           | [docs/architecture.md](docs/architecture.md)                                            |
 | Public HTTP/RPC behavior                          | [docs/compatibility.md](docs/compatibility.md) and `packages/agent-api/src/protocol.ts` |
-| Effect code                                       | [docs/effect.md](docs/effect.md), the five house rules                                  |
+| Effect code, errors, persistence, streaming       | [docs/effect.md](docs/effect.md): the five house rules and what enforces each           |
 | Native runtime, model gateway, checkpoint changes | [native-harness-change](.agents/skills/native-harness-change/SKILL.md)                  |
 | Worker bindings, Docker, R2 or deployment         | [docs/deployment.md](docs/deployment.md)                                                |
 | Toolchain, vendored skills, checkers              | [docs/development-harness.md](docs/development-harness.md)                              |
@@ -23,4 +23,4 @@ Run commands from the repository root with the pinned pnpm. `pnpm lint`, `pnpm f
 
 ## Effect
 
-This repository uses Effect 3.22.2. Follow the five house rules in [docs/effect.md](docs/effect.md). The pinned release ships no `AGENTS.md`; consult `node_modules/effect/src` and the Effect v3 documentation for signatures and semantics. Preserve the pin.
+This repository uses Effect 3.22.2. Follow the five house rules in [docs/effect.md](docs/effect.md); the lint plugin in `scripts/lint/agent-api-plugin.mjs` rejects a runner below an entrypoint, a runner inside a transaction callback and `new ApiError(...)` outside the error modules. New failures are tagged classes in `packages/agent-api/src/errors.ts` with a row in its `WIRE` table. The pinned release ships no `AGENTS.md`; consult `node_modules/effect/src` and the Effect v3 documentation for signatures and semantics. Preserve the pin.

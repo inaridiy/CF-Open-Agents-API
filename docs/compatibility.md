@@ -13,7 +13,7 @@ This is an independent implementation. It aims to let the official client work u
 | Sessions           | Create (optionally with input and `stream: true`), retrieve, list with `agent_id` filter, metadata update, delete when no turn is active. `vault_ids` may be `null`.                                            |
 | Input              | Text and image messages, cancellation, function results as a string or a content array with text and images. Input sent during a turn steers it on every harness.                                               |
 | Output items       | Assistant text, function calls, command executions, MCP calls, reasoning summaries, web search calls, usage; Codex collaboration items for native subagents.                                                    |
-| Streaming          | Live SSE on `/v1/agents/sessions/{id}/events` with keepalives; creation streams that end after the initial turn; durable replay on `/cf/v1/sessions/{id}/events?after=`.                                        |
+| Streaming          | Live SSE on `/v1/agents/sessions/{id}/events` (long-polled from the runtime; keepalives; 64 listeners); creation streams ending after the initial turn; replay on `/cf/v1/sessions/{id}/events?after=`.         |
 | Turns              | Retrieve and cursor-paginated list. `completed` means the checkpoint is committed. Failed turns carry the SDK's `SessionTurnError` codes.                                                                       |
 | Usage              | Per-turn and session token counts with cached-input and reasoning breakdown for all harnesses, preserved across eviction and restore.                                                                           |
 | Agent settings     | Reasoning effort and summary, `text.format` (`text` or `json_schema`), `text.verbosity`, `service_tier`, `multi_agent`. See [agent settings by harness](#agent-settings-by-harness).                            |
@@ -38,7 +38,7 @@ This is an independent implementation. It aims to let the official client work u
 - Unknown or unsupported fields are rejected with `400 invalid_request`.
 - Every response carries `x-request-id`. Permanent `409` conflicts (`idempotency_conflict`, `active_turn`, `session_failed`, `turn_checkpointing`, `active_turn_not_steerable`, `outcome_unknown`, `network_policy_conflict`, `invalid_session_state`, `not_deleted`, `environment_conflict`) carry `x-should-retry: false`, which the SDK honors.
 - An absent or empty request body means `{}`; a fork needs no body.
-- Errors use the OpenAI envelope: `{ error: { message, type, code, param } }`. `type` follows the status (`authentication_error`, `rate_limit_error`, `server_error`, otherwise `invalid_request_error`).
+- Errors use the OpenAI envelope: `{ error: { message, type, code, param } }`. `type` follows the status (`authentication_error`, `rate_limit_error`, `server_error`, otherwise `invalid_request_error`). Every `code` is projected from one tagged failure class by a single table (`toApiError` in `packages/agent-api/src/errors.ts`); the codes themselves are unchanged from earlier snapshots.
 - Function tool names and MCP `server_label` values match `[A-Za-z0-9_-]{1,64}`. `cf_execute`, `cf_tool_search`, `cf_call_tool`, `cf_delegate`, `cf_wait`, `cf_close` and the workspace tool names (`bash`, `read`, `write`, `edit`) are reserved while the corresponding feature is enabled.
 - Pages default to 20 records in descending order; `limit` is 1 to 100; `after` must belong to the collection.
 - Idempotency keys cover session creation, forks, submitted event batches and skill uploads. Reusing a key with different input is `409 idempotency_conflict`.
@@ -138,13 +138,14 @@ Tenant catalogs isolate session discovery, input files, skills, templates and va
 | Native checkpoint                        | 32 MiB                                                                                                                                  |
 | Supervisor event log per execution       | 8 MB, including streamed deltas (`native_output_limit` fails the turn)                                                                  |
 | Turn deadline                            | 15 minutes by default (`maxTurnMs`), including tool waits and delegated children                                                        |
+| Reconciler alarm                         | 5 seconds by default (`pollIntervalMs`); a tick long-polls the harness for the rest of its interval, at most 25 seconds per wait        |
 | Claude Code / OpenCode steps per turn    | 32                                                                                                                                      |
 | Portable AI SDK inference                | 8,192 output tokens; 120-second timeout by default                                                                                      |
 | Private model gateway                    | 4 MiB request, 8 MiB response                                                                                                           |
 | Programmatic code                        | 128 KB code, 1,000 ms CPU, 120 s wall time, 64 tool calls (8 concurrent), 128 KB arguments per call, 1 MiB results, 256 KB return value |
 | Delegated children                       | `max_concurrent_subagents` (default 6); prompt up to 128,000 characters                                                                 |
 | Fork transcript                          | 96,000 characters, 4,000 per entry; older entries are omitted first                                                                     |
-| SSE                                      | 64 KiB buffer per listener; 64 listeners per session (`429 stream_limit`); keepalive every 15 seconds                                   |
+| SSE                                      | 64 KiB queue per listener; 64 listeners per session (`429 stream_limit`); keepalive every 15 seconds; 64 events read per pull           |
 | Workspace backup TTL                     | 30 days                                                                                                                                 |
 
 The SQL budget stays below the platform's [2 MB row limit](https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits). Records repeat input fields, so a body well under 16 MiB can still exceed a row; the transaction rolls back. Session configuration bodies live in R2. The same storage budget applies to Service Binding RPC.

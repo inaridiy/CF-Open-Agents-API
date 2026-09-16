@@ -33,13 +33,24 @@ Nothing has been published to npm. The `v0.1.0` tag exists as history; this is t
 
 ### Changed
 
+- Effect architecture, described in [docs/effect.md](docs/effect.md):
+  - Typed errors: failures are tagged classes in four layers (persistence, domain, runtime adapters, wire) in `errors.ts`; `toApiError` is the only table that maps a tag to a status and code, `isPermanent` decides `x-should-retry`, and `ApiError` is only the HTTP projection and its reconstruction from an RPC wire name. `io` always threads the fiber's `AbortSignal`; the writes a durable record depends on (the dispatch marker with `POST /jobs`, R2 checkpoint, artifact, file and upload puts, the catalog commit, the OAuth refresh commit) are `Effect.uninterruptible`.
+  - RPC envelope: Durable Object RPC results travel in a `Schema.Either` envelope (`encodeRpc`, `decodeRpc`), so an expected failure re-enters the caller's fiber as a tagged instance instead of a platform exception.
+  - Repository seam: SQLite sits behind `persistence/` (`Kind<A>`, `RecordStore`, `SessionTx`, `SessionRepo`, `HarnessTx`) with unchanged SQL; a transition after I/O takes a `Fenced<ActiveSession>` that only `tx.fenced` certifies, so a stale write does not compile.
+  - Runtime: each session object runs a `ManagedRuntime` with `Drivers`, `Alarm` and `Repo`, and each HarnessDO one with `HarnessRepo` and `HarnessBindings`; the reconciler is one `Effect.fn` program with a `catchTags` policy and budgeted rounds; `Effect.run*` is confined to entrypoints.
+  - SSE: one Effect `Stream` per listener over SQLite pages, woken by a sliding `PubSub` after each commit, merged with a scheduled keepalive, capped by a 64-permit semaphore, owned by the response's `ReadableStream`.
+  - Long-poll: the reconciler polls the harness for the rest of its alarm interval (`RuntimeDriver.poll(execution, after, { waitMs })`, the `longPoll` flag, supervisor `GET /jobs/:turn?after=&wait=` up to 25 s per wait), so streaming latency follows the runtime; `pollIntervalMs` defaults to 5 seconds instead of one.
+  - Supervisor scopes: each job is owned by an Effect `Scope`; processes are acquired into it (`SIGTERM`, grace period, `SIGKILL`), delegation relays and MCP clients are scoped fibers and resources, the stop sequence is the finalizer registration order, `JobLog.poll` waits for the next event, and `server.ts` maps every tagged failure to a status in one table.
+- Public surface: the root import exports the error classes with `DomainError`, `DomainTag`, `Capability`, `isDomainError`, `toApiError`, `caughtFailure`, `projectApiError`, `isPermanent` and `parseEffect`; `ServiceError` is `DomainError | OperationError | ApiError`; `RuntimeDriver` methods are typed per method and a custom driver must fail with `RuntimeRejected`, `CommandRejected`, `ExecutionMissing` or `TransportFailure`; `PromiseRuntimeDriver` methods receive an `AbortSignal` and `poll` receives `PollOptions`; `createModelGateway` registry entries may be factories (`ModelRegistration`) built only when selected. The example Worker bundle grew from 4,631 KiB (849 KiB gzip) to 5,146 KiB (946 KiB gzip).
+- Lint: the repository plugin `scripts/lint/agent-api-plugin.mjs` adds `agent-api/no-run-in-transaction`, `agent-api/no-run-below-entrypoint` (allow-listed files, `// lint: entrypoint` marker) and `agent-api/no-api-error-construction`; `complexity` and `no-nested-ternary` are errors under `packages/**`; `pnpm test:scripts` runs the plugin's rule tests.
 - Error codes: `app_server_exited` is now `native_harness_exited`; `event_buffer_limit` is now `native_output_limit`.
 - Limits: capability archives are 16 MiB per inline archive and 64 MiB per environment, extracted to at most 32 MiB and 10,000 entries; list pages stop at 4 MiB of serialized records; fork transcripts are 96,000 characters; the supervisor event log is 8 MB.
 - Toolchain: Biome is replaced by ultracite (type-aware oxlint and oxfmt) and `@effect/tsgo`; `pnpm lint`, `pnpm format` and `pnpm effect:diagnostics` are the commands; `prepare` patches TypeScript and oxlint.
-- Documentation rewritten for adopters: README, architecture with a turn sequence, compatibility with a per-harness matrix and the not-implemented list, deployment walkthrough, Effect house rules, known issues for OpenCode `1.18.30` message listing and rootless Docker.
+- Documentation rewritten for adopters: README, architecture with a turn sequence, compatibility with a per-harness matrix and the not-implemented list, deployment walkthrough, the Effect architecture page with its house rules and error vocabulary, known issues for OpenCode `1.18.30` message listing and rootless Docker.
 
 ### Removed
 
+- `RpcResult`, `rpcFailure` and `unwrap` from the root import; the RPC envelope is internal.
 - `docs/implementation.md`; its validation table lives in CONTRIBUTING.md.
 - Every statement that the repository or its distribution is private.
 
