@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { ensureDevVars, Files, parseDevVars } from "../dist/index.js";
+import { ensureDevVars, ensureDevVarsExample, Files, parseDevVars } from "../dist/index.js";
 import { cleanup, emptyDirectory, read } from "./helpers.js";
 
 it("parses KEY=value lines and ignores comments", () => {
@@ -44,6 +44,22 @@ it("creates the file with a token comment when it is missing", () => {
     ensureDevVars({ files: new Files(root, false), token: () => "T".repeat(40) });
     expect(read(root, ".dev.vars")).toMatch(
       /^# Bearer token clients send.*\nAPI_TOKEN=T{40}\n\n# Store sandbox/,
+    );
+  } finally {
+    cleanup(root);
+  }
+});
+
+it("keeps an existing .dev.vars.example and appends the missing keys", () => {
+  const root = emptyDirectory();
+  try {
+    writeFileSync(join(root, ".dev.vars.example"), "# app\nOTHER=\n");
+    ensureDevVarsExample({
+      files: new Files(root, false),
+      secret: { name: "OPENAI_API_KEY", comment: "# key" },
+    });
+    expect(read(root, ".dev.vars.example")).toBe(
+      "# app\nOTHER=\nAPI_TOKEN=replace-with-at-least-32-random-characters\n# key\nOPENAI_API_KEY=\n# Store sandbox backups on the local R2 emulator during `wrangler dev`; unset in production.\nLOCAL_BACKUPS=true\n",
     );
   } finally {
     cleanup(root);

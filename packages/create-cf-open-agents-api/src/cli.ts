@@ -19,6 +19,8 @@ async function main(): Promise<void> {
       doctor: doctorCommand,
       vendor: vendorCommand,
     },
+    // The commands print their own intro; gunshi's header would repeat it on every run.
+    renderHeader: null,
   });
 }
 

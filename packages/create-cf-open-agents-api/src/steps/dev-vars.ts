@@ -68,13 +68,15 @@ export function ensureDevVars(options: DevVarsOptions): StepResult {
   );
 }
 
-/** The committed example next to `.dev.vars`. */
+/** The committed example next to `.dev.vars`: existing lines stay, missing keys are appended. */
 export function ensureDevVarsExample(options: DevVarsOptions): StepResult {
-  const lines = ["API_TOKEN=replace-with-at-least-32-random-characters"];
-  if (options.secret) lines.push(options.secret.comment, `${options.secret.name}=`);
-  lines.push(LOCAL_BACKUPS_COMMENT, "LOCAL_BACKUPS=true");
-  return options.files.write(
-    join(options.files.root, ".dev.vars.example"),
-    `${lines.join("\n")}\n`,
-  );
+  const path = join(options.files.root, ".dev.vars.example");
+  const existing = options.files.read(path) ?? "";
+  const values = parseDevVars(existing);
+  const lines = trimTrailing(existing.split(/\r?\n/));
+  if (!values.has("API_TOKEN")) lines.push("API_TOKEN=replace-with-at-least-32-random-characters");
+  if (options.secret && !values.has(options.secret.name))
+    lines.push(options.secret.comment, `${options.secret.name}=`);
+  if (!values.has("LOCAL_BACKUPS")) lines.push(LOCAL_BACKUPS_COMMENT, "LOCAL_BACKUPS=true");
+  return options.files.write(path, `${lines.join("\n")}\n`);
 }

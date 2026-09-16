@@ -6,7 +6,7 @@ export { type InitOptions, type InitResult, runInit } from "./init.js";
 export { CliError, Plan, type StepResult } from "./plan.js";
 export { detectPackageManager, locateProject, workerNameFrom } from "./project.js";
 export { accountIds, runSetup, type SetupOptions } from "./setup.js";
-export { ensureDevVars, parseDevVars } from "./steps/dev-vars.js";
+export { ensureDevVars, ensureDevVarsExample, parseDevVars } from "./steps/dev-vars.js";
 export { agentsSpecifier } from "./steps/entry.js";
 export { ensureVendor, readVendorManifest, type VendorManifest } from "./steps/vendor.js";
 export { upsertWranglerConfig, type WranglerInput } from "./steps/wrangler.js";

@@ -88,12 +88,10 @@ export async function ensureVendor(options: VendorOptions): Promise<StepResult> 
   const expectedSource = source ? resolve(source) : "github";
   const current = readVendorManifest(options.root);
   const status = current ? "updated" : "created";
-  if (
-    !options.force &&
-    current?.ref === ref &&
-    current.source === expectedSource &&
-    isComplete(options.root)
-  )
+  // A complete snapshot of the wanted ref is current wherever it came from; only an
+  // explicit source that differs from the recorded one replaces it.
+  const sameSource = !source || current?.source === expectedSource;
+  if (!options.force && current?.ref === ref && sameSource && isComplete(options.root))
     return { status: "skipped", file };
   if (env[SKIP_VENDOR_VARIABLE])
     return {
@@ -141,7 +139,7 @@ async function download(ref: string, staging: string, options: VendorOptions): P
   const response = await (options.fetch ?? fetch)(url);
   if (response.status === 404)
     throw new CliError(
-      `No source archive for ${ref} at ${url} yet. Pass --source <checkout> or --ref main.`,
+      `No source archive for ${ref} at ${url} yet. Pass --source <checkout> or --ref main, or set ${SOURCE_VARIABLE}=<checkout> (${SKIP_VENDOR_VARIABLE}=1 skips the snapshot).`,
     );
   if (!response.ok) throw new CliError(`Downloading ${url} failed with HTTP ${response.status}`);
   const archive = join(staging, "source.tar.gz");
