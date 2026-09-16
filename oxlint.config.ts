@@ -3,8 +3,8 @@ import core from "ultracite/oxlint/core";
 
 /**
  * Ultracite's core preset carries ~540 rules, most of them stylistic (sort-keys, curly,
- * func-style). This repository keeps the correctness subset as errors and a few quality
- * families as warnings; run `pnpm lint` (type-aware) before committing.
+ * func-style). This repository keeps the correctness subset plus a few quality families as
+ * errors; run `pnpm lint` (type-aware) before committing.
  */
 type RuleMap = NonNullable<OxlintConfig["rules"]>;
 const pick = <K extends string>(source: { rules?: RuleMap }, names: readonly K[]) => {
@@ -83,19 +83,8 @@ const PROMOTED = [
   "typescript/no-unsafe-return",
   "unicorn/no-useless-undefined",
 ] as const;
-/**
- * Quality families: errors for the packages, whose findings were cleared (2026-09-16),
- * warnings for tests and examples until their cleanup lands.
- */
+/** Quality families: errors everywhere, their findings having been cleared (2026-09-16). */
 const QUALITY = ["no-nested-ternary", "complexity"] as const;
-
-const asWarning = (rules: Record<string, unknown>) =>
-  Object.fromEntries(
-    Object.entries(rules).map(([name, rule]) => [
-      name,
-      Array.isArray(rule) ? ["warn", ...(rule as unknown[]).slice(1)] : "warn",
-    ]),
-  ) as RuleMap;
 
 export default defineConfig({
   plugins: ["eslint", "typescript", "unicorn", "oxc", "import", "promise"],
@@ -104,7 +93,7 @@ export default defineConfig({
   rules: {
     ...pick(core, ERRORS),
     ...pick(core, PROMOTED),
-    ...asWarning(pick(core, QUALITY)),
+    ...pick(core, QUALITY),
     "typescript/switch-exhaustiveness-check": [
       "error",
       { considerDefaultExhaustiveForUnions: true },
@@ -115,7 +104,6 @@ export default defineConfig({
     "agent-api/no-run-in-transaction": "error",
   } satisfies RuleMap,
   overrides: [
-    { files: ["packages/**"], rules: pick(core, QUALITY) },
     {
       // The Worker package: runners only at the marked entrypoints, ApiError only in the error modules.
       files: ["packages/agent-api/src/**"],

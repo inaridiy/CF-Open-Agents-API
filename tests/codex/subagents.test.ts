@@ -11,6 +11,124 @@ import type { Execution } from "../../packages/agent-api/src/runtime.js";
 import { Buffer } from "../../packages/supervisor/src/buffer.js";
 import { CodexJob } from "../../packages/supervisor/src/codex.js";
 
+interface ChildState {
+  requests: Record<string, unknown>[];
+  childReady: Promise<void>;
+  outcome: string;
+  searched: boolean;
+  spawned: boolean;
+}
+
+function createProviderHandler(state: ChildState) {
+  return async (request: IncomingMessage, response: ServerResponse) => {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of request) chunks.push(chunk as Uint8Array);
+    const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+    state.requests.push(body);
+    const input = body.input as { role?: string; content?: { text?: string }[] }[];
+    const child = input.some(
+      (item) => item.role === "user" && item.content?.some((part) => part.text === "CHILD_ONLY"),
+    );
+    let output: object[];
+    if (child) {
+      if (state.outcome !== "immediate") await state.childReady;
+      output = [
+        {
+          type: "message",
+          id: "child_message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "child result" }],
+        },
+      ];
+    } else if (!state.searched) {
+      state.searched = true;
+      output = [
+        {
+          type: "tool_search_call",
+          id: "search_call",
+          call_id: "search_call",
+          execution: "client",
+          arguments: { query: "spawn_agent", limit: 1 },
+        },
+      ];
+    } else if (!state.spawned) {
+      state.spawned = true;
+      output = [
+        {
+          type: "function_call",
+          id: "spawn_call",
+          call_id: "spawn_call",
+          namespace: "multi_agent_v1",
+          name: "spawn_agent",
+          arguments: JSON.stringify({ message: "CHILD_ONLY" }),
+        },
+      ];
+    } else
+      output = [
+        {
+          type: "message",
+          id: "root_message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "root result" }],
+        },
+      ];
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const send = (type: string, value: object) =>
+      response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+    send("response.created", {
+      response: { id: "response", object: "response", status: "in_progress", output: [] },
+    });
+    for (const [output_index, item] of output.entries()) {
+      send("response.output_item.added", { output_index, item });
+      send("response.output_item.done", { output_index, item });
+    }
+    send("response.completed", {
+      response: {
+        id: "response",
+        object: "response",
+        status: "completed",
+        output,
+        usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+      },
+    });
+    response.end();
+  };
+}
+
+const hasSubagentTurn = async (job: CodexJob) =>
+  (await runPromise(job.poll(0))).events.some(({ event }) => event.type === "subagent_turn");
+
+async function waitForRootText(job: CodexJob, text: string) {
+  for (
+    let i = 0;
+    i < 200 &&
+    !(await runPromise(job.poll(0))).events.some(
+      ({ event }) => event.type === "text" && event.text === text,
+    );
+    i++
+  )
+    await delay(25);
+}
+
+async function waitForSubagentTurn(job: CodexJob) {
+  for (let i = 0; i < 200 && !(await hasSubagentTurn(job)); i++) await delay(25);
+}
+
+async function waitUntilSettled(job: CodexJob) {
+  for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
+    await delay(25);
+}
+
+async function assertCancelled(job: CodexJob, diagnostics: string[]) {
+  await waitUntilSettled(job);
+  expect((await runPromise(job.poll(0))).status, diagnostics.join("\n")).toBe("cancelled");
+  expect(
+    (await runPromise(job.poll(0))).events.some(
+      ({ event }) => event.type === "subagent_turn" && event.status === "cancelled",
+    ),
+  ).toBe(true);
+}
+
 it.each(["complete", "cancel", "immediate"])(
   "keeps child output separate while the root finishes, then %s",
   async (outcome) => {
@@ -20,81 +138,13 @@ it.each(["complete", "cancel", "immediate"])(
     const childReady = new Promise<void>((resolve) => {
       releaseChild = resolve;
     });
-    let searched = false;
-    let spawned = false;
-    const handle = async (request: IncomingMessage, response: ServerResponse) => {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of request) chunks.push(chunk as Uint8Array);
-      const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
-      requests.push(body);
-      const input = body.input as { role?: string; content?: { text?: string }[] }[];
-      const child = input.some(
-        (item) => item.role === "user" && item.content?.some((part) => part.text === "CHILD_ONLY"),
-      );
-      let output: object[];
-      if (child) {
-        if (outcome !== "immediate") await childReady;
-        output = [
-          {
-            type: "message",
-            id: "child_message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "child result" }],
-          },
-        ];
-      } else if (!searched) {
-        searched = true;
-        output = [
-          {
-            type: "tool_search_call",
-            id: "search_call",
-            call_id: "search_call",
-            execution: "client",
-            arguments: { query: "spawn_agent", limit: 1 },
-          },
-        ];
-      } else if (!spawned) {
-        spawned = true;
-        output = [
-          {
-            type: "function_call",
-            id: "spawn_call",
-            call_id: "spawn_call",
-            namespace: "multi_agent_v1",
-            name: "spawn_agent",
-            arguments: JSON.stringify({ message: "CHILD_ONLY" }),
-          },
-        ];
-      } else
-        output = [
-          {
-            type: "message",
-            id: "root_message",
-            role: "assistant",
-            content: [{ type: "output_text", text: "root result" }],
-          },
-        ];
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      const send = (type: string, value: object) =>
-        response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
-      send("response.created", {
-        response: { id: "response", object: "response", status: "in_progress", output: [] },
-      });
-      for (const [output_index, item] of output.entries()) {
-        send("response.output_item.added", { output_index, item });
-        send("response.output_item.done", { output_index, item });
-      }
-      send("response.completed", {
-        response: {
-          id: "response",
-          object: "response",
-          status: "completed",
-          output,
-          usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
-        },
-      });
-      response.end();
-    };
+    const handle = createProviderHandler({
+      requests,
+      childReady,
+      outcome,
+      searched: false,
+      spawned: false,
+    });
     const server = createServer((request, response) => {
       void handle(request, response);
     });
@@ -132,38 +182,20 @@ it.each(["complete", "cancel", "immediate"])(
     let resumed: CodexJob | undefined;
     try {
       await runPromise(job.start());
-      for (
-        let i = 0;
-        i < 200 &&
-        !(await runPromise(job.poll(0))).events.some(
-          ({ event }) => event.type === "text" && event.text === "root result",
-        );
-        i++
-      )
-        await delay(25);
+      await waitForRootText(job, "root result");
       if (outcome !== "immediate")
         expect((await runPromise(job.poll(0))).status, diagnostics.join("\n")).toBe("running");
       // The child's turn notification and the root's final text are independent
       // app-server events; the child turn is asserted once it has been projected.
-      const childTurnSeen = async () =>
-        (await runPromise(job.poll(0))).events.some(({ event }) => event.type === "subagent_turn");
-      for (let i = 0; i < 200 && !(await childTurnSeen()); i++) await delay(25);
-      expect(await childTurnSeen(), diagnostics.join("\n")).toBe(true);
+      await waitForSubagentTurn(job);
+      expect(await hasSubagentTurn(job), diagnostics.join("\n")).toBe(true);
       if (outcome === "cancel") {
         await runPromise(job.control("cancel-after-root", { type: "cancel" }));
-        for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
-          await delay(25);
-        expect((await runPromise(job.poll(0))).status, diagnostics.join("\n")).toBe("cancelled");
-        expect(
-          (await runPromise(job.poll(0))).events.some(
-            ({ event }) => event.type === "subagent_turn" && event.status === "cancelled",
-          ),
-        ).toBe(true);
+        await assertCancelled(job, diagnostics);
         return;
       }
       releaseChild?.();
-      for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
-        await delay(25);
+      await waitUntilSettled(job);
       const batch = await runPromise(job.poll(0));
       expect(batch.status, diagnostics.join("\n")).toBe("completed");
       expect(
@@ -199,8 +231,7 @@ it.each(["complete", "cancel", "immediate"])(
         options,
       );
       await runPromise(resumed.start(bundle));
-      for (let i = 0; i < 200 && (await runPromise(resumed.poll(0))).status === "running"; i++)
-        await delay(25);
+      await waitUntilSettled(resumed);
       expect((await runPromise(resumed.poll(0))).status, diagnostics.join("\n")).toBe("completed");
       expect(JSON.stringify(requests.at(-1)?.input)).toContain("spawn_agent");
     } finally {

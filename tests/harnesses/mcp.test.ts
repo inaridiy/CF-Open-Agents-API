@@ -12,6 +12,34 @@ import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/mod
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
 
+const mcpResult = (method: string) => {
+  if (method === "initialize")
+    return {
+      protocolVersion: "2025-03-26",
+      capabilities: { tools: {} },
+      serverInfo: { name: "fixture", version: "1" },
+    };
+  if (method === "tools/list")
+    return {
+      tools: ["lookup", "forbidden"].map((name) => ({
+        name,
+        description: name,
+        inputSchema: { type: "object", properties: {} },
+      })),
+    };
+  return { content: [{ type: "text", text: "MCP_PROOF" }] };
+};
+const toolEnding = (received: boolean, searched: boolean) => {
+  if (!received) return "__lookup";
+  if (!searched) return "cf_tool_search";
+  return "cf_call_tool";
+};
+const toolInput = (received: boolean, searched: boolean) => {
+  if (!received) return {};
+  if (!searched) return { query: "hidden_lookup" };
+  return { name: "hidden_lookup", arguments: { query: "proof" } };
+};
+
 it.each(["claude-code", "opencode"])(
   "%s executes allowed MCP tools and discovers deferred functions",
   async (harness) => {
@@ -33,22 +61,7 @@ it.each(["claude-code", "opencode"])(
       return Response.json({
         jsonrpc: "2.0",
         id: message.id,
-        result:
-          message.method === "initialize"
-            ? {
-                protocolVersion: "2025-03-26",
-                capabilities: { tools: {} },
-                serverInfo: { name: "fixture", version: "1" },
-              }
-            : message.method === "tools/list"
-              ? {
-                  tools: ["lookup", "forbidden"].map((name) => ({
-                    name,
-                    description: name,
-                    inputSchema: { type: "object", properties: {} },
-                  })),
-                }
-              : { content: [{ type: "text", text: "MCP_PROOF" }] },
+        result: mcpResult(message.method),
       });
     });
     const gateway = createModelGateway(() => ({
@@ -62,7 +75,7 @@ it.each(["claude-code", "opencode"])(
             const complete = history.includes("DEFERRED_PROOF");
             const searched = history.includes('"role":"tool"') && history.includes("defer_loading");
             const received = history.includes("MCP_PROOF");
-            const ending = !received ? "__lookup" : !searched ? "cf_tool_search" : "cf_call_tool";
+            const ending = toolEnding(received, searched);
             const selected = definitions.find((tool) => tool.name.endsWith(ending));
             if (!complete && !selected) throw new Error(`Missing tool ${ending}`);
             return {
@@ -84,13 +97,7 @@ it.each(["claude-code", "opencode"])(
                           type: "tool-call" as const,
                           toolCallId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
                           toolName: selected?.name ?? "missing",
-                          input: JSON.stringify(
-                            !received
-                              ? {}
-                              : !searched
-                                ? { query: "hidden_lookup" }
-                                : { name: "hidden_lookup", arguments: { query: "proof" } },
-                          ),
+                          input: JSON.stringify(toolInput(received, searched)),
                         },
                       ]),
                   {

@@ -101,11 +101,12 @@ it("round-trips hyphenated function names and MCP server labels", async () => {
     },
     environment: none,
   });
-  expect(
-    session.agent.tools.map((tool) =>
-      tool.type === "function" ? tool.name : tool.type === "mcp" ? tool.server_label : tool.type,
-    ),
-  ).toEqual(["look-up_v2", "docs-server"]);
+  const label = (tool: (typeof session.agent.tools)[number]) => {
+    if (tool.type === "function") return tool.name;
+    if (tool.type === "mcp") return tool.server_label;
+    return tool.type;
+  };
+  expect(session.agent.tools.map(label)).toEqual(["look-up_v2", "docs-server"]);
   const saved = await api.beta.agents.create({
     model: "test",
     tools: [{ type: "function", name: "saved-tool", description: "", parameters: {} }],

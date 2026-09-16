@@ -138,16 +138,12 @@ it("a steer the runtime refuses becomes the next turn instead of blocking comple
       finished = true;
       await instance.submit([message("late follow-up")], "follow-up");
       await instance.alarm();
-      const items = instance
-        .items({ order: "asc", limit: 10 })
-        .data.map((item) => [
-          item.turn_id,
-          item.type === "message" && item.content[0]?.type === "input_text"
-            ? item.content[0].text
-            : item.type === "message" && item.content[0]?.type === "output_text"
-              ? item.content[0].text
-              : item.type,
-        ]);
+      const items = instance.items({ order: "asc", limit: 10 }).data.map((item) => {
+        const part = item.type === "message" ? item.content[0] : undefined;
+        if (part?.type === "input_text") return [item.turn_id, part.text];
+        if (part?.type === "output_text") return [item.turn_id, part.text];
+        return [item.turn_id, item.type];
+      });
       const afterRejection = summary(instance);
       await instance.alarm();
       return { controls, items, afterRejection, final: summary(instance) };

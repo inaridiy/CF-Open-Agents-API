@@ -18,6 +18,26 @@ const source = (description: string) =>
   `---\nname: example\ndescription: ${description}\n---\nSkill instructions.\n`;
 const file = (description: string) =>
   new File([source(description)], "SKILL.md", { type: "text/markdown" });
+const filesFor = (kind: string): File[] => {
+  if (kind === "empty") return [];
+  if (kind === "missing-frontmatter") return [new File(["not a skill"], "SKILL.md")];
+  if (kind === "duplicate") return [file("a"), file("b")];
+  if (kind === "invalid-zip") return [new File(["not zip"], "skill.zip")];
+  if (kind === "yaml-alias")
+    return [new File(["---\nname: &name example\ndescription: *name\n---\nbody"], "SKILL.md")];
+  return [
+    new File(
+      [
+        zipSync(
+          kind === "traversal"
+            ? { "../SKILL.md": strToU8(source("bad")) }
+            : { "README.md": strToU8("missing") },
+        ),
+      ],
+      "skill.zip",
+    ),
+  ];
+};
 afterEach(() => reset());
 
 it("preserves safe executable permissions and rejects invalid ZIP metadata before publishing", async () => {
@@ -152,29 +172,7 @@ it.each([
   "yaml-alias",
 ])("rejects %s uploads without publishing metadata", async (kind) => {
   const api = client().skills;
-  const files =
-    kind === "empty"
-      ? []
-      : kind === "missing-frontmatter"
-        ? [new File(["not a skill"], "SKILL.md")]
-        : kind === "duplicate"
-          ? [file("a"), file("b")]
-          : kind === "invalid-zip"
-            ? [new File(["not zip"], "skill.zip")]
-            : kind === "yaml-alias"
-              ? [new File(["---\nname: &name example\ndescription: *name\n---\nbody"], "SKILL.md")]
-              : [
-                  new File(
-                    [
-                      zipSync(
-                        kind === "traversal"
-                          ? { "../SKILL.md": strToU8(source("bad")) }
-                          : { "README.md": strToU8("missing") },
-                      ),
-                    ],
-                    "skill.zip",
-                  ),
-                ];
+  const files = filesFor(kind);
   await expect(api.create({ files })).rejects.toMatchObject({ status: 400 });
   expect((await api.list()).data).toEqual([]);
 });

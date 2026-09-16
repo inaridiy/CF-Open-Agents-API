@@ -25,6 +25,11 @@ const api = new OpenAI({
 const params = { agent: { model: "test" }, environment: { type: "none" as const } };
 const stub = (id: string) => env.SESSIONS.getByName(JSON.stringify(["compat", id]));
 const image = { type: "input_image" as const, image_url: "data:image/png;base64,iVBORw0KGgo=" };
+const scriptedOutput = (kind: string, content: InputContentParam[], failure: unknown) => {
+  if (kind === "object") return '{"ok":true}';
+  if (kind === "content") return content;
+  return failure;
+};
 afterEach(() => reset());
 
 it.each(["object", "content", "failure"])(
@@ -68,8 +73,7 @@ it.each(["object", "content", "failure"])(
       type: "tool_result",
       callId: "lookup",
       success: kind !== "failure",
-      output:
-        kind === "object" ? '{"ok":true}' : kind === "content" ? content : "Tool handler failed.",
+      output: scriptedOutput(kind, content, "Tool handler failed."),
     });
     await abortAllDurableObjects();
     const result = (await api.beta.agents.sessions.items.list(session.id)).data.find(
@@ -78,7 +82,7 @@ it.each(["object", "content", "failure"])(
     expect(result).toMatchObject({
       type: "function_call_output",
       status: kind === "failure" ? "failed" : "completed",
-      output: kind === "object" ? '{"ok":true}' : kind === "content" ? content : null,
+      output: scriptedOutput(kind, content, null),
     });
     expect(JSON.stringify(result)).not.toContain("Private handler detail");
   },

@@ -104,7 +104,12 @@ function scriptedGateway(plan: "wait" | "leave") {
             definitions.find((tool) => tool.name === suffix || tool.name.endsWith(`_${suffix}`));
           const spawned = history.includes("subagent_1");
           const waited = plan === "leave" || history.includes("CHILD_ANSWER");
-          const tool = !spawned ? find("cf_delegate") : !waited ? find("cf_wait") : undefined;
+          const selectTool = () => {
+            if (!spawned) return find("cf_delegate");
+            if (!waited) return find("cf_wait");
+            return;
+          };
+          const tool = selectTool();
           if (!waited && !tool)
             throw new Error(
               `Missing delegation tool: ${definitions.map((t) => t.name).join(", ")}`,

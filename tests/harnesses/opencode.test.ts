@@ -344,17 +344,17 @@ it("steering reaches the model within the same turn", async () => {
   const held = new Promise<void>((releaseResolve) => {
     release = releaseResolve;
   });
-  const model = await chatFixture((request, index) =>
-    index === 0
-      ? {
-          text: "Working.",
-          hold: held,
-          toolCalls: [{ name: "workspace_function_0", args: { query: "a" } }],
-        }
-      : textOf(request).includes("steered-instruction")
-        ? { text: "Steered answer." }
-        : { text: "Unsteered answer." },
-  );
+  const scriptedReply = (request: ChatRequest, index: number): Reply => {
+    if (index === 0)
+      return {
+        text: "Working.",
+        hold: held,
+        toolCalls: [{ name: "workspace_function_0", args: { query: "a" } }],
+      };
+    if (textOf(request).includes("steered-instruction")) return { text: "Steered answer." };
+    return { text: "Unsteered answer." };
+  };
+  const model = await chatFixture(scriptedReply);
   const h = await harness(model.url);
   try {
     await h.post("/jobs", { execution: execution({}), operationId: "start" });
