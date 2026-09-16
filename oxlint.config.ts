@@ -83,8 +83,11 @@ const PROMOTED = [
   "typescript/no-unsafe-return",
   "unicorn/no-useless-undefined",
 ] as const;
-/** Quality families that still carry pre-existing findings; they become errors once clean. */
-const WARNINGS = ["no-nested-ternary", "complexity"] as const;
+/**
+ * Quality families: errors for the packages, whose findings were cleared (2026-09-16),
+ * warnings for tests and examples until their cleanup lands.
+ */
+const QUALITY = ["no-nested-ternary", "complexity"] as const;
 
 const asWarning = (rules: Record<string, unknown>) =>
   Object.fromEntries(
@@ -101,7 +104,7 @@ export default defineConfig({
   rules: {
     ...pick(core, ERRORS),
     ...pick(core, PROMOTED),
-    ...asWarning(pick(core, WARNINGS)),
+    ...asWarning(pick(core, QUALITY)),
     "typescript/switch-exhaustiveness-check": [
       "error",
       { considerDefaultExhaustiveForUnions: true },
@@ -112,6 +115,7 @@ export default defineConfig({
     "agent-api/no-run-in-transaction": "error",
   } satisfies RuleMap,
   overrides: [
+    { files: ["packages/**"], rules: pick(core, QUALITY) },
     {
       // The Worker package: runners only at the marked entrypoints, ApiError only in the error modules.
       files: ["packages/agent-api/src/**"],

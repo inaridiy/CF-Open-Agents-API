@@ -103,18 +103,17 @@ const clip = (text: string) =>
     ? `${text.slice(0, TRANSCRIPT_ENTRY_LIMIT)}… [truncated]`
     : text;
 const json = (value: unknown) => clip(typeof value === "string" ? value : JSON.stringify(value));
+/** Text parts verbatim, images as a placeholder, anything else (files, refusals) omitted. */
+function transcriptPart(
+  part: Extract<AgentSessionItem, { type: "message" }>["content"][number],
+): string {
+  if (part.type === "input_text" || part.type === "output_text") return part.text;
+  return part.type === "input_image" ? "[image]" : "";
+}
 function transcriptEntry(item: AgentSessionItem): string | undefined {
   switch (item.type) {
     case "message": {
-      const text = item.content
-        .map((part) =>
-          part.type === "input_text" || part.type === "output_text"
-            ? part.text
-            : part.type === "input_image"
-              ? "[image]"
-              : "",
-        )
-        .join("\n");
+      const text = item.content.map(transcriptPart).join("\n");
       return `${item.role === "user" ? "User" : "Assistant"}: ${clip(text)}`;
     }
     case "function_call":

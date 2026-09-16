@@ -3,6 +3,7 @@ import { getSandbox, type ISandbox, Sandbox } from "@cloudflare/sandbox";
 import { Context, Effect, Layer, ManagedRuntime, Schema, Stream } from "effect";
 import { z } from "zod";
 
+import type { McpToolConfig } from "./agent-tools.js";
 import type { CatalogObject } from "./catalog.js";
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
 import { attempt, decode, decodeEffect, io, type ServiceError, settle } from "./effect.js";
@@ -79,6 +80,16 @@ function remoteImageURLs(parts: readonly { type: string; image_url?: string }[])
   );
 }
 
+/** Hosts a sandbox may reach under the environment's network policy. */
+function allowedHosts(
+  access: NonNullable<HostedConfiguration["network"]>["access"],
+  network: HostedConfiguration["network"],
+): string[] {
+  if (access === "enabled") return ["*"];
+  if (access === "restricted") return network?.allowed_domains ?? [];
+  return [];
+}
+
 export class SandboxContainer extends Sandbox<ContainerBindings> {
   override sleepAfter = "10m";
   constructor(ctx: ConstructorParameters<typeof Sandbox>[0], env: ContainerBindings) {
@@ -97,13 +108,7 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
       throw new NetworkPolicyConflict();
     await this.ctx.storage.put("environment_internet", enabled);
     this.enableInternet = enabled;
-    await this.setAllowedHosts(
-      access === "enabled"
-        ? ["*"]
-        : access === "restricted"
-          ? (network?.allowed_domains ?? [])
-          : [],
-    );
+    await this.setAllowedHosts(allowedHosts(access, network));
     await this.setDeniedHosts(access === "disabled" ? ["*"] : []);
   }
   override async fetch(request: Request): Promise<Response> {
@@ -220,6 +225,149 @@ const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Ex
   );
   return manifest;
 });
+
+/** The harness a start names, once its checkpoint is known to belong to that harness revision. */
+const admittedHarness = (execution: Execution) =>
+  Effect.gen(function* () {
+    if (!Object.hasOwn(HARNESSES, execution.harness))
+      return yield* new HarnessUnknown({ harness: execution.harness });
+    const harness = execution.harness as HarnessName;
+    if (
+      execution.checkpoint &&
+      (execution.checkpoint.driver !== harness ||
+        execution.checkpoint.revision !== HARNESSES[harness].revision)
+    )
+      return yield* new CheckpointHarnessMismatch({
+        harness: execution.checkpoint.driver,
+        revision: execution.checkpoint.revision,
+      });
+    return harness;
+  });
+/**
+ * How the current assignment receives a start: a stale execution is `Superseded`, a retry
+ * of a dispatched turn is a no-op, another session's turn is an `AssignmentConflict`.
+ */
+const startAdmission = (execution: Execution, previous: Assignment | undefined) =>
+  Effect.gen(function* () {
+    if (
+      previous &&
+      (execution.generation < previous.generation ||
+        (execution.generation === previous.generation && execution.turnId !== previous.turnId))
+    )
+      return yield* new Superseded({
+        turnId: execution.turnId,
+        generation: execution.generation,
+      });
+    if (previous?.turnId === execution.turnId && previous.dispatched) return "dispatched" as const;
+    if (previous && previous.sessionId !== execution.sessionId)
+      return yield* new AssignmentConflict({ sessionId: previous.sessionId });
+    return "new" as const;
+  });
+/** Codex drives hosted search itself; the assignment records the mode the agent configured. */
+const webSearchMode = (execution: Execution): NonNullable<Assignment["webSearchMode"]> =>
+  execution.agent.tools?.some((tool) => tool.type === "web_search")
+    ? (execution.agent.tools.find((tool) => tool.type === "web_search")?.mode ?? "live")
+    : "disabled";
+/** Worker-authoritative names code may call: client functions plus, with a sandbox, workspace tools. */
+function programmaticConfig(execution: Execution): Assignment["programmatic"] | undefined {
+  const tools = execution.agent.tools;
+  if (!tools?.some((tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false))
+    return;
+  return {
+    tools: [
+      ...tools.filter((tool) => tool.type === "function").map((tool) => tool.name),
+      ...(execution.sandbox ? Object.keys(workspaceTools) : []),
+    ],
+    deadline: execution.deadline,
+  };
+}
+/** Only a root turn with delegates may spawn children; they inherit this configuration. */
+function delegationConfig(execution: Execution): Assignment["delegation"] | undefined {
+  if (!execution.delegates?.length || execution.parent) return;
+  return {
+    delegates: execution.delegates,
+    maxConcurrentSubagents: execution.maxConcurrentSubagents ?? 6,
+    agent: execution.agent,
+    deadline: execution.deadline,
+    ...(execution.environmentId ? { environmentId: execution.environmentId } : {}),
+  };
+}
+/** The assignment a start writes before dispatch; `digests` bounds the images the turn may fetch. */
+function buildAssignment(
+  execution: Execution,
+  harness: HarnessName,
+  digests: string[],
+): Assignment {
+  const programmatic = programmaticConfig(execution);
+  const delegation = delegationConfig(execution);
+  return {
+    sessionId: execution.sessionId,
+    generation: execution.generation,
+    turnId: execution.turnId,
+    model: execution.model,
+    ...(harness === "codex" ? { webSearchMode: webSearchMode(execution) } : {}),
+    harness,
+    dispatched: false,
+    sandbox: execution.sandbox,
+    tenant: execution.tenant,
+    vaultIds: execution.vaultIds,
+    mcp: (execution.agent.tools ?? []).filter((tool) => tool.type === "mcp"),
+    imageDigests: digests,
+    ...(programmatic ? { programmatic } : {}),
+    ...(delegation ? { delegation } : {}),
+    ...(execution.parent ? { parent: execution.parent } : {}),
+  };
+}
+type AgentTool = NonNullable<Execution["agent"]["tools"]>[number];
+/** The stub `getSandbox` returns: `ISandbox` plus the container lifecycle (destroy, restore). */
+type LiveSandbox = ReturnType<typeof getSandbox<SandboxContainer>>;
+/**
+ * Configured MCP servers reach the harness through the Worker's proxy; Codex keeps the
+ * stdio and environment-origin servers it drives itself.
+ */
+function proxiedTool(tool: AgentTool, harness: HarnessName) {
+  if (tool.type !== "mcp") return tool;
+  if (
+    harness === "codex" &&
+    (tool.transport.type !== "http" || tool.connection_origin === "environment")
+  )
+    return tool;
+  return {
+    ...tool,
+    transport: { type: "http", server_url: `http://mcp.internal/${tool.server_label}` },
+    connection_origin: "service",
+    credential_id: null,
+    request_metadata: {},
+  };
+}
+/** The supervisor job body: the execution with proxied tools, portable instructions and the checkpoint. */
+function jobBody(
+  execution: Execution,
+  assigned: Assignment,
+  capabilityRoots: string[],
+  portableInstructions: string,
+  operationId: string,
+  checkpoint: unknown,
+): string {
+  return JSON.stringify({
+    execution: {
+      ...execution,
+      capabilityRoots,
+      agent: {
+        ...execution.agent,
+        instructions: [execution.agent.instructions, portableInstructions]
+          .filter(Boolean)
+          .join("\n\n"),
+        tools: [
+          ...(execution.agent.tools ?? []).filter((tool) => tool.type !== "mcp"),
+          ...(assigned.mcp ?? []),
+        ].map((tool) => proxiedTool(tool, assigned.harness)),
+      },
+    },
+    operationId,
+    checkpoint,
+  });
+}
 
 export class HarnessContainer<
   Env extends ContainerBindings = ContainerBindings,
@@ -750,181 +898,38 @@ export class HarnessContainer<
   }
   private startAttempt(execution: Execution, operationId: string) {
     return Effect.gen(this, function* () {
-      if (!Object.hasOwn(HARNESSES, execution.harness))
-        return yield* new HarnessUnknown({ harness: execution.harness });
-      const harness = execution.harness as HarnessName;
-      if (
-        execution.checkpoint &&
-        (execution.checkpoint.driver !== harness ||
-          execution.checkpoint.revision !== HARNESSES[harness].revision)
-      )
-        return yield* new CheckpointHarnessMismatch({
-          harness: execution.checkpoint.driver,
-          revision: execution.checkpoint.revision,
-        });
+      const harness = yield* admittedHarness(execution);
       const previous = yield* read((tx) => tx.assignment());
-      if (
-        previous &&
-        (execution.generation < previous.generation ||
-          (execution.generation === previous.generation && execution.turnId !== previous.turnId))
-      )
-        return yield* new Superseded({
-          turnId: execution.turnId,
-          generation: execution.generation,
-        });
-      if (previous?.turnId === execution.turnId && previous.dispatched) return;
-      if (previous && previous.sessionId !== execution.sessionId)
-        return yield* new AssignmentConflict({ sessionId: previous.sessionId });
-      const assigned: Assignment = {
-        sessionId: execution.sessionId,
-        generation: execution.generation,
-        turnId: execution.turnId,
-        model: execution.model,
-        ...(harness === "codex"
-          ? {
-              webSearchMode: execution.agent.tools?.some((tool) => tool.type === "web_search")
-                ? (execution.agent.tools.find((tool) => tool.type === "web_search")?.mode ?? "live")
-                : "disabled",
-            }
-          : {}),
-        harness,
-        dispatched: false,
-        sandbox: execution.sandbox,
-        tenant: execution.tenant,
-        vaultIds: execution.vaultIds,
-        mcp: (execution.agent.tools ?? []).filter((tool) => tool.type === "mcp"),
-        imageDigests: yield* imageDigests(
-          remoteImageURLs(execution.input.flatMap((message) => message.content)),
-          [],
-        ),
-        ...(execution.agent.tools?.some(
-          (tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false,
-        )
-          ? {
-              programmatic: {
-                tools: [
-                  ...execution.agent.tools
-                    .filter((tool) => tool.type === "function")
-                    .map((tool) => tool.name),
-                  ...(execution.sandbox ? Object.keys(workspaceTools) : []),
-                ],
-                deadline: execution.deadline,
-              },
-            }
-          : {}),
-        ...(execution.delegates?.length && !execution.parent
-          ? {
-              delegation: {
-                delegates: execution.delegates,
-                maxConcurrentSubagents: execution.maxConcurrentSubagents ?? 6,
-                agent: execution.agent,
-                deadline: execution.deadline,
-                ...(execution.environmentId ? { environmentId: execution.environmentId } : {}),
-              },
-            }
-          : {}),
-        ...(execution.parent ? { parent: execution.parent } : {}),
-      };
+      if ((yield* startAdmission(execution, previous)) === "dispatched") return;
+      const digests = yield* imageDigests(
+        remoteImageURLs(execution.input.flatMap((message) => message.content)),
+        [],
+      );
+      const assigned = buildAssignment(execution, harness, digests);
       this.abortCodeExecutions();
       yield* write((tx) => tx.putAssignment(assigned));
       const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const previousCheckpoint = execution.checkpoint;
       const previousWorkspace = previousCheckpoint?.workspace ?? this.environment.base();
       // A delegated child joins the parent's live sandbox; only the parent resets it.
-      const listening = (port: number) =>
-        io("startAttempt.probe", async () => {
-          const probe = await sandbox.exec([
-            "bash",
-            "-c",
-            `exec 3<>/dev/tcp/127.0.0.1/${port} 2>/dev/null && echo up || echo down`,
-          ]);
-          return (await probe.output({ timeout: 10_000, encoding: "utf8" })).stdout.includes("up");
-        });
-      if (execution.sandbox && !execution.parent) {
-        const workspaceId = previousWorkspace?.id ?? "";
-        // A running sandbox that provably holds the committed workspace continues as is,
-        // including state outside /workspace. Anything else starts from the last committed
-        // filesystem checkpoint: destroy, restore, and configure the fresh container.
-        const reused = yield* this.sandboxHolds(sandbox, execution.sessionId, workspaceId);
-        if (!reused) {
-          yield* write((tx) => tx.forgetSandbox());
-          yield* io("startAttempt", () => sandbox.destroy());
-          if (previousWorkspace)
-            yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
-          else {
-            yield* io("startAttempt", () => sandbox.mkdir("/workspace", { recursive: true }));
-          }
-          const environmentSpec = this.environment.spec();
-          if (environmentSpec) yield* this.environment.configure(environmentSpec);
-          yield* this.rememberSandbox(sandbox, {
-            workspaceId,
-            provisioned: previousCheckpoint !== null || this.environment.inherited(),
-          });
-        }
-        // The deployment hook runs once per fresh workspace; an inherited workspace was provisioned.
-        if (!(yield* read((tx) => tx.sandbox()))?.provisioned) {
-          yield* io("startAttempt", () => this.prepareSandbox(sandbox, execution));
-          yield* this.rememberSandbox(sandbox, { workspaceId, provisioned: true });
-        }
-        yield* this.environment.applyUploads(previousCheckpoint?.environmentFileVersion ?? 0);
-      }
-      if (execution.sandbox && harness === "codex" && !(yield* listening(4500))) {
-        const executor = yield* io("startAttempt", () =>
-          sandbox.exec(["codex", "exec-server", "--listen", "ws://0.0.0.0:4500"]),
-        );
-        yield* io("startAttempt", () => executor.waitForPort(4500));
-      }
+      if (execution.sandbox && !execution.parent)
+        yield* this.prepareWorkspace(sandbox, execution, previousWorkspace);
+      if (execution.sandbox && harness === "codex") yield* this.ensureCodexServer(sandbox);
       const capabilityRoots = execution.parent
         ? [...(execution.capabilityRoots ?? [])]
         : this.environment.capabilityRoots();
       let portableInstructions = "";
       if (harness !== "codex" && execution.sandbox) {
-        const configured = assigned.mcp ?? [];
-        // Plugin-derived labels are sanitized and kept distinct from configured servers, so
-        // workspace content can add servers but never replace or break configured ones.
-        const discovered = yield* io("capabilities.discover", () =>
-          discoverCapabilities(sandbox, capabilityRoots, {
-            reservedLabels: configured.map((entry) => entry.server_label),
-            diagnostics: (line) =>
-              console.warn("Capability discovery skipped an entry", {
-                sessionId: execution.sessionId,
-                line,
-              }),
-          }),
+        const attached = yield* this.attachCapabilities(
+          sandbox,
+          execution,
+          assigned.mcp ?? [],
+          capabilityRoots,
         );
-        portableInstructions = discovered.instructions;
-        assigned.mcp = [...configured, ...discovered.mcp];
-        const environmentServers = assigned.mcp.filter(
-          (tool) => tool.transport.type === "stdio" || tool.connection_origin === "environment",
-        );
-        if (environmentServers.length && !(yield* listening(4501))) {
-          yield* io("mcp.bridge.config", () =>
-            sandbox.writeFile(
-              "/tmp/cf-environment-mcp.json",
-              JSON.stringify(
-                Object.fromEntries(
-                  environmentServers.map((tool) => [tool.server_label, tool.transport]),
-                ),
-              ),
-            ),
-          );
-          yield* io("mcp.bridge.script", () =>
-            sandbox.writeFile("/tmp/cf-environment-mcp.mjs", environmentMcpScript),
-          );
-          const bridge = yield* io("mcp.bridge.start", () =>
-            sandbox.exec(["node", "/tmp/cf-environment-mcp.mjs", "/tmp/cf-environment-mcp.json"]),
-          );
-          yield* io("mcp.bridge.ready", () => bridge.waitForPort(4501));
-        }
+        portableInstructions = attached.instructions;
+        assigned.mcp = attached.mcp;
       }
-      let checkpoint: unknown;
-      if (previousCheckpoint) {
-        const object = yield* io("startAttempt", () =>
-          this.env.CHECKPOINTS.get(previousCheckpoint.native),
-        );
-        if (!object) return yield* new CheckpointMissing({ key: previousCheckpoint.native });
-        checkpoint = yield* io("startAttempt", () => object.json());
-      }
+      const checkpoint = yield* this.loadCheckpoint(previousCheckpoint);
       yield* io("startAttempt", (signal) =>
         this.startAndWaitForPorts(undefined, { abort: signal }),
       );
@@ -938,40 +943,14 @@ export class HarnessContainer<
               this.containerFetch("http://harness/jobs", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                  execution: {
-                    ...execution,
-                    capabilityRoots,
-                    agent: {
-                      ...execution.agent,
-                      instructions: [execution.agent.instructions, portableInstructions]
-                        .filter(Boolean)
-                        .join("\n\n"),
-                      tools: [
-                        ...(execution.agent.tools ?? []).filter((tool) => tool.type !== "mcp"),
-                        ...(assigned.mcp ?? []),
-                      ].map((tool) =>
-                        tool.type === "mcp" &&
-                        (harness !== "codex" ||
-                          (tool.transport.type === "http" &&
-                            tool.connection_origin !== "environment"))
-                          ? {
-                              ...tool,
-                              transport: {
-                                type: "http",
-                                server_url: `http://mcp.internal/${tool.server_label}`,
-                              },
-                              connection_origin: "service",
-                              credential_id: null,
-                              request_metadata: {},
-                            }
-                          : tool,
-                      ),
-                    },
-                  },
+                body: jobBody(
+                  execution,
+                  assigned,
+                  capabilityRoots,
+                  portableInstructions,
                   operationId,
                   checkpoint,
-                }),
+                ),
               }),
             ),
           ),
@@ -982,6 +961,127 @@ export class HarnessContainer<
           operation: "startAttempt",
           cause: `Harness rejected start (${result.status})`,
         });
+    });
+  }
+  /** Whether a process inside the sandbox already listens on `port`. */
+  private listening(sandbox: ISandbox, port: number) {
+    return io("startAttempt.probe", async () => {
+      const probe = await sandbox.exec([
+        "bash",
+        "-c",
+        `exec 3<>/dev/tcp/127.0.0.1/${port} 2>/dev/null && echo up || echo down`,
+      ]);
+      return (await probe.output({ timeout: 10_000, encoding: "utf8" })).stdout.includes("up");
+    });
+  }
+  /**
+   * A running sandbox that provably holds the committed workspace continues as is,
+   * including state outside /workspace. Anything else starts from the last committed
+   * filesystem checkpoint: destroy, restore, and configure the fresh container. The
+   * deployment hook then runs once per fresh workspace; an inherited workspace was
+   * provisioned. Uploads made since the checkpoint are applied last.
+   */
+  private prepareWorkspace(
+    sandbox: LiveSandbox,
+    execution: Execution,
+    previousWorkspace: NonNullable<Checkpoint["workspace"]> | undefined,
+  ) {
+    return Effect.gen(this, function* () {
+      const previousCheckpoint = execution.checkpoint;
+      const workspaceId = previousWorkspace?.id ?? "";
+      const reused = yield* this.sandboxHolds(sandbox, execution.sessionId, workspaceId);
+      if (!reused) {
+        yield* write((tx) => tx.forgetSandbox());
+        yield* io("startAttempt", () => sandbox.destroy());
+        if (previousWorkspace)
+          yield* io("startAttempt", () => sandbox.restoreBackup(previousWorkspace));
+        else {
+          yield* io("startAttempt", () => sandbox.mkdir("/workspace", { recursive: true }));
+        }
+        const environmentSpec = this.environment.spec();
+        if (environmentSpec) yield* this.environment.configure(environmentSpec);
+        yield* this.rememberSandbox(sandbox, {
+          workspaceId,
+          provisioned: previousCheckpoint !== null || this.environment.inherited(),
+        });
+      }
+      if (!(yield* read((tx) => tx.sandbox()))?.provisioned) {
+        yield* io("startAttempt", () => this.prepareSandbox(sandbox, execution));
+        yield* this.rememberSandbox(sandbox, { workspaceId, provisioned: true });
+      }
+      yield* this.environment.applyUploads(previousCheckpoint?.environmentFileVersion ?? 0);
+    });
+  }
+  /** Codex runs its app server inside the sandbox; start it once per container. */
+  private ensureCodexServer(sandbox: ISandbox) {
+    return Effect.gen(this, function* () {
+      if (yield* this.listening(sandbox, 4500)) return;
+      const executor = yield* io("startAttempt", () =>
+        sandbox.exec(["codex", "exec-server", "--listen", "ws://0.0.0.0:4500"]),
+      );
+      yield* io("startAttempt", () => executor.waitForPort(4500));
+    });
+  }
+  /**
+   * Discover workspace capabilities and bridge the environment-origin MCP servers. Plugin-
+   * derived labels are sanitized and kept distinct from configured servers, so workspace
+   * content can add servers but never replace or break configured ones.
+   */
+  private attachCapabilities(
+    sandbox: ISandbox,
+    execution: Execution,
+    configured: McpToolConfig[],
+    capabilityRoots: string[],
+  ) {
+    return Effect.gen(this, function* () {
+      const discovered = yield* io("capabilities.discover", () =>
+        discoverCapabilities(sandbox, capabilityRoots, {
+          reservedLabels: configured.map((entry) => entry.server_label),
+          diagnostics: (line) =>
+            console.warn("Capability discovery skipped an entry", {
+              sessionId: execution.sessionId,
+              line,
+            }),
+        }),
+      );
+      const mcp = [...configured, ...discovered.mcp];
+      const environmentServers = mcp.filter(
+        (tool) => tool.transport.type === "stdio" || tool.connection_origin === "environment",
+      );
+      if (environmentServers.length && !(yield* this.listening(sandbox, 4501)))
+        yield* this.startEnvironmentBridge(sandbox, environmentServers);
+      return { instructions: discovered.instructions, mcp };
+    });
+  }
+  /** The in-sandbox bridge that serves stdio and environment-origin MCP servers over HTTP. */
+  private startEnvironmentBridge(sandbox: ISandbox, servers: McpToolConfig[]) {
+    return Effect.gen(function* () {
+      yield* io("mcp.bridge.config", () =>
+        sandbox.writeFile(
+          "/tmp/cf-environment-mcp.json",
+          JSON.stringify(
+            Object.fromEntries(servers.map((tool) => [tool.server_label, tool.transport])),
+          ),
+        ),
+      );
+      yield* io("mcp.bridge.script", () =>
+        sandbox.writeFile("/tmp/cf-environment-mcp.mjs", environmentMcpScript),
+      );
+      const bridge = yield* io("mcp.bridge.start", () =>
+        sandbox.exec(["node", "/tmp/cf-environment-mcp.mjs", "/tmp/cf-environment-mcp.json"]),
+      );
+      yield* io("mcp.bridge.ready", () => bridge.waitForPort(4501));
+    });
+  }
+  /** The native checkpoint document from R2, or nothing for a first turn. */
+  private loadCheckpoint(previousCheckpoint: Checkpoint | null) {
+    return Effect.gen(this, function* () {
+      if (!previousCheckpoint) return;
+      const object = yield* io("startAttempt", () =>
+        this.env.CHECKPOINTS.get(previousCheckpoint.native),
+      );
+      if (!object) return yield* new CheckpointMissing({ key: previousCheckpoint.native });
+      return yield* io("startAttempt", () => object.json());
     });
   }
   /**

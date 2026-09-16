@@ -65,10 +65,8 @@ function validPath(path: string): void {
     throw invalid("Skill file paths must be relative and cannot contain traversal");
 }
 
-/** Validate and normalize uploads before any durable write; never execute uploaded code. */
-export async function readSkillUpload(
-  form: FormData,
-): Promise<SkillMetadata & { bundle: Uint8Array<ArrayBuffer>; makeDefault: boolean }> {
+/** The upload form carries `files` (or `files[]`) and an optional boolean `default`. */
+function uploadForm(form: FormData): { uploads: File[]; makeDefault: boolean } {
   for (const key of form.keys())
     if (!["files", "files[]", "default"].includes(key))
       throw invalid(`Unknown upload field: ${key}`);
@@ -81,6 +79,12 @@ export async function readSkillUpload(
     throw invalid("default must be a boolean");
   if (uploads.reduce((sum, file) => sum + file.size, 0) > SKILL_UPLOAD_LIMIT)
     throw new SkillTooLarge({ limit: "upload" });
+  return { uploads, makeDefault: defaultValue === "true" };
+}
+/** One ZIP archive is unpacked; loose files are taken as named. Paths are validated either way. */
+async function uploadEntries(
+  uploads: File[],
+): Promise<{ entries: Record<string, Uint8Array>; executable: Set<string> }> {
   const entries = Object.create(null) as Record<string, Uint8Array>;
   const executable = new Set<string>();
   if (uploads.length === 1 && uploads[0]?.name.toLowerCase().endsWith(".zip")) {
@@ -90,13 +94,17 @@ export async function readSkillUpload(
       entries[path] = entry.bytes;
       if (entry.executable) executable.add(path);
     }
-  } else {
-    for (const file of uploads) {
-      validPath(file.name);
-      if (Object.hasOwn(entries, file.name)) throw invalid("Duplicate file paths");
-      entries[file.name] = new Uint8Array(await file.arrayBuffer());
-    }
+    return { entries, executable };
   }
+  for (const file of uploads) {
+    validPath(file.name);
+    if (Object.hasOwn(entries, file.name)) throw invalid("Duplicate file paths");
+    entries[file.name] = new Uint8Array(await file.arrayBuffer());
+  }
+  return { entries, executable };
+}
+/** The one SKILL.md, at the root or in one directory, names the skill root. */
+function skillRoot(entries: Record<string, Uint8Array>): string {
   for (const path of Object.keys(entries)) {
     const parts = path.split("/");
     for (let count = 1; count < parts.length; count++)
@@ -110,7 +118,13 @@ export async function readSkillUpload(
     throw invalid("Expected one SKILL.md at the root or in one skill directory");
   const manifest = manifests[0];
   if (!manifest) throw invalid("Missing SKILL.md");
-  const root = manifest.slice(0, -"SKILL.md".length);
+  return manifest.slice(0, -"SKILL.md".length);
+}
+/** Every file re-keyed relative to the skill root, within the expanded budget. */
+function relativeToRoot(
+  entries: Record<string, Uint8Array>,
+  root: string,
+): Record<string, Uint8Array> {
   const normalized = Object.create(null) as Record<string, Uint8Array>;
   let total = 0;
   for (const [path, bytes] of Object.entries(entries)) {
@@ -121,20 +135,32 @@ export async function readSkillUpload(
     if (total > expandedLimit) throw new SkillTooLarge({ limit: "expanded" });
     normalized[relative] = bytes;
   }
-  const content = normalized["SKILL.md"];
+  return normalized;
+}
+/** Name and description from the SKILL.md YAML frontmatter; nothing else is read. */
+function skillMetadata(content: Uint8Array | undefined): SkillMetadata {
   if (!content || content.length > 128_000) throw invalid("SKILL.md must be at most 128 KB");
-  let metadata: SkillMetadata;
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(content);
     const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)?.[1];
     if (!frontmatter) throw invalid("SKILL.md requires YAML name and description frontmatter");
     const document = parseDocument(frontmatter, { uniqueKeys: true });
     if (document.errors.length) throw invalid("Invalid SKILL.md frontmatter");
-    metadata = metadataSchema.parse(document.toJS({ maxAliasCount: 0 }));
+    return metadataSchema.parse(document.toJS({ maxAliasCount: 0 }));
   } catch (error) {
     if (error instanceof SkillInvalid) throw error;
     throw invalid("SKILL.md requires valid UTF-8 and string name/description fields");
   }
+}
+/** Validate and normalize uploads before any durable write; never execute uploaded code. */
+export async function readSkillUpload(
+  form: FormData,
+): Promise<SkillMetadata & { bundle: Uint8Array<ArrayBuffer>; makeDefault: boolean }> {
+  const { uploads, makeDefault } = uploadForm(form);
+  const { entries, executable } = await uploadEntries(uploads);
+  const root = skillRoot(entries);
+  const normalized = relativeToRoot(entries, root);
+  const metadata = skillMetadata(normalized["SKILL.md"]);
   // Repack as regular files: archive symlink/device attributes never reach the Sandbox.
   const bundle = zipSync(
     Object.fromEntries(
@@ -153,9 +179,15 @@ export async function readSkillUpload(
     ),
     { level: 0, mtime: new Date("1980-01-01T00:00:00Z") },
   );
-  return { ...metadata, bundle, makeDefault: defaultValue === "true" };
+  return { ...metadata, bundle, makeDefault };
 }
 
+/** `default` (or nothing) and `latest` are aliases; anything else is a version number. */
+function versionNumber(skill: Skill, selector: string | null | undefined): string {
+  if (!selector || selector === "default") return skill.default_version;
+  if (selector === "latest") return skill.latest_version;
+  return selector;
+}
 /** Tenant-local metadata; immutable bundles live in R2 and sessions pin their keys. */
 export class SkillRepository {
   constructor(private readonly db: SqlStore) {}
@@ -187,13 +219,7 @@ export class SkillRepository {
   }
   version(skillId: string, selector?: string | null): StoredSkillVersion {
     const skill = this.retrieve(skillId);
-    const number =
-      !selector || selector === "default"
-        ? skill.default_version
-        : selector === "latest"
-          ? skill.latest_version
-          : selector;
-    const id = this.db.require(Kinds.skillVersionNumber(skillId), number);
+    const id = this.db.require(Kinds.skillVersionNumber(skillId), versionNumber(skill, selector));
     return this.db.require(Kinds.skillVersion(skillId), id);
   }
   versions(skillId: string, query: PageQuery) {

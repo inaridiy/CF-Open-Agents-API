@@ -48,20 +48,21 @@ export interface AIModelOptions {
   providerOptions?: ProviderOptions | ((settings: ModelSettings) => ProviderOptions | undefined);
 }
 /** The AI SDK's provider-neutral reasoning levels stop at `xhigh`; `max` rounds down. */
-const standardReasoning = (
+function standardReasoning(
   effort: ReasoningEffort | undefined,
-): Parameters<typeof streamText>[0]["reasoning"] =>
-  effort === undefined ? undefined : effort === "max" ? "xhigh" : effort;
-const structuredOutput = (schema: OutputSchema | undefined) =>
-  schema === undefined
-    ? undefined
-    : schema.schema
-      ? Output.object({
-          schema: jsonSchema(schema.schema),
-          ...(schema.name ? { name: schema.name } : {}),
-          ...(schema.description ? { description: schema.description } : {}),
-        })
-      : Output.json(schema.name ? { name: schema.name } : {});
+): Parameters<typeof streamText>[0]["reasoning"] {
+  if (effort === undefined) return;
+  return effort === "max" ? "xhigh" : effort;
+}
+function structuredOutput(schema: OutputSchema | undefined) {
+  if (schema === undefined) return;
+  if (!schema.schema) return Output.json(schema.name ? { name: schema.name } : {});
+  return Output.object({
+    schema: jsonSchema(schema.schema),
+    ...(schema.name ? { name: schema.name } : {}),
+    ...(schema.description ? { description: schema.description } : {}),
+  });
+}
 const settingsOf = (input: ModelInput): ModelSettings => ({
   ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
   ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
