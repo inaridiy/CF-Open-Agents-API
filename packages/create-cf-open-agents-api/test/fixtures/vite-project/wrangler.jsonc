@@ -1,0 +1,13 @@
+{
+  // The app's own Worker; the agents API is added next to it.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "my-app",
+  "main": "./src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./dist/client" },
+  "vars": { "GREETING": "hi" },
+  "durable_objects": { "bindings": [{ "name": "COUNTER", "class_name": "Counter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+  "env": { "staging": { "vars": { "GREETING": "staging" } } }
+}

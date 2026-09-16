@@ -23,5 +23,11 @@
     ]
   },
   "include": ["packages/**/*.ts", "examples/**/*.ts", "tests/**/*.ts", "*.config.ts"],
-  "exclude": ["**/dist", "node_modules", "examples/worker/env.d.ts", "examples/caller/env.d.ts"]
+  "exclude": [
+    "**/dist",
+    "node_modules",
+    "examples/worker/env.d.ts",
+    "examples/caller/env.d.ts",
+    "packages/create-cf-open-agents-api/test/fixtures"
+  ]
 }

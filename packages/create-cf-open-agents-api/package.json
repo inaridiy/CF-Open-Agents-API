@@ -1,0 +1,55 @@
+{
+  "name": "create-cf-open-agents-api",
+  "version": "0.2.0",
+  "description": "Add the CF-Open-Agents-API to an existing Cloudflare Workers project or create a new one: bindings, composition, Docker image snapshot, dev vars, buckets and secrets",
+  "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
+  "bugs": {
+    "url": "https://github.com/inaridiy/CF-Open-Agents-API/issues"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inaridiy/CF-Open-Agents-API.git",
+    "directory": "packages/create-cf-open-agents-api"
+  },
+  "bin": {
+    "create-cf-open-agents-api": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "tag": "alpha"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "node ../../scripts/prepare-package.mjs"
+  },
+  "dependencies": {
+    "@clack/prompts": "1.8.1",
+    "gunshi": "0.37.2",
+    "jsonc-parser": "3.3.1"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "4.0.53",
+    "@ai-sdk/openai": "4.0.65",
+    "@ai-sdk/provider": "4.0.13",
+    "ai": "7.0.97",
+    "workers-ai-provider": "4.0.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

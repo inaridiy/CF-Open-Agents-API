@@ -33,7 +33,7 @@ export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO,
       workers: { harness: "codex", model: "workers" },
     },
     // Each entry is a factory: a preset is built only when a session selects it, so a
-    // deployment without an OpenAI key can still serve the Workers AI preset.
+    // deployment without one provider's credentials can still serve the other presets.
     models: (env) => ({
       codex: () =>
         nativeModel({

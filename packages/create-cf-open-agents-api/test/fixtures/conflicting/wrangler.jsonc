@@ -1,0 +1,7 @@
+{
+  "name": "conflicting",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "SESSIONS", "class_name": "Other" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Other"] }]
+}

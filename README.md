@@ -64,27 +64,37 @@ One Worker exports every class. Each session has its own SessionDO, HarnessDO an
 
 What you pay for in production: Container run time (a harness container on the `basic` instance type and a sandbox container on `standard-1`, both idle-stopped after 10 minutes), R2 storage for checkpoints and workspace backups (backups expire after 30 days), Durable Object requests and storage, and whatever your model provider bills. The example keeps a session's sandbox alive between turns, so a chatty session pays for one container pair, not one per turn. Nothing in this repository sets a spending limit for you; see [deployment](docs/deployment.md) for the cost model and scaling knobs.
 
-## First run without a paid model key
+## Add it to your Worker
 
-The `workers` preset runs Codex against Workers AI. Workers AI has no local emulator: `wrangler dev` sends `AI` binding calls to your account, so you must be logged in (`wrangler login`) and the calls count against your Workers AI usage.
+The setup CLI, [`create-cf-open-agents-api`](packages/create-cf-open-agents-api/README.md), adds the API to a Workers project you already have (a Vite + `@cloudflare/vite-plugin` app, a Hono Worker, anything Wrangler deploys) or creates a new Worker for it. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition from your provider and runtime choices, snapshots the Docker build context into `.cf-open-agents-api/`, and creates `.dev.vars` with a random token. Run it in the project directory:
+
+```sh
+pnpm dlx create-cf-open-agents-api@alpha init   # asks about provider, runtimes and tool calling; --yes takes the defaults
+pnpm install
+pnpm exec wrangler login                        # the AI binding and deployments need your account
+pnpm dev                                        # Docker must be running; the first image build takes several minutes
+```
+
+Your Worker then forwards `/v1/*` to its own `AGENTS` binding (`app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw))`) or calls the typed RPC methods on it. `create-cf-open-agents-api setup` creates the R2 buckets and puts the production secrets, `doctor` checks the toolchain and the configuration. Until the packages reach npm, the CLI README explains how to point it at a checkout and packed tarballs.
+
+## First run from this repository
+
+The `workers` preset runs Codex against Workers AI. Workers AI has no local emulator: `wrangler dev` sends `AI` binding calls to your account, so you must be logged in (`wrangler login`) and the calls count against your Workers AI usage. `examples/worker` is the Worker this repository deploys and the template the CLI generates; `examples/caller` is a Worker that consumes it.
 
 ```sh
 git clone https://github.com/inaridiy/CF-Open-Agents-API.git
 cd CF-Open-Agents-API
 pnpm install --frozen-lockfile
-pnpm build
-cp examples/worker/.dev.vars.example examples/worker/.dev.vars
-cp examples/caller/.dev.vars.example examples/caller/.dev.vars
-# Put the same unpredictable API_TOKEN (at least 32 characters) in both files.
+pnpm bootstrap        # writes examples/worker/.dev.vars and examples/caller/.dev.vars with one random API_TOKEN
 # Leave OPENAI_API_KEY empty if you have no OpenAI key: presets are built only
 # when a session selects them, and the `workers` preset never calls OpenAI.
-pnpm dev:caller
+pnpm dev:caller       # builds the library first, then both Docker images
 ```
 
 Wrangler builds both Docker images, starts the Agent Worker and starts the caller on `http://localhost:8788`. Then:
 
 ```sh
-export AGENT_API_TOKEN=... # the API_TOKEN from .dev.vars
+export AGENT_API_TOKEN=... # the API_TOKEN from examples/worker/.dev.vars
 curl http://localhost:8788/sdk/sessions \
   -H "Authorization: Bearer $AGENT_API_TOKEN" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: first-report' \
@@ -123,14 +133,15 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 
 `agents.internal` is a routing label; the request never leaves the Service Binding. `openai_hosted` is the SDK's wire name and selects a Cloudflare sandbox here. `coding` is a preset your deployment defines; clients pick presets and never see provider URLs or keys.
 
-| Connection                                      | Start here                                               |
-| ----------------------------------------------- | -------------------------------------------------------- |
-| Another Worker, Service Binding, OpenAI client  | [Service Binding guide](docs/service-binding.md)         |
-| Another Worker, typed RPC without HTTP          | [RPC guide](docs/rpc.md)                                 |
-| Node, Python or anything else over HTTPS        | [HTTP guide](docs/http-api.md)                           |
-| Embedding the library in your own Worker        | [Library API](docs/library-api.md)                       |
-| Files, skills, templates, MCP, subagents, forks | [Environments and tools](docs/environments-and-tools.md) |
-| Presets, model adapters, custom drivers         | [Extending](docs/extending.md)                           |
+| Connection                                      | Start here                                                                |
+| ----------------------------------------------- | ------------------------------------------------------------------------- |
+| Another Worker, Service Binding, OpenAI client  | [Service Binding guide](docs/service-binding.md)                          |
+| Another Worker, typed RPC without HTTP          | [RPC guide](docs/rpc.md)                                                  |
+| Node, Python or anything else over HTTPS        | [HTTP guide](docs/http-api.md)                                            |
+| Adding the API to your Worker with the CLI      | [create-cf-open-agents-api](packages/create-cf-open-agents-api/README.md) |
+| Embedding the library in your own Worker        | [Library API](docs/library-api.md)                                        |
+| Files, skills, templates, MCP, subagents, forks | [Environments and tools](docs/environments-and-tools.md)                  |
+| Presets, model adapters, custom drivers         | [Extending](docs/extending.md)                                            |
 
 ## How a turn works
 
@@ -150,16 +161,18 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 
 ## Develop
 
-`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `examples/worker` the deployable composition and `examples/caller` a consuming Worker. Local suites use scripted models and need no provider credentials.
+`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `packages/create-cf-open-agents-api` the setup CLI, `examples/worker` the deployable composition (and the CLI's standalone template) and `examples/caller` a consuming Worker. Local suites use scripted models and need no provider credentials.
 
 | Command                   | Purpose                                                                 |
 | ------------------------- | ----------------------------------------------------------------------- |
+| `pnpm bootstrap`          | Write both example `.dev.vars` files with one random API token          |
 | `pnpm dev:caller`         | Run the caller and its Agent Worker together (caller on localhost:8788) |
 | `pnpm dev`                | Run the Agent Worker alone on localhost:8787                            |
 | `pnpm check`              | Docs, harness, scripts, types, lint, Worker tests and build             |
 | `pnpm check:docs`         | Documented commands, exports, bindings and image pins agree             |
 | `pnpm check:harness`      | Documentation links, agent entrypoints and skill provenance             |
 | `pnpm test:scripts`       | Unit tests of the development scripts                                   |
+| `pnpm test:cli`           | The setup CLI against fixture projects, rendered compositions typecheck |
 | `pnpm typecheck`          | TypeScript with Effect language-service diagnostics                     |
 | `pnpm lint`               | Type-aware oxlint and oxfmt checks through ultracite                    |
 | `pnpm format`             | Fix lint findings and formatting                                        |

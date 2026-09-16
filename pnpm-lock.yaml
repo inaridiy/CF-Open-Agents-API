@@ -94,7 +94,7 @@ importers:
         version: 3.22.2
       workers-ai-provider:
         specifier: 4.0.0
-        version: 4.0.0(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2))
+        version: 4.0.0(@ai-sdk/anthropic@4.0.53(zod@4.6.2))(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2))
       zod:
         specifier: 4.6.2
         version: 4.6.2
@@ -136,6 +136,34 @@ importers:
         specifier: 7.15.0
         version: 7.15.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.2)
 
+  packages/create-cf-open-agents-api:
+    dependencies:
+      '@clack/prompts':
+        specifier: 1.8.1
+        version: 1.8.1
+      gunshi:
+        specifier: 0.37.2
+        version: 0.37.2
+      jsonc-parser:
+        specifier: 3.3.1
+        version: 3.3.1
+    devDependencies:
+      '@ai-sdk/anthropic':
+        specifier: 4.0.53
+        version: 4.0.53(zod@4.6.2)
+      '@ai-sdk/openai':
+        specifier: 4.0.65
+        version: 4.0.65(zod@4.6.2)
+      '@ai-sdk/provider':
+        specifier: 4.0.13
+        version: 4.0.13
+      ai:
+        specifier: 7.0.97
+        version: 7.0.97(zod@4.6.2)
+      workers-ai-provider:
+        specifier: 4.0.0
+        version: 4.0.0(@ai-sdk/anthropic@4.0.53(zod@4.6.2))(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2))
+
   packages/supervisor:
     dependencies:
       '@anthropic-ai/claude-agent-sdk':
@@ -168,6 +196,12 @@ importers:
 
 packages:
 
+  '@ai-sdk/anthropic@4.0.53':
+    resolution: {integrity: sha512-JMxAuCFte6mFOvoaUcig3Dp2LObin0wU2Li8ncsveh7hHKW7cG3g1bFjooxn1paxeT8UUf5XMSjhxtXG9wFLig==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
   '@ai-sdk/gateway@4.0.78':
     resolution: {integrity: sha512-fcamzmFlcy+c/tIc7QcATLe/kArgSVGQ1QxaddMjhOSX8zypc2hmD5sHB2bp1DSFcSxDD32d6usF9a7xLCTULg==}
     engines: {node: '>=22'}
@@ -192,8 +226,18 @@ packages:
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
 
+  '@ai-sdk/provider-utils@5.0.40':
+    resolution: {integrity: sha512-zsXPwSAQ9mRJ2hvyITaLOYUyuGrBmzFhJXOg4mllGmla1PfNxZcm4GwqMiV2xQaDgcgBMdUGxXkp9xekZZNIkg==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
   '@ai-sdk/provider@4.0.13':
     resolution: {integrity: sha512-sJvnbFIFLzmKFXIjfwS8XCOAj6puHCawItwvA9PBZgk2f/l/TiC4OSfK3ueDbUVXfRCOn5eJN97EIF10toIOmQ==}
+    engines: {node: '>=22'}
+
+  '@ai-sdk/provider@4.0.14':
+    resolution: {integrity: sha512-yukP2tbcQQErG5gLCMBGvpvb/rM3D3KlTKG6eKKOdNHLHqtNNDEeBxdYrY/JL+O76B2ig5dXY19H/f1HFSvRiQ==}
     engines: {node: '>=22'}
 
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.268':
@@ -1816,6 +1860,10 @@ packages:
     resolution: {integrity: sha512-ZUKRh6/kUFoAiTAtTYPZJ3hw9wNxx+BIBOijnlG9PnrJsCcSjs1wyyD6vJpaYtgnzDrKYRSqf3OO6Rfa93xsRg==}
     engines: {node: '>= 0.4'}
 
+  gunshi@0.37.2:
+    resolution: {integrity: sha512-pHsYEDSOxaNxSGIYiIYF11Lvc6OiEKw+IkfrLXRWj6bKzqI3noLX8QXOLqGTwPsM8amkpNoZG9tlpg8/4QG7MQ==}
+    engines: {node: '>= 22'}
+
   has-symbols@1.1.0:
     resolution: {integrity: sha512-1cDNdwJ2Jaohmb3sg4OmKaMBwuC48sYni5HUw2DvsC8LjGTLK9h+eb1X6RyuOHe4hT0ULCW68iomhjUoKUqlPQ==}
     engines: {node: '>= 0.4'}
@@ -2691,6 +2739,12 @@ packages:
 
 snapshots:
 
+  '@ai-sdk/anthropic@4.0.53(zod@4.6.2)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.14
+      '@ai-sdk/provider-utils': 5.0.40(zod@4.6.2)
+      zod: 4.6.2
+
   '@ai-sdk/gateway@4.0.78(zod@4.6.2)':
     dependencies:
       '@ai-sdk/provider': 4.0.13
@@ -2719,7 +2773,20 @@ snapshots:
       undici: 7.29.1
       zod: 4.6.2
 
+  '@ai-sdk/provider-utils@5.0.40(zod@4.6.2)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.14
+      '@standard-schema/spec': 1.1.0
+      '@workflow/serde': 4.1.0
+      eventsource-parser: 3.1.1
+      undici: 7.29.1
+      zod: 4.6.2
+
   '@ai-sdk/provider@4.0.13':
+    dependencies:
+      json-schema: 0.4.0
+
+  '@ai-sdk/provider@4.0.14':
     dependencies:
       json-schema: 0.4.0
 
@@ -3909,6 +3976,8 @@ snapshots:
 
   gopd@1.2.0: {}
 
+  gunshi@0.37.2: {}
+
   has-symbols@1.1.0: {}
 
   hasown@2.0.4:
@@ -4687,11 +4756,12 @@ snapshots:
       '@cloudflare/workerd-linux-arm64': 1.20260911.1
       '@cloudflare/workerd-windows-64': 1.20260911.1
 
-  workers-ai-provider@4.0.0(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2)):
+  workers-ai-provider@4.0.0(@ai-sdk/anthropic@4.0.53(zod@4.6.2))(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2)):
     dependencies:
       '@ai-sdk/provider': 4.0.13
       ai: 7.0.97(zod@4.6.2)
     optionalDependencies:
+      '@ai-sdk/anthropic': 4.0.53(zod@4.6.2)
       '@ai-sdk/openai': 4.0.65(zod@4.6.2)
 
   wrangler@4.124.0(@cloudflare/workers-types@5.20260911.1):

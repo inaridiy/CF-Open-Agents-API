@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,14 @@ const library =
       await readFile(new URL("../packages/agent-api/package.json", import.meta.url), "utf8"),
     )
   );
+const cli = /** @type {{ name: string, version: string }} */ (
+  JSON.parse(
+    await readFile(
+      new URL("../packages/create-cf-open-agents-api/package.json", import.meta.url),
+      "utf8",
+    ),
+  )
+);
 /**
  * @param {string} command
  * @param {readonly string[]} args
@@ -44,6 +52,16 @@ try {
     assert(!/from "ai"/.test(source), `${file} must not import the optional ai peer`);
   }
   assert.equal(library.peerDependencies.effect, "^3.22.2");
+  // The setup CLI ships on its own: an executable, no dependency on the library.
+  run("pnpm", ["--filter", cli.name, "pack", "--pack-destination", directory], root);
+  const cliTarball = join(directory, `${cli.name}-${cli.version}.tgz`);
+  const cliEntries = execFileSync("tar", ["-tzf", cliTarball], { encoding: "utf8" }).split("\n");
+  for (const file of ["LICENSE", "NOTICE", "README.md", "dist/cli.js", "dist/index.js"])
+    assert(cliEntries.includes(`package/${file}`), `Missing packaged CLI ${file}`);
+  assert(
+    !cliEntries.some((entry) => entry.startsWith("package/test/")),
+    "CLI tests leaked into the package",
+  );
   await writeFile(
     join(directory, "package.json"),
     JSON.stringify({
@@ -57,6 +75,7 @@ try {
         openai: manifest.devDependencies.openai,
         "@cloudflare/workers-types": manifest.devDependencies["@cloudflare/workers-types"],
       },
+      devDependencies: { [cli.name]: `file:${cliTarball}` },
     }),
   );
   await writeFile(
@@ -130,7 +149,27 @@ assert.equal(webSearch(async () => []).spec.name, "web_search");
 `,
   );
   run(process.execPath, ["runtime.mjs"], directory);
-  console.log("Packed entrypoints, license files and a consumer-owned Effect driver passed.");
+  // The packed CLI runs from node_modules and plans a retrofit of a fixture project.
+  const fixture = join(directory, "fixture");
+  await cp(
+    new URL("../packages/create-cf-open-agents-api/test/fixtures/vite-project", import.meta.url),
+    fixture,
+    { recursive: true },
+  );
+  const planned = execFileSync(
+    "pnpm",
+    ["exec", cli.name, "init", "--yes", "--dry-run", "--source", root, fixture],
+    {
+      cwd: directory,
+      encoding: "utf8",
+      env: { ...process.env, CF_OPEN_AGENTS_API_SKIP_VENDOR: "1" },
+    },
+  );
+  assert.match(planned, /Dry run: nothing was written/);
+  assert.match(planned, /src\/agents\.ts/);
+  console.log(
+    "Packed entrypoints, license files, a consumer-owned Effect driver and the packed CLI passed.",
+  );
 } finally {
   await rm(directory, { recursive: true, force: true });
 }
