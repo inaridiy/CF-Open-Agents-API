@@ -7,6 +7,7 @@ import type {
 } from "../../packages/agent-api/src/persistence/session-record.js";
 import type { SessionRepo } from "../../packages/agent-api/src/persistence/session-repo.js";
 import type { Checkpoint, RuntimeBatch } from "../../packages/agent-api/src/runtime.js";
+import type { AgentBindings } from "../../packages/agent-api/src/service.js";
 import {
   acceptBatch,
   commitCheckpoint,
@@ -17,6 +18,7 @@ import {
 } from "../../packages/agent-api/src/session-state.js";
 import type { SessionRecord } from "../../packages/agent-api/src/session.js";
 import type { SqlStore } from "../../packages/agent-api/src/storage.js";
+import { defineAgentWorker } from "../../packages/agent-api/src/worker.js";
 
 /** Compile-time regressions for the synchronous persistence boundary and state machine. */
 export function stateContracts(db: SqlStore, repo: SessionRepo, record: SessionRecord) {
@@ -76,4 +78,14 @@ export function fenceContracts(
       return acceptBatch(tx, fenced, batch, tx.cancellation(cancel.turnId));
     }),
   ] as const;
+}
+
+/** Without Container bindings the composition must name its drivers. */
+export function compositionContracts() {
+  // @ts-expect-error harnesses is required when Env lacks the Container bindings.
+  return defineAgentWorker<AgentBindings & { API_TOKEN: string }>({
+    agents: {},
+    models: () => ({}),
+    authenticate: async () => null,
+  });
 }

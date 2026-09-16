@@ -9,6 +9,11 @@
       "binding": "AGENTS",
       "service": "cf-open-agents-api-test",
       "entrypoint": "BindingAgentWorker"
+    },
+    {
+      "binding": "MODEL_GATEWAY",
+      "service": "cf-open-agents-api-test",
+      "entrypoint": "Models"
     }
   ],
   "vars": { "API_TOKEN": "scripted-binding-test-token-not-for-production" },

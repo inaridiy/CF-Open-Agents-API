@@ -967,13 +967,24 @@ function errorType(status: number): string {
   return "invalid_request_error";
 }
 
+let warnedAboutToken = false;
 /** Static single-tenant example auth. Production can inject Access/JWT verification. */
 export async function bearerTenant(
   request: Request,
   token: string | undefined,
   tenant: string,
 ): Promise<string | null> {
-  if (!token || token.length < 32) return null;
+  if (!token || token.length < 32) {
+    // Fail closed, but say why once per isolate: a missing or short API_TOKEN otherwise
+    // looks like a client problem in every response.
+    if (!warnedAboutToken) {
+      warnedAboutToken = true;
+      console.error(
+        "bearerTenant: API_TOKEN is missing or shorter than 32 characters, so every request is rejected with 401. Set a random token of at least 32 characters (create-cf-open-agents-api init generates one).",
+      );
+    }
+    return null;
+  }
   const supplied = request.headers.get("authorization") ?? "";
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(

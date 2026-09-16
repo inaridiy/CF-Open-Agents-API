@@ -34,6 +34,15 @@ try {
     "Development files leaked into the package",
   );
   assert(!library.dependencies.effect, "Effect must be supplied by the consumer");
+  // The Cloudflare entrypoint composes the model gateway without the optional `ai` peer.
+  for (const file of [
+    "package/dist/cloudflare.js",
+    "package/dist/worker.js",
+    "package/dist/models/gateway.js",
+  ]) {
+    const source = execFileSync("tar", ["-xzOf", tarball, file], { encoding: "utf8" });
+    assert(!/from "ai"/.test(source), `${file} must not import the optional ai peer`);
+  }
   assert.equal(library.peerDependencies.effect, "^3.22.2");
   await writeFile(
     join(directory, "package.json"),
@@ -60,7 +69,7 @@ try {
     `
 import { Effect, Schema } from "effect";
 import { type RuntimeDriver, runPromise } from "cf-open-agents-api";
-import { type AgentRPC, createAgentService } from "cf-open-agents-api/cloudflare";
+import { type AgentRPC, createAgentService, defineAgentWorker } from "cf-open-agents-api/cloudflare";
 import { modelAdapter } from "cf-open-agents-api/models";
 import { defineTool } from "cf-open-agents-api/tools";
 const driver: RuntimeDriver = {
@@ -70,6 +79,7 @@ const driver: RuntimeDriver = {
   checkpoint: () => Effect.succeed({ version: 1, driver: "consumer", revision: "1", native: "test" }),
 };
 void createAgentService;
+void defineAgentWorker;
 declare const rpc: AgentRPC;
 void rpc.listSessions("tenant");
 void rpc.listItems("tenant", "sess_example", { limit: 1 });

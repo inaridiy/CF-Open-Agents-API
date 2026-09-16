@@ -21,3 +21,10 @@ export {
   createAgentService,
 } from "./service.js";
 export { SessionObject } from "./session.js";
+export {
+  type AgentWorkerClasses,
+  type AgentWorkerOptions,
+  type ContainerAgentWorkerOptions,
+  type CustomAgentWorkerOptions,
+  defineAgentWorker,
+} from "./worker.js";
