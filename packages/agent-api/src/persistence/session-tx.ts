@@ -6,6 +6,7 @@ import { SessionKinds } from "./session-kinds.js";
 import {
   type ActiveSession,
   type Command,
+  type Fenced,
   migrate,
   type SessionRecord,
   validate,
@@ -23,7 +24,12 @@ export interface SessionTx {
   session(): SessionRecord | undefined;
   /** Throws `SessionNotFound` for a missing or deleted session, `InvalidSessionState` for a corrupt one. */
   requireSession(): SessionRecord;
-  /** Validates the phase/execution invariant before writing. */
+  /**
+   * Validates the phase/execution invariant before writing. The caller vouches that the
+   * record is current: either it was read by `requireSession` in this same synchronous
+   * transaction (input, environment status, deletion, a fresh turn) or it derives from a
+   * `Fenced` record. A record carried across I/O must go through `fenced` first.
+   */
   save(record: SessionRecord): void;
   emit(event: AgentSessionEvent): void;
   turn(id: string): Turn | undefined;
@@ -33,9 +39,16 @@ export interface SessionTx {
   /** Queued deliveries in acceptance order, at most `limit`. */
   commands(limit: number): Command[];
   cancellation(turnId: string): Command | undefined;
-  /** Throws `Superseded` when `(generation, turnId)` no longer match the durable record. */
-  fenced(execution: Execution): ActiveSession;
+  /**
+   * Throws `Superseded` when `(generation, turnId)` no longer match the durable record.
+   * The only source of a `Fenced` record: the state transitions that overwrite an active
+   * record take one, so a transition on a stale read does not compile.
+   */
+  fenced(execution: Execution): Fenced<ActiveSession>;
 }
+
+/** The one place the brand is applied; the record was re-read and matched in this transaction. */
+const certify = (record: ActiveSession): Fenced<ActiveSession> => record as Fenced<ActiveSession>;
 
 export const makeSessionTx = (store: RecordStore): SessionTx => {
   const session = (): SessionRecord | undefined => {
@@ -75,7 +88,7 @@ export const makeSessionTx = (store: RecordStore): SessionTx => {
         record.execution.turnId !== execution.turnId
       )
         throw new Superseded({ turnId: execution.turnId, generation: execution.generation });
-      return record as ActiveSession;
+      return certify(record as ActiveSession);
     },
   };
 };

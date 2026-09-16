@@ -50,6 +50,7 @@ export function settle<A, E>(exit: Exit.Exit<A, E>): A {
 }
 /** Preserve API errors across Workers RPC instead of exporting FiberFailure wrappers. */
 export async function runPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
+  // lint: entrypoint
   return settle(await Effect.runPromiseExit(effect));
 }
 
@@ -58,6 +59,7 @@ export async function runPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A> 
  * running as a leaked fiber; it is stopped and reported as a defect of `operation`.
  */
 export function runSync<A, E>(effect: Effect.Effect<A, E>, operation = "runSync"): A {
+  // lint: entrypoint
   const exit = Effect.runSyncExit(effect);
   if (Exit.isSuccess(exit)) return exit.value;
   const error = Cause.squash(exit.cause);
@@ -74,4 +76,5 @@ export const decodeEffect = <A, I>(schema: Schema.Schema<A, I>, input: unknown) 
     Effect.mapError((error) => new InvalidRequest({ issues: error.message })),
   );
 export const decode = <A, I>(schema: Schema.Schema<A, I>, input: unknown): A =>
+  // lint: entrypoint
   runSync(decodeEffect(schema, input), "decode");

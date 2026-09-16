@@ -45,6 +45,7 @@ export function defineTool<Input, Output, E, EncodedInput, EncodedOutput>(
     ...definition,
     effect,
     call: (input: unknown, context: ToolContext): Promise<Output> =>
+      // lint: entrypoint
       runPromise(effect(input, context)),
     spec: {
       type: "function" as const,

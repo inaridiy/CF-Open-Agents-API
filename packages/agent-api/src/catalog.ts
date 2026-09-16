@@ -106,6 +106,7 @@ export class CatalogObject extends DurableObject {
   }
   private readonly vaultStore = new VaultRepository(this.db);
   mcpToken(vaultIds: string[], url: string, credentialId?: string | null) {
+    // lint: entrypoint
     return runPromise(this.vaultStore.token(vaultIds, url, credentialId));
   }
   createVault(...args: Parameters<VaultRepository["create"]>) {
@@ -185,6 +186,7 @@ export class CatalogObject extends DurableObject {
     return this.db.require(CatalogKinds.environment, id);
   }
   reservation(key: string, fingerprint: string): string {
+    // lint: entrypoint
     return runSync(
       encodeRpc(
         ReservationResult,
@@ -199,6 +201,7 @@ export class CatalogObject extends DurableObject {
     );
   }
   reserve(key: string, fingerprint: string, record: SessionRecord): string {
+    // lint: entrypoint
     return runSync(
       encodeRpc(
         ReserveResult,

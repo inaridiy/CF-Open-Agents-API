@@ -1,5 +1,5 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
-import { Effect, Layer, Option, TestClock, TestContext } from "effect";
+import { Effect, Exit, Layer, Option, TestClock, TestContext } from "effect";
 import { expect, it } from "vitest";
 
 import type { StorageFailure } from "../../packages/agent-api/src/errors.js";
@@ -13,7 +13,12 @@ import type { PromiseRuntimeDriver, RuntimeBatch } from "../../packages/agent-ap
 import { fromPromiseDriver } from "../../packages/agent-api/src/runtime.js";
 import { reconcileTick } from "../../packages/agent-api/src/session-reconcile.js";
 import { Alarm, Drivers, Repo } from "../../packages/agent-api/src/session-services.js";
-import { addInput, begin, enqueue } from "../../packages/agent-api/src/session-state.js";
+import {
+  acceptBatch,
+  addInput,
+  begin,
+  enqueue,
+} from "../../packages/agent-api/src/session-state.js";
 
 /**
  * Reconciler policy without a Durable Object: the three services are substituted, the
@@ -160,6 +165,7 @@ it("one tick starts, polls, commits the checkpoint and re-arms the alarm first",
 
 it("a fence that no longer holds ends the tick silently after the I/O it was waiting on", async () => {
   const { store, tx } = starting();
+  const stale = tx.requireSession().execution as NonNullable<SessionRecord["execution"]>;
   const driver = fixture({
     poll: async () => {
       // Another writer moved the record on while the poll was in flight.
@@ -175,6 +181,27 @@ it("a fence that no longer holds ends the tick silently after the I/O it was wai
   });
   const { run } = harness(store, { fixture: driver });
   await run(reconcileTick());
+  expect(summary(store)).toMatchObject({ phase: "idle", turns: ["in_progress"], checkpoint: null });
+  // The stale execution, applied through the seam the tick uses, is `Superseded` before
+  // any transition can run, and the transaction it was in leaves nothing behind.
+  const events = store.lastEvent();
+  const exit = await Effect.runPromiseExit(
+    makeSessionRepo(store, store).transaction((view) => {
+      view.emit({ type: "agent.session.idle", event_id: "evt_stale", session });
+      return acceptBatch(
+        view,
+        view.fenced(stale),
+        completed("stale"),
+        view.cancellation(stale.turnId),
+      );
+    }),
+  );
+  expect(Exit.isFailure(exit)).toBe(true);
+  if (Exit.isFailure(exit))
+    expect(exit.cause).toMatchObject({
+      error: { _tag: "Superseded", turnId: stale.turnId, generation: stale.generation },
+    });
+  expect(store.lastEvent()).toBe(events);
   expect(summary(store)).toMatchObject({ phase: "idle", turns: ["in_progress"], checkpoint: null });
 });
 

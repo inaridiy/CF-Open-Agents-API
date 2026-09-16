@@ -67,7 +67,12 @@ import {
 } from "./session-state.js";
 import { SqlStore } from "./storage.js";
 
-export type { ActiveSession, ArtifactRecord, SessionRecord } from "./persistence/session-record.js";
+export type {
+  ActiveSession,
+  ArtifactRecord,
+  Fenced,
+  SessionRecord,
+} from "./persistence/session-record.js";
 export type { SessionDependencies } from "./session-services.js";
 export { isIndeterminate, transcriptMessage } from "./session-state.js";
 
@@ -98,18 +103,17 @@ const clip = (text: string) =>
     ? `${text.slice(0, TRANSCRIPT_ENTRY_LIMIT)}… [truncated]`
     : text;
 const json = (value: unknown) => clip(typeof value === "string" ? value : JSON.stringify(value));
+/** Text parts verbatim, images as a placeholder, anything else (files, refusals) omitted. */
+function transcriptPart(
+  part: Extract<AgentSessionItem, { type: "message" }>["content"][number],
+): string {
+  if (part.type === "input_text" || part.type === "output_text") return part.text;
+  return part.type === "input_image" ? "[image]" : "";
+}
 function transcriptEntry(item: AgentSessionItem): string | undefined {
   switch (item.type) {
     case "message": {
-      const text = item.content
-        .map((part) =>
-          part.type === "input_text" || part.type === "output_text"
-            ? part.text
-            : part.type === "input_image"
-              ? "[image]"
-              : "",
-        )
-        .join("\n");
+      const text = item.content.map(transcriptPart).join("\n");
       return `${item.role === "user" ? "User" : "Assistant"}: ${clip(text)}`;
     }
     case "function_call":
@@ -208,6 +212,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   /** Synchronous typed view for the plain RPC reads. */
   private readonly tx: SessionTx = makeSessionTx(this.db);
   /** Post-commit wake for live streams; see `wakeAfterCommit`. */
+  // lint: entrypoint
   private readonly wake = runSync(PubSub.sliding<void>(1), "session.wake");
   /** Effect edge of the seam: one `transactionSync` per `transaction`, then a wake. */
   private readonly repo: SessionRepo = wakeAfterCommit(
@@ -233,6 +238,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
   private run<A, E>(program: Effect.Effect<A, E, SessionServices>): Promise<A> {
+    // lint: entrypoint
     return this.runtime.runPromiseExit(program).then(settle);
   }
   private readonly close = Deferred.done(this.closed, Exit.void);
@@ -251,6 +257,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     });
     // The one synchronous wake: this entrypoint is plain, and publishing to a sliding
     // PubSub never suspends, so `runSync` cannot leave a fiber behind.
+    // lint: entrypoint
     runSync(PubSub.publish(this.wake, void 0), "session.wake");
     return migrated.session;
   }
@@ -271,6 +278,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       Effect.flatMap(Repo, (repo) => repo.transaction((tx) => applyEnvironmentStatus(tx, status))),
     );
   }
+  /**
+   * Unfenced by design: the read and the write are one synchronous step of a serialized
+   * RPC call, so no reconciler transaction can move the record on in between, and a fenced
+   * transition that follows re-reads the metadata from the store rather than from its own
+   * earlier read.
+   */
   update(metadata: Record<string, string>): AgentSession {
     const record = this.record();
     const next = { ...record, session: { ...record.session, metadata } };
@@ -343,6 +356,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   }
   /** Committed state only: an active turn has no consistent checkpoint yet. */
   forkSource(): string {
+    // lint: entrypoint
     return runSync(
       encodeRpc(
         ForkSourceResult,
@@ -437,10 +451,12 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     // The cap is checked here, synchronously, and the permit is held by the stream's scope.
     // RPC serializes calls to this object, so the stream's fiber (which starts on the next
     // task) takes the permit the probe saw. The probe takes and releases without suspending.
+    // lint: entrypoint
     const free = runSync(this.listeners.withPermitsIfAvailable(1)(Effect.void), "session.stream");
     if (Option.isNone(free)) throw new StreamLimitExceeded({ limit: LISTENER_LIMIT });
     // The stream's fiber starts on the object's runtime; obtaining it is synchronous once
     // the layers are built, and they hold no resources.
+    // lint: entrypoint
     const runtime = this.runtime.runSync(this.runtime.runtimeEffect);
     const body = Stream.toReadableStreamRuntime(
       this.events(after ?? this.db.lastEvent(), !!options.initial),

@@ -21,6 +21,7 @@ import {
   type ActiveSession,
   type ArtifactRecord,
   type Command,
+  type Fenced,
   migrate,
   type QueuedInput,
   type SessionRecord,
@@ -42,6 +43,13 @@ import { acceptRuntimeEvent, finishOutputItems, recordToolResult } from "./sessi
  * The session state machine: every transition is a synchronous, total function of a
  * `SessionTx` and runs inside one `transactionSync`. Nothing here performs I/O or waits;
  * a throw is the rollback and carries a tagged error the Effect edge classifies.
+ *
+ * Two kinds of transition write the session record. The input, environment and deletion
+ * entrypoints read the record with `requireSession` and write it in the same synchronous
+ * transaction, so what they read cannot go stale. The reconciler's transitions run after
+ * the tick awaited the runtime, so they take a `Fenced<ActiveSession>`: the record as
+ * `tx.fenced` re-read it in the writing transaction, matched to the execution. They derive
+ * the next record from that value, and a stale execution never reaches them.
  */
 
 /** Failure categories the SDK's turn error type can carry verbatim. */
@@ -211,9 +219,16 @@ export function enqueue(
     ...(itemIds ? { itemIds } : {}),
   } satisfies Command);
 }
-/** The executor refused a queued command for good. A steer's input becomes the next turn. */
-export function reject(tx: SessionTx, operation: Command): void {
+/**
+ * The executor took delivery of a queued command, or the command outlived its turn: drop
+ * it. The fenced record is the witness that the queue belongs to a live execution.
+ */
+export function discard(tx: SessionTx, _fence: Fenced<ActiveSession>, operation: Command): void {
   tx.store.remove(SessionKinds.command, operation.id);
+}
+/** The executor refused a queued command for good. A steer's input becomes the next turn. */
+export function reject(tx: SessionTx, record: Fenced<ActiveSession>, operation: Command): void {
+  discard(tx, record, operation);
   if (operation.command.type !== "steer") return;
   for (const itemId of operation.itemIds ?? []) tx.store.remove(SessionKinds.item, itemId);
   tx.store.put(SessionKinds.queuedInput, operation.id, {
@@ -221,7 +236,7 @@ export function reject(tx: SessionTx, operation: Command): void {
   } satisfies QueuedInput);
 }
 /** The runtime acknowledged the start: the turn is in progress. */
-export function markRunning(tx: SessionTx, record: ActiveSession): void {
+export function markRunning(tx: SessionTx, record: Fenced<ActiveSession>): void {
   tx.save({ ...record, phase: "running" });
   const turn = {
     ...tx.requireTurn(record.execution.turnId),
@@ -244,7 +259,7 @@ export function markRunning(tx: SessionTx, record: ActiveSession): void {
  */
 export function acceptBatch(
   tx: SessionTx,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   batch: RuntimeBatch,
   cancel: Command | undefined,
 ): "commands" | ActiveSession["phase"] {
@@ -268,7 +283,7 @@ export function acceptBatch(
 export function commitCheckpoint(
   tx: SessionTx,
   config: TurnConfig,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   checkpoint: Checkpoint,
 ): void {
   if (checkpoint.driver !== record.driver || checkpoint.revision !== record.revision)
@@ -284,7 +299,7 @@ export function commitCheckpoint(
 }
 function closeChildTurns(
   tx: SessionTx,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   status: "completed" | "cancelled" | "failed",
   turnError: SessionTurnError | null,
 ): void {
@@ -328,7 +343,7 @@ function closeChildTurns(
 export function complete(
   tx: SessionTx,
   config: TurnConfig,
-  record: ActiveSession,
+  record: Fenced<ActiveSession>,
   status: "completed" | "cancelled" | "failed",
   error?: string,
 ): void {

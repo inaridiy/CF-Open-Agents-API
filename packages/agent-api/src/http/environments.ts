@@ -37,6 +37,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
     if (session.environment.type !== "openai_hosted")
       throw new EnvironmentNotFound({ environmentId: spec.id });
     const { files, plugins, skills } = session.environment;
+    // lint: entrypoint
     const status = await runPromise(
       options.environments?.(c.env.env).status(spec) ?? Effect.succeed("failed"),
     );
@@ -65,6 +66,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
         [input.file_id]: { key: file.key, size: file.resource.bytes },
       };
     }
+    // lint: entrypoint
     return Response.json(await runPromise(driver.upload(spec, input)));
   });
   app.get("/v1/agents/environments/:id/files", async (c) => {
@@ -73,6 +75,7 @@ export function registerEnvironmentRoutes<Env>(app: RouteApp<Env>, options: Serv
     const driver = options.environments?.(c.env.env);
     if (!driver) throw new EnvironmentDriverUnavailable();
     return Response.json(
+      // lint: entrypoint
       await runPromise(driver.files(spec, parse(environmentFilePageSchema, c.req.query()))),
     );
   });

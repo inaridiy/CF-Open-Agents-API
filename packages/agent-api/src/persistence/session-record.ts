@@ -40,6 +40,18 @@ const executionState = Schema.Union(
 );
 export type SessionRecord = SessionBase & typeof executionState.Type;
 export type ActiveSession = Extract<SessionRecord, { execution: Execution }>;
+/**
+ * The fence brand. A `Fenced<ActiveSession>` was read inside the current transaction by
+ * `SessionTx.fenced`, and its generation and turn matched the caller's execution. It is
+ * the only proof a transition accepts that the record it is about to overwrite is still
+ * the one the execution started from; every other read may be stale by the time an
+ * awaited poll or checkpoint returns. Only the tx module certifies a record (the brand
+ * symbol is not exported, so no other module can construct the type without a cast). A
+ * spread of a fenced record keeps the brand, so a transition derives its next record
+ * from the value it was given and nothing else.
+ */
+declare const FencedBrand: unique symbol;
+export type Fenced<A> = A & { readonly [FencedBrand]: true };
 export interface ArtifactRecord extends SessionArtifact {
   key: string;
 }

@@ -7,7 +7,7 @@ import {
   type TransportFailure,
 } from "./errors.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
-import type { ActiveSession, Command } from "./persistence/session-record.js";
+import type { ActiveSession, Command, Fenced } from "./persistence/session-record.js";
 import type { SessionRepo, Sync } from "./persistence/session-repo.js";
 import type { SessionTx } from "./persistence/session-tx.js";
 import type { Execution, RuntimeDriver } from "./runtime.js";
@@ -16,6 +16,7 @@ import {
   acceptBatch,
   commitCheckpoint,
   complete,
+  discard,
   markRunning,
   reject,
   type TurnConfig,
@@ -57,7 +58,8 @@ const pollWait = (tick: Tick, record: ActiveSession, now: number): number => {
   return Math.max(0, Math.min(remaining, LONG_POLL_MAX_MS));
 };
 
-const fenced = <A>(tick: Tick, f: (record: ActiveSession, tx: SessionTx) => Sync<A>) =>
+/** One fenced transaction: `f` sees the record as re-read and matched to this tick's execution. */
+const fenced = <A>(tick: Tick, f: (record: Fenced<ActiveSession>, tx: SessionTx) => Sync<A>) =>
   tick.repo.transaction((tx) => f(tx.fenced(tick.execution), tx));
 const finish = (tick: Tick, status: "cancelled" | "failed", error?: string) =>
   fenced(tick, (record, tx) => complete(tx, tick.config, record, status, error));
@@ -95,7 +97,7 @@ const deliver = Effect.fn("session.deliver")(function* (
   operation: Command,
   cancel: Command | undefined,
 ) {
-  const remove = fenced(tick, (_record, tx) => tx.store.remove(SessionKinds.command, operation.id));
+  const remove = fenced(tick, (record, tx) => discard(tx, record, operation));
   if (operation.turnId !== tick.execution.turnId) {
     if (!cancel) yield* remove;
     return "skipped" as const;
@@ -106,7 +108,7 @@ const deliver = Effect.fn("session.deliver")(function* (
           Effect.as("skipped" as const),
         )
       : Effect.logWarning("Executor refused a queued command", error).pipe(
-          Effect.zipRight(fenced(tick, (_record, tx) => reject(tx, operation))),
+          Effect.zipRight(fenced(tick, (record, tx) => reject(tx, record, operation))),
           Effect.as("skipped" as const),
         );
   const delivery = yield* tick.driver.control(tick.execution, operation.id, operation.command).pipe(

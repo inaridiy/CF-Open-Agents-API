@@ -17,8 +17,12 @@ export const workspacePathSchema = z
 export const base64Schema = z
   .string()
   .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
-export const base64Size = (data: string) =>
-  (data.length / 4) * 3 - (data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0);
+/** Padding characters at the end of a base64 string, each standing for one missing byte. */
+function base64Padding(data: string): number {
+  if (data.endsWith("==")) return 2;
+  return data.endsWith("=") ? 1 : 0;
+}
+export const base64Size = (data: string) => (data.length / 4) * 3 - base64Padding(data);
 export const environmentFileSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("inline"),

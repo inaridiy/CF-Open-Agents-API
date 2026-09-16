@@ -54,6 +54,11 @@ export const metadataSchema = z
   .refine((value) => Object.keys(value).length <= 16, "At most 16 metadata entries")
   .nullable()
   .optional();
+/** What must be unique among an agent's tools: a function's name, an MCP server's label, else the type. */
+function toolIdentity(tool: z.infer<typeof agentToolSchema>): string {
+  if (tool.type === "function") return tool.name;
+  return tool.type === "mcp" ? `mcp:${tool.server_label}` : tool.type;
+}
 export const agentConfigSchema = z.strictObject({
   model: z.string().min(1).max(200),
   instructions: z.string().max(128_000).nullable().optional(),
@@ -61,16 +66,7 @@ export const agentConfigSchema = z.strictObject({
     .array(agentToolSchema)
     .max(64)
     .refine(
-      (tools) =>
-        new Set(
-          tools.map((tool) =>
-            tool.type === "function"
-              ? tool.name
-              : tool.type === "mcp"
-                ? `mcp:${tool.server_label}`
-                : tool.type,
-          ),
-        ).size === tools.length,
+      (tools) => new Set(tools.map(toolIdentity)).size === tools.length,
       "Tool names must be unique",
     )
     .refine(

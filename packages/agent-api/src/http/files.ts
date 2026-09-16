@@ -9,6 +9,7 @@ import { objects, type RouteApp } from "./context.js";
 
 export function registerFileRoutes<Env>(app: RouteApp<Env>, options: ServiceOptions<Env>) {
   app.post("/v1/files", async (c) => {
+    // lint: entrypoint
     const record = await runPromise(
       uploadInputFile(objects(options, c.env), await c.req.formData()),
     );

@@ -62,25 +62,39 @@ export const agentToolSchema = z.discriminatedUnion("type", [
 ]);
 export type AgentToolConfig = z.infer<typeof agentToolSchema>;
 export type McpToolConfig = z.infer<typeof mcpToolSchema>;
-export function publicTool(tool: AgentToolConfig) {
-  if (tool.type === "function") return { ...tool, defer_loading: tool.defer_loading ?? false };
-  if (tool.type === "tool_search") return tool;
-  if (tool.type === "programmatic_tool_calling") return { ...tool, enabled: tool.enabled ?? true };
-  if (tool.type === "web_search")
+type WebSearchToolConfig = Extract<AgentToolConfig, { type: "web_search" }>;
+function publicWebSearch(tool: WebSearchToolConfig) {
+  return {
+    type: tool.type,
+    mode: tool.mode ?? "live",
+    context_size: tool.context_size ?? "medium",
+    allowed_domains: tool.allowed_domains ?? null,
+    location: tool.location
+      ? {
+          city: tool.location.city ?? null,
+          country: tool.location.country ?? null,
+          region: tool.location.region ?? null,
+          timezone: tool.location.timezone ?? null,
+        }
+      : null,
+  };
+}
+function publicTransport(transport: McpToolConfig["transport"]) {
+  if (transport.type === "http")
     return {
-      type: tool.type,
-      mode: tool.mode ?? "live",
-      context_size: tool.context_size ?? "medium",
-      allowed_domains: tool.allowed_domains ?? null,
-      location: tool.location
-        ? {
-            city: tool.location.city ?? null,
-            country: tool.location.country ?? null,
-            region: tool.location.region ?? null,
-            timezone: tool.location.timezone ?? null,
-          }
-        : null,
+      type: transport.type,
+      server_url: transport.server_url,
+      headers: transport.headers ?? {},
     };
+  return {
+    type: transport.type,
+    command: transport.command,
+    cwd: transport.cwd,
+    args: transport.args ?? [],
+    env_vars: transport.env_vars ?? [],
+  };
+}
+function publicMcp(tool: McpToolConfig) {
   return {
     type: tool.type,
     server_label: tool.server_label,
@@ -91,21 +105,15 @@ export function publicTool(tool: AgentToolConfig) {
     credential_id: tool.credential_id ?? null,
     request_metadata: tool.request_metadata ?? {},
     required: tool.required ?? false,
-    transport:
-      tool.transport.type === "http"
-        ? {
-            type: tool.transport.type,
-            server_url: tool.transport.server_url,
-            headers: tool.transport.headers ?? {},
-          }
-        : {
-            type: tool.transport.type,
-            command: tool.transport.command,
-            cwd: tool.transport.cwd,
-            args: tool.transport.args ?? [],
-            env_vars: tool.transport.env_vars ?? [],
-          },
+    transport: publicTransport(tool.transport),
   };
+}
+export function publicTool(tool: AgentToolConfig) {
+  if (tool.type === "function") return { ...tool, defer_loading: tool.defer_loading ?? false };
+  if (tool.type === "tool_search") return tool;
+  if (tool.type === "programmatic_tool_calling") return { ...tool, enabled: tool.enabled ?? true };
+  if (tool.type === "web_search") return publicWebSearch(tool);
+  return publicMcp(tool);
 }
 /**
  * The session's agent view. The SDK's `AgentSession.agent.tools` union (`AgentTool`)

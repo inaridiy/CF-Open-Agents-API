@@ -6,6 +6,7 @@ import { jsonBody, type RouteApp } from "./context.js";
 export function registerAgentRoutes<Env>(app: RouteApp<Env>) {
   app.post("/v1/agents", async (c) => {
     const input = parse(savedAgentSchema, await jsonBody(c));
+    // lint: entrypoint
     await runPromise(c.env.validateModel(input.model, input, false));
     return Response.json(
       await c.env
@@ -23,6 +24,7 @@ export function registerAgentRoutes<Env>(app: RouteApp<Env>) {
     const input = parse(savedAgentSchema.partial(), await jsonBody(c));
     const catalog = c.env.catalog(c.get("tenant"));
     const previous = await catalog.agent(c.req.param("id"));
+    // lint: entrypoint
     await runPromise(
       c.env.validateModel(
         input.model ?? previous.model,
