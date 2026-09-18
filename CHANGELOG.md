@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `create-cf-open-agents-api init` writes `allowBuilds` for `esbuild` and `workerd` to `pnpm-workspace.yaml` in pnpm projects, and treats a run through `pnpm dlx` in an empty directory as a pnpm project. Without the approval pnpm 11 fails every `pnpm exec` in the generated project with `ERR_PNPM_IGNORED_BUILDS`, so `wrangler dev`, `doctor` and `tsc` never ran. The pre-publication note about `--library` is gone now that the library is on npm.
+
 ## 0.2.0 (2026-09-18)
 
 The first version on npm, under the `alpha` dist-tag. The `v0.1.0` tag exists as history and was never published.

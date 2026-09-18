@@ -58,7 +58,7 @@ export interface WranglerConfig {
 const CONFIG_FILES = ["wrangler.jsonc", "wrangler.json"] as const;
 
 /** Finds the Wrangler configuration; a directory without one becomes a new project. */
-export function locateProject(root: string): Project {
+export function locateProject(root: string, userAgent?: string): Project {
   const configPath = CONFIG_FILES.map((file) => join(root, file)).find((path) => existsSync(path));
   if (!configPath && existsSync(join(root, "wrangler.toml")))
     throw new CliError(
@@ -72,11 +72,15 @@ export function locateProject(root: string): Project {
     root,
     mode: configPath ? "retrofit" : "standalone",
     configPath: configPath ?? join(root, "wrangler.jsonc"),
-    packageManager: detectPackageManager(root),
+    packageManager: detectPackageManager(root, userAgent),
   };
 }
 
-export function detectPackageManager(root: string): PackageManager {
+/**
+ * The `packageManager` field, then a lockfile, then the package manager that runs this CLI
+ * (`npm_config_user_agent`, so `pnpm dlx ... init` in an empty directory is a pnpm project).
+ */
+export function detectPackageManager(root: string, userAgent?: string): PackageManager {
   const manifest = readManifest(root);
   const declared = typeof manifest?.packageManager === "string" ? manifest.packageManager : "";
   for (const manager of ["pnpm", "yarn", "bun"] as const)
@@ -84,6 +88,8 @@ export function detectPackageManager(root: string): PackageManager {
   if (existsSync(join(root, "pnpm-lock.yaml"))) return "pnpm";
   if (existsSync(join(root, "yarn.lock"))) return "yarn";
   if (existsSync(join(root, "bun.lock")) || existsSync(join(root, "bun.lockb"))) return "bun";
+  for (const manager of ["pnpm", "yarn", "bun"] as const)
+    if (userAgent?.startsWith(`${manager}/`)) return manager;
   return "npm";
 }
 

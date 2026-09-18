@@ -11,6 +11,7 @@ import { ensureDevVars, ensureDevVarsExample } from "./steps/dev-vars.js";
 import { ensureEntryExports } from "./steps/entry.js";
 import { ensureGitignore } from "./steps/gitignore.js";
 import { ensurePackageJson, type PackageJsonOptions, vendorScript } from "./steps/package-json.js";
+import { ensurePnpmBuilds } from "./steps/pnpm-builds.js";
 import { ensureStandaloneSkeleton } from "./steps/standalone.js";
 import { ensureTsconfigExclude } from "./steps/tsconfig.js";
 import { ensureVendor } from "./steps/vendor.js";
@@ -81,7 +82,7 @@ const chooseReporter = (options: InitOptions): Reporter =>
 
 export async function runInit(options: InitOptions): Promise<InitResult> {
   const root = resolve(options.dir);
-  const project = locateProject(root);
+  const project = locateProject(root, (options.env ?? process.env).npm_config_user_agent);
   const prompter = choosePrompter(options);
   const reporter = chooseReporter(options);
   const files = new Files(root, options.dryRun);
@@ -109,12 +110,9 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   plan.add(ensureDevVars({ files, secret, token: options.token }));
   plan.add(ensureDevVarsExample({ files, secret }));
   plan.add(ensureGitignore(files));
+  plan.add(ensurePnpmBuilds(files, project.packageManager));
   plan.add(ensurePackageJson(manifestChanges(files, project, composition, options)));
   if (project.mode === "retrofit") plan.add(ensureTsconfigExclude(files));
-  if (!options.library)
-    plan.note(
-      `${LIBRARY_NAME}@${CLI_VERSION} must be on npm for install to succeed; before that, pass --library <tarball>.`,
-    );
   if (answers.install && !options.dryRun) await install(project, reporter, options.runner ?? run);
   reporter.note(nextSteps(project, answers, agentsPath), "Next steps");
   reporter.plan(plan, options.dryRun ? "Dry run: nothing was written" : "Done");

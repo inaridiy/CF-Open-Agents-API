@@ -220,7 +220,6 @@ it("--library and --cli-package write file: dependencies for pre-publication run
     const manifest = readJson<Manifest>(dir, "package.json");
     expect(manifest.dependencies["cf-open-agents-api"]).toBe("file:/tmp/lib.tgz");
     expect(manifest.devDependencies["create-cf-open-agents-api"]).toBe("file:/tmp/cli.tgz");
-    expect(plan.notes.join("\n")).not.toMatch(/must be on npm/);
   } finally {
     cleanup(dir);
   }
