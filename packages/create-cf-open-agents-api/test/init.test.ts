@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { CliError, type InitOptions, parseDevVars, runInit } from "../src/index.js";
+import { CliError, type InitOptions, parseDevVars, runInit, versions } from "../src/index.js";
 import {
   cleanup,
   cliPath,
@@ -67,10 +67,10 @@ it("retrofit adds the API to an existing Vite Worker project", async () => {
     expect(devVars.get("OPENAI_API_KEY")).toBe("sk-existing");
     expect(devVars.get("LOCAL_BACKUPS")).toBe("true");
     const manifest = readJson<Manifest>(dir, "package.json");
-    expect(manifest.dependencies["cf-open-agents-api"]).toBe("0.2.0");
+    expect(manifest.dependencies["cf-open-agents-api"]).toBe(versions.CLI_VERSION);
     expect(manifest.dependencies.effect).toBe("3.21.0");
     expect(manifest.scripts.postinstall).toBe("echo hi && create-cf-open-agents-api vendor");
-    expect(manifest.devDependencies["create-cf-open-agents-api"]).toBe("0.2.0");
+    expect(manifest.devDependencies["create-cf-open-agents-api"]).toBe(versions.CLI_VERSION);
     expect(read(dir, ".gitignore")).toMatch(/\.cf-open-agents-api\/\n\.dev\.vars\n$/);
     expect(readJson<{ exclude: string[] }>(dir, "tsconfig.json").exclude).toEqual([
       ".cf-open-agents-api",
@@ -214,9 +214,7 @@ it("provider and harness flags shape the composition", async () => {
 it("--library and --cli-package write file: dependencies for pre-publication runs", async () => {
   const dir = copyFixture("vite-project");
   try {
-    const { plan } = await runInit(
-      base(dir, { library: "/tmp/lib.tgz", cliPackage: "/tmp/cli.tgz" }),
-    );
+    await runInit(base(dir, { library: "/tmp/lib.tgz", cliPackage: "/tmp/cli.tgz" }));
     const manifest = readJson<Manifest>(dir, "package.json");
     expect(manifest.dependencies["cf-open-agents-api"]).toBe("file:/tmp/lib.tgz");
     expect(manifest.devDependencies["create-cf-open-agents-api"]).toBe("file:/tmp/cli.tgz");
