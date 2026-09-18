@@ -1,8 +1,10 @@
 # Releasing
 
-A release is a version tag on a commit whose CI run passed. The npm package is built from that tag. Pushing commits or tags publishes nothing: `publish.yml` runs only by manual workflow dispatch. Nothing has been published yet; `v0.1.0` was tagged but not released to npm.
+A release is a version tag on a commit whose CI run passed. The npm package is built from that tag. Pushing commits or tags publishes nothing: `publish.yml` runs only by manual workflow dispatch. `v0.1.0` was tagged but never released to npm; `v0.2.0` is the first published alpha.
 
 ## Before the first public release
+
+Done on 2026-09-18 for `v0.2.0`; kept as the record of what the publish workflow checks.
 
 1. Make the repository public. Enable GitHub Private Vulnerability Reporting at the same time, check that the [report link](https://github.com/inaridiy/CF-Open-Agents-API/security/advisories/new) works, and update SECURITY.md to say so.
 2. Configure the `npm` GitHub environment and its release permissions. Configure npm trusted publishing for this repository, workflow `publish.yml`, environment `npm`. Initial package registration may need an owner-operated bootstrap; never add registry credentials to the repository. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/).

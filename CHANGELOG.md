@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-09-18)
 
-Nothing has been published to npm. The `v0.1.0` tag exists as history; this is the first version intended for public adopters.
+The first version on npm, under the `alpha` dist-tag. The `v0.1.0` tag exists as history and was never published.
 
 ### Fixed
 

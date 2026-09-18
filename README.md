@@ -10,7 +10,7 @@ Keep the official OpenAI client. Point it at your Worker. The Worker owns the AP
 - It runs the native agent runtimes (Codex `0.154.0`, Claude Agent SDK `0.3.268`, OpenCode `1.18.30`) in Cloudflare Containers. Each runtime keeps its own agent loop; this project supplies sandboxes, tools, durability and the API around it.
 - It is not affiliated with, endorsed by or supported by OpenAI, Anthropic, the OpenCode project or Cloudflare. "OpenAI", "Codex", "Claude", "Claude Code", "OpenCode" and "Cloudflare" are trademarks of their owners and are used here only to describe compatibility.
 - It does not use Cloudflare's `agents` npm package. The name describes the API it implements, not a dependency.
-- It is pre-release software. Version `0.2.0` is unreleased; nothing has been published to npm yet. Expect breaking changes until `1.0`.
+- It is pre-release software. Versions publish under the npm `alpha` dist-tag, never `latest`. Expect breaking changes until `1.0`.
 
 ## Who it is for
 

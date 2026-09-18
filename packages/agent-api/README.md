@@ -4,7 +4,7 @@
 
 Keep the official OpenAI client. Your Worker owns the API, the session state, the sandboxes and the model credentials. The runtimes run in Cloudflare Containers; Durable Objects hold the sessions; R2 holds checkpoints, workspaces and files. This package is not affiliated with OpenAI, Anthropic, the OpenCode project or Cloudflare; product names are used only to describe compatibility.
 
-Targets `agents=v1` in `openai@7.15.0`. Pre-release: nothing has been published to npm yet. Read the [compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/compatibility.md) before integrating.
+Targets `agents=v1` in `openai@7.15.0`. Pre-release: versions publish under the npm `alpha` dist-tag. Read the [compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/compatibility.md) before integrating.
 
 Every runtime supports hosted environments, files, skills, templates, MCP with Vault credentials, deferred tools, programmatic tool calling, images, steering, native subagents, reasoning and command streaming, usage and native checkpoint restore. Presets can delegate subagents to other runtimes, and sessions can be forked onto another preset. Hosted web search is available on Codex and Claude Code through a native model connection.
 

@@ -4,7 +4,7 @@
 
 Do not post exploit details, credentials or tenant data in public issues.
 
-When the repository is published, GitHub Private Vulnerability Reporting will be enabled as part of the [release procedure](docs/releasing.md), and reports go through [Report a vulnerability](https://github.com/inaridiy/CF-Open-Agents-API/security/advisories/new). Until that switch is flipped, contact the repository owner through a private channel; the release checklist verifies the reporting link before the first npm publication.
+GitHub Private Vulnerability Reporting is enabled: report through [Report a vulnerability](https://github.com/inaridiy/CF-Open-Agents-API/security/advisories/new). The [release procedure](docs/releasing.md) verifies that this link works before every npm publication.
 
 Include the affected version or commit, configuration, a minimal reproduction, impact, and redacted logs. Allow the maintainer to investigate and coordinate a fix before publishing technical details.
 
