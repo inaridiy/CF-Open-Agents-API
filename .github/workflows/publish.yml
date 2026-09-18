@@ -30,6 +30,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           test "$RELEASE_TAG" = "v$(node -p "require('./packages/agent-api/package.json').version")"
+          test "$RELEASE_TAG" = "v$(node -p "require('./packages/create-cf-open-agents-api/package.json').version")"
           test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
           test "$(gh api "repos/$REPOSITORY" --jq .private)" = false
           gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$(git rev-parse HEAD)&status=success" --jq '.workflow_runs | any(.event == "push")' | grep -qx true
@@ -45,5 +46,11 @@ jobs:
       - run: |
           mkdir -p "$RUNNER_TEMP/release"
           pnpm --filter cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
+          pnpm --filter create-cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
+      # The library first: the CLI's generated projects depend on it, and its `vendor`
+      # step downloads this tag's archive, which exists once the tag is pushed.
       - name: Publish alpha with npm trusted publishing
-        run: npm publish "$RUNNER_TEMP"/release/*.tgz --access public --tag alpha --provenance
+        run: |
+          for tarball in "$RUNNER_TEMP"/release/cf-open-agents-api-*.tgz "$RUNNER_TEMP"/release/create-cf-open-agents-api-*.tgz; do
+            npm publish "$tarball" --access public --tag alpha --provenance
+          done

@@ -6,10 +6,15 @@ const manifest =
   /** @type {{ scripts: Record<string, string>, devDependencies: Record<string, string> }} */ (
     JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
   );
-// npm lifecycle hooks run on install and are not commands a developer types.
+// npm lifecycle hooks run on install, and pre/post hooks of a documented script run with
+// it; neither is a command a developer types.
 const lifecycle = new Set(["prepare", "prepack", "postinstall", "preinstall", "prepublishOnly"]);
+const isHook = (/** @type {string} */ command) => {
+  const hook = /^(?:pre|post)(.+)$/.exec(command);
+  return hook?.[1] !== undefined && hook[1] in manifest.scripts;
+};
 for (const command of Object.keys(manifest.scripts))
-  if (!lifecycle.has(command))
+  if (!(lifecycle.has(command) || isHook(command)))
     assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
 const library =
   /** @type {{ name: string, repository: { url: string }, exports: Record<string, unknown>, dependencies: Record<string, string> }} */ (
@@ -47,6 +52,25 @@ for (const file of ["examples/worker/wrangler.jsonc", "tests/containers/wrangler
     `${file}: sandbox backup configuration must match the R2 binding`,
   );
 }
+const cli = /** @type {{ name: string, version: string, bin: Record<string, string> }} */ (
+  JSON.parse(
+    await readFile(
+      new URL("../packages/create-cf-open-agents-api/package.json", import.meta.url),
+      "utf8",
+    ),
+  )
+);
+assert.equal(cli.version, library.version, "The setup CLI and the library share one version");
+assert.equal(cli.name, `create-${library.name}`, "The setup CLI is the library's create-* package");
+const cliReadme = await readFile(
+  new URL("../packages/create-cf-open-agents-api/README.md", import.meta.url),
+  "utf8",
+);
+for (const command of ["init", "setup", "doctor", "vendor"])
+  assert(
+    new RegExp(`\`${command} \\[directory\\]`).test(cliReadme),
+    `Document the ${command} command in the CLI README`,
+  );
 const dockerfile = await readFile(new URL("../docker/Sandbox.Dockerfile", import.meta.url), "utf8");
 assert(
   dockerfile.includes(`cloudflare/sandbox:${library.dependencies["@cloudflare/sandbox"]}\n`),

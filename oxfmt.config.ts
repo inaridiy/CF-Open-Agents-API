@@ -16,6 +16,9 @@ export default defineConfig({
     "**/.claude/**",
     "**/env.d.ts",
     "**/dist/**",
+    // Fixture projects the setup CLI is tested against and the files its tests render.
+    "**/test/fixtures/**",
+    "**/test/.tmp-*/**",
     "**/.wrangler/**",
   ],
 });

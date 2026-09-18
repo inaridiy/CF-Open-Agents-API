@@ -2,18 +2,19 @@
 
 This is a pnpm TypeScript workspace: a Workers API with SQLite Durable Objects, R2 and Containers, plus a Node supervisor for Codex, Claude Code and OpenCode. The native runtimes own their agent loops; the model gateway performs single inferences.
 
-| When working on                                   | Start with                                                                              |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Setup, commands, test selection                   | [CONTRIBUTING.md](CONTRIBUTING.md#validation) and [README.md](README.md#develop)        |
-| Service boundaries or durable execution           | [docs/architecture.md](docs/architecture.md)                                            |
-| Public HTTP/RPC behavior                          | [docs/compatibility.md](docs/compatibility.md) and `packages/agent-api/src/protocol.ts` |
-| Effect code, errors, persistence, streaming       | [docs/effect.md](docs/effect.md): the five house rules and what enforces each           |
-| Native runtime, model gateway, checkpoint changes | [native-harness-change](.agents/skills/native-harness-change/SKILL.md)                  |
-| Worker bindings, Docker, R2 or deployment         | [docs/deployment.md](docs/deployment.md)                                                |
-| Toolchain, vendored skills, checkers              | [docs/development-harness.md](docs/development-harness.md)                              |
-| Scope, authorization or completion decisions      | [Contribution scope](CONTRIBUTING.md#scope-and-completion)                              |
-| Resumable experiments or a handoff                | [.agents/PLANS.md](.agents/PLANS.md)                                                    |
-| A recurring validation diagnostic                 | [docs/known-issues.md](docs/known-issues.md); match the documented scope                |
+| When working on                                   | Start with                                                                                                                      |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Setup, commands, test selection                   | [CONTRIBUTING.md](CONTRIBUTING.md#validation) and [README.md](README.md#develop)                                                |
+| Service boundaries or durable execution           | [docs/architecture.md](docs/architecture.md)                                                                                    |
+| Public HTTP/RPC behavior                          | [docs/compatibility.md](docs/compatibility.md) and `packages/agent-api/src/protocol.ts`                                         |
+| Effect code, errors, persistence, streaming       | [docs/effect.md](docs/effect.md): the five house rules and what enforces each                                                   |
+| Native runtime, model gateway, checkpoint changes | [native-harness-change](.agents/skills/native-harness-change/SKILL.md)                                                          |
+| The setup CLI or the generated project files      | [packages/create-cf-open-agents-api/README.md](packages/create-cf-open-agents-api/README.md); `examples/worker` is its template |
+| Worker bindings, Docker, R2 or deployment         | [docs/deployment.md](docs/deployment.md)                                                                                        |
+| Toolchain, vendored skills, checkers              | [docs/development-harness.md](docs/development-harness.md)                                                                      |
+| Scope, authorization or completion decisions      | [Contribution scope](CONTRIBUTING.md#scope-and-completion)                                                                      |
+| Resumable experiments or a handoff                | [.agents/PLANS.md](.agents/PLANS.md)                                                                                            |
+| A recurring validation diagnostic                 | [docs/known-issues.md](docs/known-issues.md); match the documented scope                                                        |
 
 The API is an independent implementation; its name does not imply use of Cloudflare's `agents` package. Persistence uses Kysely with synchronous SQLite transactions. The Sandbox package is pinned to the preview line and its image must match. Confirm versions in the package manifests.
 

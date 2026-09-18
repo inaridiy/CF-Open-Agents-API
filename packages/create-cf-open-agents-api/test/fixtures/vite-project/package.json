@@ -1,0 +1,16 @@
+{
+  "name": "my-app",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "postinstall": "echo hi"
+  },
+  "dependencies": {
+    "effect": "3.21.0",
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.0.0",
+    "wrangler": "^4.0.0"
+  }
+}

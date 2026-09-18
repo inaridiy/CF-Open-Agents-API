@@ -3,6 +3,8 @@ dist/
 .wrangler/
 .dev.vars*
 !.dev.vars.example
+# The retrofit fixture carries a fake .dev.vars so the test sees an existing file.
+!packages/create-cf-open-agents-api/test/fixtures/**/.dev.vars
 .env*
 !.env.example
 coverage/
@@ -14,6 +16,12 @@ examples/caller/env.d.ts
 packages/agent-api/LICENSE
 packages/agent-api/NOTICE
 packages/agent-api/CHANGELOG.md
+packages/create-cf-open-agents-api/LICENSE
+packages/create-cf-open-agents-api/NOTICE
+packages/create-cf-open-agents-api/CHANGELOG.md
+
+# Compositions the setup CLI tests render and typecheck.
+packages/create-cf-open-agents-api/test/.tmp-*/
 
 # Local work notes are not release documentation.
 .agents/execplans/

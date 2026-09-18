@@ -28,6 +28,7 @@ Run commands from the repository root. Pick the rows that match the change; CI r
 | Container transport, sandbox tools, R2 restore or Docker images    | The applicable rows above plus `pnpm test:containers`; see [local runtime notes](docs/deployment.md#local-runtime-notes) |
 | Public package exports, dependencies or release assembly           | `pnpm check`, `pnpm test:package`; native and container checks when their dependency tree changes                        |
 | Worker bindings, configuration or deployment packaging             | `pnpm types`, `pnpm build`, `pnpm deploy:check`; transport changes also need the container smoke                         |
+| The setup CLI, its templates or the generated project files        | `pnpm build`, `pnpm test:cli`, `pnpm lint`, `pnpm test:package`; a template change also needs `pnpm check:docs`          |
 
 What each suite covers:
 
@@ -36,7 +37,8 @@ What each suite covers:
 - `pnpm test:harnesses` (`tests/harnesses`): all three native runtimes through the supervisor with scripted models, the model gateway through the official OpenAI and Anthropic clients, MCP, media and usage, delegation, workspace tools, supervisor lifecycle and concurrency, history restored after the original home is removed. Needs Codex `0.154.0` on `PATH`.
 - `pnpm test:containers` (`scripts/test-containers.mjs`, `tests/containers`): the real Worker, Container and R2 path in Wrangler's local emulation with Docker. Needs Docker and `python3`; see [deployment](docs/deployment.md#local-runtime-notes) for the rootless recipe.
 - `pnpm test:package`: packs the library and typechecks a consumer against the tarball.
-- `pnpm test:scripts`: unit tests of the checker and container scripts. The label test imports the built library, so run `pnpm build` first.
+- `pnpm test:scripts`: unit tests of the checker, bootstrap and container scripts. The label test imports the built library, so run `pnpm build` first.
+- `pnpm test:cli` (`packages/create-cf-open-agents-api/test`, vitest in Node): `init` against fixture projects (retrofit, standalone, idempotency, dry run, conflicts, `--force`), the snapshot, `doctor`, `setup` through a fake runner, the pins against the workspace manifests, and every rendered composition formatted with oxfmt and typechecked against the built library. Run `pnpm build` first; the standalone test compares the output with `examples/worker` byte for byte.
 
 Match recurring diagnostics against [known issues](docs/known-issues.md). See [scope and completion](#scope-and-completion) for boundaries.
 
@@ -57,7 +59,9 @@ Match recurring diagnostics against [known issues](docs/known-issues.md). See [s
 - `tools.ts`: tool contracts, search presets and immutable asset helpers.
 - `packages/supervisor/src`: `server.ts` (the container HTTP API and its one status table), `main.ts`, `job.ts` (the `Job` lifecycle, finalizer-ordered stop), `lifecycle.ts` (`JobLog`, `Operations`, `once`, the tagged failures), `process.ts` (process acquisition, readiness and termination), `json-rpc.ts` (the Codex app-server transport), `codex.ts`, `claude-code.ts`, `opencode.ts` (adapters), `delegation.ts` (cross-runtime children), `remote-tools.ts` (MCP bridge), `checkpoint.ts`.
 - `scripts/lint/agent-api-plugin.mjs`: the repository lint rules and their tests.
-- `examples/worker`: deployable composition; no test fixture enters this build. `examples/caller`: a consuming Worker.
+- `worker.ts`: `defineAgentWorker`, the one-call composition; `models/gateway.ts`: the model gateway, `nativeModel` and the error sanitizer, kept free of the optional `ai` peer.
+- `packages/create-cf-open-agents-api/src`: the setup CLI. `init.ts` runs the steps in order over a `Files` overlay (dry runs never touch disk); `steps/wrangler.ts` upserts the bindings with `jsonc-parser` edits and its conflict rules; `steps/vendor.ts` snapshots the Docker build context; `templates/agents.ts` renders the composition; `doctor.ts` and `setup.ts` back the other commands; `versions.ts` holds the pins a generated project receives.
+- `examples/worker`: deployable composition and the CLI's standalone template; no test fixture enters this build. `examples/caller`: a consuming Worker.
 - `docker/`: the harness and sandbox images.
 
 ## Changes worth discussing
@@ -68,13 +72,13 @@ Keep validation at boundaries. Never put model or provider credentials in a sand
 
 Add a behavioral regression test for a correctness fix. Use the smallest useful layer, but use real workerd for SQLite, RPC and alarm changes and real Codex for protocol changes. Tests must not read a developer's OpenAI or Codex credentials.
 
-Update the compatibility profile and README when an endpoint, field, script or setup step changes. Generated `dist/` and binding types are not checked in. New persistent schemas need an explicit version migration and restart evidence.
+Update the compatibility profile and README when an endpoint, field, script or setup step changes; a change to the composition in `examples/worker` is a change to the CLI's template and vice versa. Generated `dist/` and binding types are not checked in. New persistent schemas need an explicit version migration and restart evidence.
 
 Pull requests state what failed before, the resulting behavior and the checks run. Keep commits focused.
 
 ## Dependencies
 
-Renovate proposes updates weekly and only for releases at least 24 hours old (`minimumReleaseAge: "1 day"` in `renovate.json`); the native runtime and Sandbox pins are excluded and bumped by hand. A new dependency needs a reason beyond saving a few lines, verified exports, compatible peers and an updated lockfile. To bump a fresh release yourself, `pnpm update <package>@<version>`, run the rows its consumers need, and note in the pull request that the release is younger than the policy and why it is needed now. A native runtime bump also updates `docker/`, `packages/agent-api/src/harnesses.ts`, the compatibility profile and the checkpoint revision; `pnpm check:docs` verifies that they agree.
+Renovate proposes updates weekly and only for releases at least 24 hours old (`minimumReleaseAge: "1 day"` in `renovate.json`); the native runtime and Sandbox pins are excluded and bumped by hand. A new dependency needs a reason beyond saving a few lines, verified exports, compatible peers and an updated lockfile. The setup CLI's three runtime dependencies are `gunshi` (typed subcommands, flags and help), `@clack/prompts` (terminal prompts and spinners) and `jsonc-parser` (comment-preserving edits of `wrangler.jsonc`); the versions it writes into generated projects live in `packages/create-cf-open-agents-api/src/versions.ts` and must move with the workspace pins (`pnpm test:cli` compares them). To bump a fresh release yourself, `pnpm update <package>@<version>`, run the rows its consumers need, and note in the pull request that the release is younger than the policy and why it is needed now. A native runtime bump also updates `docker/`, `packages/agent-api/src/harnesses.ts`, the compatibility profile and the checkpoint revision; `pnpm check:docs` verifies that they agree.
 
 ## Scope and completion
 

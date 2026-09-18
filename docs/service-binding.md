@@ -12,7 +12,9 @@ Deploy or run the [Agent Worker](deployment.md), then add this to the caller's W
 }
 ```
 
-For local development, follow the [README walkthrough](../README.md#first-run-without-a-paid-model-key); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
+For local development, follow the [README walkthrough](../README.md#first-run-from-this-repository); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
+
+When the API lives in the same Worker as your application (the setup CLI's retrofit), the binding points at the Worker itself: `{ "binding": "AGENTS", "service": "<your worker>", "entrypoint": "Agents" }`. Everything below applies unchanged; `env.AGENTS` is the same `Fetcher & AgentRPC`.
 
 Configure the same `API_TOKEN` on both Workers for the example's single-tenant authenticator. It must contain at least 32 unpredictable characters. The provider's `OPENAI_API_KEY` belongs only on the Agent Worker.
 

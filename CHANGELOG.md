@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-09-18)
 
-Nothing has been published to npm. The `v0.1.0` tag exists as history; this is the first version intended for public adopters.
+The first version on npm, under the `alpha` dist-tag. The `v0.1.0` tag exists as history and was never published.
 
 ### Fixed
 
@@ -20,6 +20,9 @@ Nothing has been published to npm. The `v0.1.0` tag exists as history; this is t
 
 ### Added
 
+- `create-cf-open-agents-api`, the setup CLI: `init` adds the API to an existing Workers project (bindings upserted into `wrangler.jsonc` with comments kept, a generated `defineAgentWorker` composition, one re-export in the entry, a `.cf-open-agents-api/` snapshot the Dockerfiles build from, `.dev.vars` with a random token, pinned dependencies) or creates a new Worker that is `examples/worker`, generated; `setup` creates the R2 buckets and puts the production secrets in one `wrangler secret bulk`; `doctor` checks the toolchain and the binding agreement rules; `vendor` refreshes the snapshot from the `postinstall` hook.
+- `defineAgentWorker` in `cf-open-agents-api/cloudflare` composes the API Worker, the `SessionDO` and the `Models` gateway entrypoint in one call and returns every class a deployment exports; the model gateway moved to `models/gateway.ts` so the Cloudflare entrypoint never loads the optional `ai` peer.
+- `bearerTenant` logs once when `API_TOKEN` is missing or shorter than 32 characters instead of rejecting every request silently; `pnpm bootstrap` writes both example `.dev.vars` files with one token; `pnpm dev` builds the library first.
 - Steering on every harness: Codex `turn/steer`, Claude Code's open prompt iterable with priority messages, OpenCode's `noReply` prompt with a rerun before settlement. A steer the runtime refuses is re-queued as the next turn.
 - Native subagents on every harness: Codex threads, Claude Code `Options.agents` with the `Task` tool, OpenCode `task` children, projected as session subagents with scoped items, turns, usage and function calls.
 - Agent settings applied natively: reasoning effort (Claude Code `Options.effort`, OpenCode provider variants), reasoning summary display, `text.format` `json_schema` structured output (Codex `outputSchema`, Claude Code `outputFormat`, OpenCode `StructuredOutput`), hosted web search on Claude Code (Anthropic `WebSearch`, `allowed_domains` enforced). `text.verbosity` and `service_tier` apply to Codex.

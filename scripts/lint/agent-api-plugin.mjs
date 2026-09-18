@@ -90,6 +90,7 @@ export const DEFAULT_ENTRYPOINTS = [
   "packages/agent-api/src/containers.ts",
   "packages/agent-api/src/catalog.ts",
   "packages/agent-api/src/models.ts",
+  "packages/agent-api/src/models/gateway.ts",
   "packages/agent-api/src/tools.ts",
 ];
 export const DEFAULT_ERROR_MODULES = [

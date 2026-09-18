@@ -6,13 +6,17 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-12",
   "compatibility_flags": ["nodejs_compat"],
-  "worker_loaders": [{ "binding": "CODE_LOADER" }],
   "observability": {
     "enabled": true,
     "traces": {
       "enabled": true
     }
   },
+  "worker_loaders": [
+    {
+      "binding": "CODE_LOADER"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {

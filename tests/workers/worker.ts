@@ -19,11 +19,13 @@ import {
   bearerTenant,
   createAgentService,
 } from "../../packages/agent-api/src/service.js";
+import { defineAgentWorker } from "../../packages/agent-api/src/worker.js";
 
 export interface TestEnv extends AgentBindings {
   SCRIPTED: DurableObjectNamespace<ScriptedHarness>;
   ASSETS: R2Bucket;
-  AGENTS: Service<BindingAgentWorker>;
+  AGENTS: Service<InstanceType<typeof BindingAgentWorker>>;
+  MODEL_GATEWAY: Fetcher;
   API_TOKEN: string;
 }
 
@@ -321,11 +323,18 @@ export class SessionDO extends service.SessionDO {}
 export class CatalogDO extends CatalogObject {}
 export default class TestWorker extends service.AgentWorker {}
 
-const bindingService = createAgentService<TestEnv>({
+// The one-call composition, exported the way the example and generated projects do:
+// destructured class bindings that Wrangler resolves by export name.
+export const { Agents: BindingAgentWorker, Models } = defineAgentWorker<TestEnv>({
   agents: { test: { harness: "fixture", model: "fixture-model" } },
   harnesses: (env) => ({ fixture: fixture(env) }),
+  models: () => ({
+    "fixture-model": {
+      fetch: async (request) =>
+        Response.json({ model: (await request.json<{ model: string }>()).model }),
+    },
+  }),
   authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
   pollIntervalMs: 60_000,
 });
-export class BindingAgentWorker extends bindingService.AgentWorker {}
 export class CallerWorker extends ExampleCallerWorker {}
