@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { versions } from "../dist/index.js";
+import { versions } from "../src/index.js";
 import { packageRoot, repoRoot } from "./helpers.js";
 
 interface PackageManifest {

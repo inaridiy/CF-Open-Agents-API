@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { Reporter } from "../dist/index.js";
+import type { Reporter } from "../src/index.js";
 
 export const packageRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const repoRoot = resolve(packageRoot, "..", "..");

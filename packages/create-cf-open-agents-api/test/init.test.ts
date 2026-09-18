@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { CliError, type InitOptions, parseDevVars, runInit } from "../dist/index.js";
+import { CliError, type InitOptions, parseDevVars, runInit } from "../src/index.js";
 import {
   cleanup,
   cliPath,

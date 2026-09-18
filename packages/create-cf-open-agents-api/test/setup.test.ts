@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { accountIds, CliError, runInit, runSetup, type SetupOptions } from "../dist/index.js";
+import { accountIds, CliError, runInit, runSetup, type SetupOptions } from "../src/index.js";
 import { cleanup, copyFixture, emptyDirectory, offline, silent } from "./helpers.js";
 
 it("extracts account ids from wrangler whoami output", () => {

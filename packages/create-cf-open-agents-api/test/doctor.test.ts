@@ -11,7 +11,7 @@ import {
   runInit,
   snapshotCheck,
   versions,
-} from "../dist/index.js";
+} from "../src/index.js";
 import {
   cleanup,
   copyFixture,

@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { CliError, ensureVendor, readVendorManifest, versions } from "../dist/index.js";
+import { CliError, ensureVendor, readVendorManifest, versions } from "../src/index.js";
 import { cleanup, emptyDirectory, repoRoot } from "./helpers.js";
 
 const snapshotOptions = (root: string, extra = {}) => ({

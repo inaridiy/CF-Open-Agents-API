@@ -10,7 +10,7 @@ import {
   HARNESSES,
   PROVIDERS,
   renderComposition,
-} from "../dist/index.js";
+} from "../src/index.js";
 import { packageRoot, repoRoot } from "./helpers.js";
 
 /** Inside the package so the provider packages resolve from its node_modules. */

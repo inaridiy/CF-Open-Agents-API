@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { ensureDevVars, ensureDevVarsExample, Files, parseDevVars } from "../dist/index.js";
+import { ensureDevVars, ensureDevVarsExample, Files, parseDevVars } from "../src/index.js";
 import { cleanup, emptyDirectory, read } from "./helpers.js";
 
 it("parses KEY=value lines and ignores comments", () => {

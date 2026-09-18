@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { type InitOptions, runInit, workerNameFrom } from "../dist/index.js";
+import { type InitOptions, runInit, workerNameFrom } from "../src/index.js";
 import {
   cleanup,
   emptyDirectory,
