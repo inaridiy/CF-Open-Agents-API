@@ -8,6 +8,7 @@ export { detectPackageManager, locateProject, workerNameFrom } from "./project.j
 export { accountIds, runSetup, type SetupOptions } from "./setup.js";
 export { ensureDevVars, ensureDevVarsExample, parseDevVars } from "./steps/dev-vars.js";
 export { agentsSpecifier } from "./steps/entry.js";
+export { ensurePnpmBuilds, PNPM_BUILDS } from "./steps/pnpm-builds.js";
 export { ensureVendor, readVendorManifest, type VendorManifest } from "./steps/vendor.js";
 export { upsertWranglerConfig, type WranglerInput } from "./steps/wrangler.js";
 export {

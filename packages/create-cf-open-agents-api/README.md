@@ -2,7 +2,7 @@
 
 Adds the [CF-Open-Agents-API](https://github.com/inaridiy/CF-Open-Agents-API) to a Cloudflare Workers project you already have, or creates a new Worker for it. One run writes the bindings, the composition, the Docker image snapshot and the local secrets; a second command provisions the R2 buckets and production secrets.
 
-The library and this CLI are pre-release. Until they are on npm's `latest` tag, run them with the `@alpha` tag and see [Before the packages are published](#before-the-packages-are-published).
+The library and this CLI are pre-release and publish under the npm `alpha` dist-tag; run them with `@alpha`. To try an unpublished change, see [Running an unpublished checkout](#running-an-unpublished-checkout).
 
 ## Add the API to an existing Workers project
 
@@ -26,6 +26,7 @@ pnpm dev            # or: pnpm exec wrangler dev — Docker must be running
 | `.dev.vars`, `.dev.vars.example` | A random `API_TOKEN` (32+ characters), the provider key line and `LOCAL_BACKUPS=true` for local development                                                                                                                                                                                                                                                                                 |
 | `package.json`                   | `cf-open-agents-api` with its peers `effect`, `openai`, `ai`, `zod`, the provider package, this CLI as a devDependency and `postinstall: create-cf-open-agents-api vendor`. Other versions you already pinned are kept (`--force` overwrites)                                                                                                                                               |
 | `.gitignore`, `tsconfig.json`    | Ignore the snapshot and `.dev.vars`; exclude the snapshot from a broad `include`                                                                                                                                                                                                                                                                                                            |
+| `pnpm-workspace.yaml`            | pnpm projects only (a `packageManager` field, a lockfile, or the CLI run through `pnpm dlx`): `allowBuilds` for `esbuild` and `workerd`, without which pnpm 11 fails `pnpm exec wrangler` with `ERR_PNPM_IGNORED_BUILDS`. A project inside a pnpm workspace gets a note naming the workspace file instead                                                                                   |
 
 Your Worker reaches the API through the `AGENTS` binding, which points at this Worker's `Agents` entrypoint:
 
@@ -76,9 +77,9 @@ pnpm exec wrangler deploy                          # builds and pushes both imag
 
 Containers need the Workers Paid plan. The R2 API token (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`) comes from the Cloudflare dashboard, R2 → Manage R2 API Tokens, with Object Read & Write on the workspaces bucket; `setup` tells you when it needs it. `LOCAL_BACKUPS` stays out of production.
 
-## Before the packages are published
+## Running an unpublished checkout
 
-`init` pins `cf-open-agents-api` and this CLI to its own version; `pnpm install` needs them on npm. Until then, build both from a checkout and point the CLI at the tarballs:
+`init` pins `cf-open-agents-api` and this CLI to its own version, which `pnpm install` takes from npm. To try a change before it is published, build both from a checkout and point the CLI at the tarballs:
 
 ```sh
 git clone https://github.com/inaridiy/CF-Open-Agents-API.git && cd CF-Open-Agents-API
@@ -86,7 +87,7 @@ pnpm install --frozen-lockfile && pnpm build
 pnpm --filter cf-open-agents-api pack --pack-destination /tmp/cfo
 pnpm --filter create-cf-open-agents-api pack --pack-destination /tmp/cfo
 node packages/create-cf-open-agents-api/dist/cli.js init <your-project> \
-  --source "$PWD" --library /tmp/cfo/cf-open-agents-api-0.2.0.tgz --cli-package /tmp/cfo/create-cf-open-agents-api-0.2.0.tgz
+  --source "$PWD" --library /tmp/cfo/cf-open-agents-api-<version>.tgz --cli-package /tmp/cfo/create-cf-open-agents-api-<version>.tgz
 ```
 
 `--source` snapshots the checkout instead of downloading a tag archive; `--library` and `--cli-package` write `file:` dependencies.
