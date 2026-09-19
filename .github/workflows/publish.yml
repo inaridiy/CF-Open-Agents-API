@@ -49,8 +49,17 @@ jobs:
           pnpm --filter create-cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
       # The library first: the CLI's generated projects depend on it, and its `vendor`
       # step downloads this tag's archive, which exists once the tag is pushed.
+      # A version already on npm is skipped so a run that failed after the library
+      # published (for example the CLI's trusted publisher missing the publish action)
+      # can be re-run and only publishes what is missing.
       - name: Publish alpha with npm trusted publishing
         run: |
           for tarball in "$RUNNER_TEMP"/release/cf-open-agents-api-*.tgz "$RUNNER_TEMP"/release/create-cf-open-agents-api-*.tgz; do
+            name=$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name")
+            version=$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already on npm; skipping"
+              continue
+            fi
             npm publish "$tarball" --access public --tag alpha --provenance
           done
