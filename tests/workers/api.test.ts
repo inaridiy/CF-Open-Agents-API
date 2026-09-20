@@ -33,6 +33,15 @@ function client(tenant = "tenant-a") {
   });
 }
 const params = { agent: { model: "test" }, environment: { type: "none" as const } };
+/** The session's status once no turn is in progress, polled briefly: a natural alarm may still be finishing. */
+async function settledStatus(id: string) {
+  for (let i = 0; i < 100; i++) {
+    const { status } = await client().beta.agents.sessions.retrieve(id);
+    if (status !== "in_progress") return status;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return (await client().beta.agents.sessions.retrieve(id)).status;
+}
 const stub = (id: string, tenant = "tenant-a") =>
   env.SESSIONS.getByName(JSON.stringify([tenant, id]));
 afterEach(async () => {
@@ -207,7 +216,8 @@ it("isolates tenants and validates unsupported features before creating state", 
     input: "hello",
   });
   await runDurableObjectAlarm(stub(capable.id));
-  expect((await client().beta.agents.sessions.retrieve(capable.id)).status).toBe("idle");
+  // The alarm armed at creation may already be running this tick; wait for it to settle.
+  expect(await settledStatus(capable.id)).toBe("idle");
 });
 
 it("resolves deployment-owned delegation targets when subagents are enabled", async () => {

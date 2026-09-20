@@ -98,10 +98,14 @@ function createProviderHandler(state: ChildState) {
 const hasSubagentTurn = async (job: CodexJob) =>
   (await runPromise(job.poll(0))).events.some(({ event }) => event.type === "subagent_turn");
 
+// A loaded CI runner can take well over five seconds to spawn a child thread; the
+// loops return as soon as the condition holds, so the bound only matters on failure.
+const WAIT_ROUNDS = 1_200;
+
 async function waitForRootText(job: CodexJob, text: string) {
   for (
     let i = 0;
-    i < 200 &&
+    i < WAIT_ROUNDS &&
     !(await runPromise(job.poll(0))).events.some(
       ({ event }) => event.type === "text" && event.text === text,
     );
@@ -111,11 +115,11 @@ async function waitForRootText(job: CodexJob, text: string) {
 }
 
 async function waitForSubagentTurn(job: CodexJob) {
-  for (let i = 0; i < 200 && !(await hasSubagentTurn(job)); i++) await delay(25);
+  for (let i = 0; i < WAIT_ROUNDS && !(await hasSubagentTurn(job)); i++) await delay(25);
 }
 
 async function waitUntilSettled(job: CodexJob) {
-  for (let i = 0; i < 200 && (await runPromise(job.poll(0))).status === "running"; i++)
+  for (let i = 0; i < WAIT_ROUNDS && (await runPromise(job.poll(0))).status === "running"; i++)
     await delay(25);
 }
 
