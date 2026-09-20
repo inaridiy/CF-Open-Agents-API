@@ -43,6 +43,19 @@ const resetActivity = (id: string) =>
       session: { ...record.session, last_active_at: 0 },
     });
   });
+/**
+ * Zero `last_active_at` and run the reconciler in one Durable Object event, so the alarm
+ * a command armed cannot settle the turn between the reset and the tick.
+ */
+const resetActivityAndTick = (id: string) =>
+  runInDurableObject<SessionDO, void>(stub(id), async (instance) => {
+    const record = instance.db.require(SessionKinds.state, "session");
+    instance.db.put(SessionKinds.state, "session", {
+      ...record,
+      session: { ...record.session, last_active_at: 0 },
+    });
+    await instance.alarm();
+  });
 afterEach(() => reset());
 
 it("last_active_at moves on every accepted input and when a turn settles", async () => {
@@ -58,8 +71,7 @@ it("last_active_at moves on every accepted input and when a turn settles", async
     events: [{ type: "agent.session.input.cancel" }],
   });
   expect((await api.beta.agents.sessions.retrieve(session.id)).last_active_at).toBeGreaterThan(0);
-  await resetActivity(session.id);
-  await runDurableObjectAlarm(stub(session.id));
+  await resetActivityAndTick(session.id);
   const settled = await api.beta.agents.sessions.retrieve(session.id);
   expect(settled.status).toBe("idle");
   expect(settled.last_active_at).toBeGreaterThan(0);
