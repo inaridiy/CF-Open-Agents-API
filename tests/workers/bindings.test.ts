@@ -2,9 +2,11 @@
 
 import { reset, runDurableObjectAlarm } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
+import OpenAI from "openai";
 import { afterEach, expect, it } from "vitest";
 
 import { agentClient } from "../../examples/caller/src/index.js";
+import { tenantFetch } from "../../packages/agent-api/src/cloudflare.js";
 import type {
   AgentSession,
   AgentSessionItem,
@@ -115,4 +117,44 @@ it("binding HTTP preserves authentication and RPC preserves tenant and page vali
     Promise.resolve(env.AGENTS.listTurns("default", session.id, { limit: 101 })),
   ).rejects.toMatchObject({ name: "AgentApiError:400:invalid_request" });
   expect((await env.AGENTS.listItems("default", session.id, { limit: 1 })).data).toHaveLength(1);
+});
+
+it("fetchAs serves the HTTP API as the caller's tenant without a bearer token", async () => {
+  const api = (tenant: string, path: string, init?: RequestInit) =>
+    env.AGENTS.fetchAs(
+      tenant,
+      new Request(`https://agents.internal${path}`, {
+        ...init,
+        headers: { "content-type": "application/json", "Idempotency-Key": "fetch-as-task" },
+      }),
+    );
+  const created = await api("default", "/v1/agents/sessions", {
+    method: "POST",
+    body: JSON.stringify(parameters),
+  });
+  expect(created.status).toBe(200);
+  const session = await created.json<AgentSession>();
+  expect(created.headers.get("x-request-id")).toBeTruthy();
+  // The official client needs no token either: the binding is the credential. The SDK
+  // attaches an AbortSignal, which RPC cannot clone; tenantFetch handles it on this side.
+  const client = new OpenAI({
+    apiKey: "service-binding",
+    baseURL: "https://agents.internal/v1",
+    fetch: tenantFetch(env.AGENTS, "default"),
+  });
+  expect((await client.beta.agents.sessions.retrieve(session.id)).id).toBe(session.id);
+  const aborted = new AbortController();
+  aborted.abort();
+  await expect(
+    tenantFetch(env.AGENTS, "default")("https://agents.internal/v1/agents/sessions", {
+      signal: aborted.signal,
+    }),
+  ).rejects.toMatchObject({ name: "AbortError" });
+  // Ownership is still checked within the tenant the caller named.
+  expect((await api("another-tenant", `/v1/agents/sessions/${session.id}`)).status).toBe(404);
+  await expect(
+    Promise.resolve(
+      env.AGENTS.fetchAs("", new Request("https://agents.internal/v1/agents/sessions")),
+    ),
+  ).rejects.toMatchObject({ name: expect.stringContaining("invalid_tenant") as string });
 });

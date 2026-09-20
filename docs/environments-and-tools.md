@@ -4,12 +4,12 @@ Use the `client` from the [Service Binding guide](service-binding.md#connect-the
 
 ## Images, web search and streamed progress
 
-Hosted web search needs a preset whose model connection provides it (`webSearch: true`, like the example's `coding` preset) on Codex or Claude Code. OpenCode has no hosted search; expose search as a function tool there. Images work on every harness; the portable AI SDK adapter still needs a provider that accepts them.
+Hosted web search needs a preset on Codex or Claude Code whose model connection provides it: `webSearch: true` on a preset whose gateway entry is a `nativeModel` connection, like the example's `codex` preset. The portable AI SDK adapter does not carry hosted search. OpenCode has no hosted search; expose search as a function tool there. Images work on every harness; the portable AI SDK adapter still needs a provider that accepts them.
 
 ```ts
 const visual = await client.beta.agents.sessions.create({
   agent: {
-    model: "coding",
+    model: "codex",
     reasoning: { summary: "detailed" },
     tools: [{ type: "web_search", mode: "cached", allowed_domains: ["developer.mozilla.org"] }],
   },
@@ -75,7 +75,7 @@ Ask for a JSON document with `text.format`; every harness enforces the schema na
 ```ts
 const structured = await client.beta.agents.sessions.create({
   agent: {
-    model: "coding",
+    model: "codex",
     text: {
       format: {
         type: "json_schema",
@@ -121,7 +121,7 @@ const template = await client.beta.agents.environments.templates.create({
   setup_commands: [{ command: "mkdir -p /workspace/outputs", cwd: "/workspace" }],
 });
 const session = await client.beta.agents.sessions.create({
-  agent: { model: "coding", reasoning: { effort: "high" } },
+  agent: { model: "codex", reasoning: { effort: "high" } },
   environment: { type: "openai_hosted", environment_template_id: template.id },
 });
 ```
@@ -190,7 +190,7 @@ const credential = await client.beta.agents.vaults.credentials.create(vault.id, 
 });
 const withMcp = await client.beta.agents.sessions.create({
   agent: {
-    model: "coding",
+    model: "codex",
     tools: [
       {
         type: "mcp",
@@ -219,7 +219,7 @@ Environment-origin HTTP and stdio MCP servers run inside the execution environme
 ```ts
 const batch = await client.beta.agents.sessions.create({
   agent: {
-    model: "coding",
+    model: "codex",
     tools: [
       { type: "programmatic_tool_calling" },
       {
@@ -248,7 +248,7 @@ With `multi_agent.enabled`, every harness may start native subagents: Codex thre
 
 ```ts
 const parallel = await client.beta.agents.sessions.create({
-  agent: { model: "coding", multi_agent: { enabled: true, max_concurrent_subagents: 3 } },
+  agent: { model: "codex", multi_agent: { enabled: true, max_concurrent_subagents: 3 } },
   environment: { type: "openai_hosted" },
 });
 let rootTurnId: string | undefined;
@@ -273,7 +273,7 @@ for await (const child of client.beta.agents.sessions.subagents.list(parallel.id
 
 Child turns share the session event stream. Use the turn's `subagent_id` to associate lifecycle events, and `turn_id` to associate text. A child's terminal event is not the root turn's completion; the root completes after its children. A child's function calls appear in `required_actions` with the child's `turn_id`, and SDK `toolHandlers` answer them like any other call. The runtime decides whether to delegate; enabling subagents allows it but does not force a decomposition. Children are single-turn and cannot delegate further.
 
-The example deployment lets `coding`, `claude` and `opencode` delegate to each other; see [extending](extending.md#presets-harnesses-and-the-model-gateway) for the configuration.
+The example deployment lets `codex`, `claude` and `opencode` delegate to each other; see [extending](extending.md#presets-harnesses-and-the-model-gateway) for the configuration.
 
 ## Fork a session
 

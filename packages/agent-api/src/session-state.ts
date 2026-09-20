@@ -16,6 +16,8 @@ import {
   TurnCheckpointing,
   UnknownToolCall,
 } from "./errors.js";
+import type { Kind } from "./persistence/kind.js";
+import type { ListFilter } from "./persistence/record-store.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import {
   type ActiveSession,
@@ -99,7 +101,16 @@ function delegates(
   if (!record.agent.multi_agent?.enabled) return undefined;
   const targets = (agents[record.session.agent.model]?.delegates ?? []).flatMap((alias) => {
     const target = agents[alias];
-    return target ? [{ alias, harness: target.harness, model: target.model }] : [];
+    return target
+      ? [
+          {
+            alias,
+            harness: target.harness,
+            model: target.model,
+            ...(target.tiers ? { tiers: target.tiers } : {}),
+          },
+        ]
+      : [];
   });
   return targets.length ? targets : undefined;
 }
@@ -124,6 +135,7 @@ export function begin(
       agent: record.agent,
       harness: record.driver,
       model: record.model,
+      ...(record.tiers ? { tiers: record.tiers } : {}),
       input: record.inheritedTranscript
         ? [transcriptMessage(record.inheritedTranscript), ...input]
         : input,
@@ -297,46 +309,65 @@ export function commitCheckpoint(
     } satisfies ArtifactRecord);
   complete(tx, config, { ...record, checkpoint }, "completed");
 }
+/** Every page of `kind` under `filter`, folded through `f`. */
+function eachRecord<A>(
+  tx: SessionTx,
+  kind: Parameters<SessionTx["store"]["list"]>[0] & Kind<A>,
+  filter: ListFilter | undefined,
+  f: (record: A) => void,
+): void {
+  let after: string | undefined;
+  do {
+    const page = tx.store.list(kind, { order: "asc", limit: 100, after }, filter);
+    for (const record of page.data) f(record);
+    after = page.has_more ? (page.last_id ?? undefined) : undefined;
+  } while (after);
+}
+/**
+ * The child turns a sealing root turn closes. A completed root publishes the children the
+ * pending index holds (finished, awaiting this checkpoint). A failed or cancelled root
+ * closes every subagent turn still `in_progress` or `waiting`; those are read by status
+ * rather than by scanning every turn the session ever ran.
+ */
+function openChildTurns(tx: SessionTx, status: "completed" | "cancelled" | "failed"): Turn[] {
+  const open: Turn[] = [];
+  if (status === "completed") {
+    eachRecord(tx, SessionKinds.pendingSubagentTurn, undefined, (turn) => open.push(turn));
+    return open;
+  }
+  for (const value of ["in_progress", "waiting"] as const)
+    eachRecord(tx, SessionKinds.turn, { field: "status", value }, (turn) => {
+      if (turn.subagent_id) open.push(turn);
+    });
+  return open;
+}
 function closeChildTurns(
   tx: SessionTx,
   record: Fenced<ActiveSession>,
   status: "completed" | "cancelled" | "failed",
   turnError: SessionTurnError | null,
 ): void {
-  let after: string | undefined;
-  do {
-    const page = tx.store.list(
-      status === "completed" ? SessionKinds.pendingSubagentTurn : SessionKinds.turn,
-      { order: "asc", limit: 100, after },
-    );
-    for (const pending of page.data) {
-      if (
-        status !== "completed" &&
-        (!pending.subagent_id || !["in_progress", "waiting"].includes(pending.status))
-      )
-        continue;
-      const child: Turn =
-        status === "completed"
-          ? pending
-          : {
-              ...pending,
-              status,
-              completed_at: Math.floor(Date.now() / 1000),
-              error: turnError,
-            };
-      tx.putTurn(child);
-      finishOutputItems(tx, record, child.id, SessionKinds.subagentItem(child.subagent_id ?? ""));
-      tx.emit({
-        type: `agent.session.turn.${status}`,
-        event_id: identifier("evt"),
-        session_id: record.session.id,
-        turn_id: child.id,
-        turn: child,
-        usage: child.usage,
-      });
-    }
-    after = page.has_more ? (page.last_id ?? undefined) : undefined;
-  } while (after);
+  for (const pending of openChildTurns(tx, status)) {
+    const child: Turn =
+      status === "completed"
+        ? pending
+        : {
+            ...pending,
+            status,
+            completed_at: Math.floor(Date.now() / 1000),
+            error: turnError,
+          };
+    tx.putTurn(child);
+    finishOutputItems(tx, record, child.id, SessionKinds.subagentItem(child.subagent_id ?? ""));
+    tx.emit({
+      type: `agent.session.turn.${status}`,
+      event_id: identifier("evt"),
+      session_id: record.session.id,
+      turn_id: child.id,
+      turn: child,
+      usage: child.usage,
+    });
+  }
   tx.store.clear(SessionKinds.pendingSubagentTurn);
 }
 /** Seal the turn, together with the checkpoint and event log, in one transaction. */

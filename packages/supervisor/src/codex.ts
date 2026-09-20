@@ -1,12 +1,50 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { Execution, RuntimeCommand, RuntimeEvent } from "cf-open-agents-api";
+import type { Execution, RuntimeCommand } from "cf-open-agents-api";
 import { attempt, io, type JsonValue, programmaticTool, workspaceTools } from "cf-open-agents-api";
 import { Deferred, Effect, type Scope, Stream } from "effect";
 import { z } from "zod";
 
 import { restore } from "./checkpoint.js";
+import {
+  type CodexConfig,
+  configToml,
+  environmentsToml,
+  mcpServers,
+  searchConfig,
+} from "./codex-config.js";
+import {
+  type ChildState,
+  childId,
+  childStateSchema,
+  childTurnId,
+  childTurnSchema,
+  childTurnStatus,
+  type CollabItem,
+  collabItem,
+  collaborationOperation,
+  commandStatus,
+  type CompletedItem,
+  completedItem,
+  contentItems,
+  itemDeltaUpdate,
+  type Origin,
+  originParams,
+  reasoningItem,
+  reasoningSummaryUpdate,
+  rootTurnSchema,
+  threadResponse,
+  threadStartedNotification,
+  type TokenUsage,
+  tokenUsageUpdate,
+  toolCall,
+  turnErrorCode,
+  turnResponse,
+  userInputRequest,
+  webSearchEvent,
+  webSearchItem,
+} from "./codex-protocol.js";
 import { DELEGATION_TOOLS } from "./delegation.js";
 import { Job, type JobOptions, ToolUnavailable } from "./job.js";
 import { AppServer, type RpcFailure, type RpcMessage } from "./json-rpc.js";
@@ -17,7 +55,6 @@ import {
   ExecutionCancelled,
   ExecutionStopped,
   type TaggedFailure,
-  type TurnErrorCode,
 } from "./lifecycle.js";
 import {
   CodeCallsOutstanding,
@@ -28,333 +65,14 @@ import {
 } from "./programmatic.js";
 import { executeWorkspace } from "./workspace.js";
 
-const threadResponse = z.object({ thread: z.object({ id: z.string() }) });
-const turnResponse = z.object({ turn: z.object({ id: z.string() }) });
-const toolCall = z.object({ callId: z.string(), tool: z.string(), arguments: z.json() });
-/** EXPERIMENTAL `item/tool/requestUserInput` server request (ToolRequestUserInputParams). */
-const userInputRequest = z.object({
-  itemId: z.string(),
-  questions: z.array(
-    z.object({
-      id: z.string(),
-      header: z.string(),
-      question: z.string(),
-      options: z
-        .array(z.object({ label: z.string(), description: z.string() }))
-        .nullable()
-        .optional(),
-    }),
-  ),
-});
-/** Codex error variants with one public code each; transport variants are handled apart. */
-const CODEX_ERROR_CODES: ReadonlyMap<string, TurnErrorCode> = new Map([
-  ["contextWindowExceeded", "context_length_exceeded"],
-  ["sessionBudgetExceeded", "session_budget_exceeded"],
-  ["usageLimitExceeded", "usage_limit_exceeded"],
-  ["rateLimitExceeded", "rate_limit_exceeded"],
-  ["serverOverloaded", "server_overloaded"],
-  ["cyberPolicy", "cyber_policy"],
-  ["misalignmentPolicyViolation", "cyber_policy"],
-  ["internalServerError", "server_error"],
-  ["unauthorized", "authentication_error"],
-  ["badRequest", "invalid_request"],
-  ["sandboxError", "sandbox_error"],
-  ["activeTurnNotSteerable", "active_turn_not_steerable"],
-]);
-/**
- * Transport variants: Codex reports the upstream HTTP status it gave up on, and
- * that status is more informative than the wrapper (e.g. 429 after retries).
- */
-const CONNECTION_VARIANTS = new Set([
-  "httpConnectionFailed",
-  "responseStreamConnectionFailed",
-  "responseStreamDisconnected",
-  "responseTooManyFailedAttempts",
-]);
-const variantDetail = z.object({ httpStatusCode: z.number().nullish() });
-/** `codexErrorInfo` is a camelCase enum string or a single-key object such as `{ httpConnectionFailed: { httpStatusCode } }`. */
-function errorVariant(info: unknown): { variant?: string; httpStatusCode?: number } {
-  if (typeof info === "string") return { variant: info };
-  if (!info || typeof info !== "object") return {};
-  const [variant] = Object.keys(info);
-  if (variant === undefined) return {};
-  const detail = variantDetail.safeParse((info as Record<string, unknown>)[variant]);
-  return {
-    variant,
-    httpStatusCode: detail.success ? (detail.data.httpStatusCode ?? undefined) : undefined,
-  };
-}
-/**
- * Translate Codex's `TurnError.codexErrorInfo` to the public `SessionTurnError.code`
- * vocabulary. Codex 0.154.0 classifies most provider HTTP failures as `other` and
- * keeps the status and upstream body in the message, so unknown variants read the
- * message before falling back to `internal_error`.
- */
-export function turnErrorCode(info: unknown, message = ""): TurnErrorCode {
-  const { variant, httpStatusCode: status } = errorVariant(info);
-  if (variant !== undefined && CONNECTION_VARIANTS.has(variant))
-    return httpStatusCode(status) ?? "connection_failed";
-  const known = variant === undefined ? undefined : CODEX_ERROR_CODES.get(variant);
-  return known ?? messageErrorCode(message) ?? "internal_error";
-}
-function httpStatusCode(status: number | undefined): TurnErrorCode | undefined {
-  if (status === undefined) return undefined;
-  if (status === 401 || status === 403) return "authentication_error";
-  if (status === 404) return "resource_not_found";
-  if (status === 429) return "rate_limit_exceeded";
-  if (status === 503 || status === 529) return "server_overloaded";
-  if (status >= 500) return "server_error";
-  if (status === 400 || status === 422) return "invalid_request";
-  return undefined;
-}
-function messageErrorCode(message: string): TurnErrorCode | undefined {
-  if (/context_length_exceeded|context[ _]window|exceeds the context/i.test(message))
-    return "context_length_exceeded";
-  if (/insufficient_quota|usage_limit_reached|usage_not_included/i.test(message))
-    return "usage_limit_exceeded";
-  const status = /\bstatus:?\s*(\d{3})\b/i.exec(message)?.[1];
-  return status ? httpStatusCode(Number(status)) : undefined;
-}
-const tokenUsage = z.object({
-  inputTokens: z.number().int().nonnegative(),
-  cachedInputTokens: z.number().int().nonnegative(),
-  outputTokens: z.number().int().nonnegative(),
-  reasoningOutputTokens: z.number().int().nonnegative(),
-  totalTokens: z.number().int().nonnegative(),
-});
-const completedItem = z.object({
-  item: z.discriminatedUnion("type", [
-    z.object({
-      type: z.literal("mcpToolCall"),
-      id: z.string(),
-      server: z.string(),
-      tool: z.string(),
-      status: z.string(),
-      arguments: z.json(),
-      result: z.json(),
-      error: z.json(),
-    }),
-    z.object({
-      type: z.literal("agentMessage"),
-      id: z.string(),
-      text: z.string(),
-      phase: z.enum(["commentary", "final_answer"]).nullable().optional(),
-    }),
-    z.object({
-      type: z.literal("commandExecution"),
-      id: z.string(),
-      command: z.string(),
-      aggregatedOutput: z.string().nullable().optional(),
-      exitCode: z.number().nullable().optional(),
-      cwd: z.string().nullable().optional(),
-      durationMs: z.number().nullable().optional(),
-      status: z.string().optional(),
-    }),
-  ]),
-});
-const childStateSchema = z.object({
-  parent: z.string(),
-  name: z.string().nullable(),
-  instructions: z.string().nullable(),
-  openedAt: z.number(),
-  closed: z.boolean(),
-  active: z.boolean(),
-  turnId: z.string().optional(),
-});
-type ChildState = z.infer<typeof childStateSchema>;
-type CompletedItem = z.infer<typeof completedItem>["item"];
-const childId = (id: string) => `subagent_${id.replaceAll("-", "")}`;
-const childTurnId = (id: string) => `turn_${id.replaceAll("-", "")}`;
-
-// --- App-server notification shapes -----------------------------------------------------
-
-/** Where a notification comes from: the native thread it names and, for a child, its public scope. */
-interface Origin {
-  readonly nativeThread?: string;
-  readonly child?: ChildState;
-  readonly scope: { subagentId?: string; turnId?: string };
-}
-const originParams = z.object({ threadId: z.string().optional(), turnId: z.string().optional() });
-const threadStartedNotification = z.object({
-  thread: z.object({
-    id: z.string(),
-    parentThreadId: z.string().nullable(),
-    createdAt: z.number(),
-    agentNickname: z.string().nullable().optional(),
-  }),
-});
-const childTurnSchema = z.object({
-  turn: z.object({
-    id: z.string(),
-    status: z.string(),
-    startedAt: z.number().nullable(),
-    completedAt: z.number().nullable(),
-  }),
-});
-const rootTurnSchema = z.object({
-  turn: z.object({
-    status: z.string(),
-    error: z
-      .object({
-        message: z.string(),
-        codexErrorInfo: z.unknown().optional(),
-        additionalDetails: z.string().nullable().optional(),
-      })
-      .nullable()
-      .optional(),
-  }),
-});
-const tokenUsageUpdate = z.object({
-  turnId: z.string(),
-  tokenUsage: z.object({ last: tokenUsage, total: tokenUsage }),
-});
-const itemDeltaUpdate = z.object({ itemId: z.string(), delta: z.string() });
-const reasoningSummaryUpdate = z.object({
-  itemId: z.string(),
-  summaryIndex: z.number().int().nonnegative(),
-  delta: z.string().optional(),
-});
-const reasoningItem = z.object({
-  item: z.object({
-    type: z.literal("reasoning"),
-    id: z.string(),
-    summary: z.array(z.string()).default([]),
-  }),
-});
-const webSearchItem = z.object({
-  item: z.object({
-    type: z.literal("webSearch"),
-    id: z.string(),
-    query: z.string(),
-    action: z
-      .discriminatedUnion("type", [
-        z.object({
-          type: z.literal("search"),
-          query: z.string().nullable().optional(),
-          queries: z.array(z.string()).nullable().optional(),
-        }),
-        z.object({ type: z.literal("openPage"), url: z.string().nullable().optional() }),
-        z.object({
-          type: z.literal("findInPage"),
-          url: z.string().nullable().optional(),
-          pattern: z.string().nullable().optional(),
-        }),
-        z.object({ type: z.literal("other") }),
-      ])
-      .nullable()
-      .optional(),
-  }),
-});
-type WebSearchItem = z.infer<typeof webSearchItem>["item"];
-const collabItem = z.object({
-  item: z.object({
-    type: z.literal("collabAgentToolCall"),
-    id: z.string(),
-    tool: z.string(),
-    status: z.string(),
-    senderThreadId: z.string(),
-    receiverThreadIds: z.array(z.string()),
-    prompt: z.string().nullable(),
-    model: z.string().nullable(),
-    reasoningEffort: z.string().nullable(),
-  }),
-});
-type CollabItem = z.infer<typeof collabItem>["item"];
-const collaborationOperation = z.enum([
-  "spawnAgent",
-  "sendInput",
-  "resumeAgent",
-  "wait",
-  "closeAgent",
-  "sendMessage",
-  "followupTask",
-  "interruptAgent",
-]);
-
-function searchAction(
-  action: WebSearchItem["action"],
-): Extract<RuntimeEvent, { type: "web_search" }>["action"] {
-  if (!action) return null;
-  switch (action.type) {
-    case "search":
-      return { type: "search", query: action.query ?? null, queries: action.queries ?? null };
-    case "openPage":
-      return { type: "open_page", url: action.url ?? null };
-    case "findInPage":
-      return { type: "find_in_page", url: action.url ?? null, pattern: action.pattern ?? null };
-    case "other":
-      return { type: "other" };
-  }
-}
-const webSearchEvent = (
-  item: WebSearchItem,
-  status: "in_progress" | "completed",
-  scope: Origin["scope"],
-): RuntimeEvent => ({
-  ...scope,
-  type: "web_search",
-  id: item.id,
-  status,
-  action: searchAction(item.action),
-});
-/** A running child turn is in progress; a finished one reads Codex's own status. */
-function childTurnStatus(
-  active: boolean,
-  status: string,
-): "in_progress" | "completed" | "cancelled" | "failed" {
-  if (active) return "in_progress";
-  if (status === "completed") return "completed";
-  return status === "interrupted" ? "cancelled" : "failed";
-}
-/** Codex reports a status for declined and failed commands; otherwise the exit code decides. */
-function commandStatus(
-  item: Extract<CompletedItem, { type: "commandExecution" }>,
-): "completed" | "failed" | "incomplete" {
-  if (item.status === "completed") return "completed";
-  if (item.status === "declined" || item.status === "failed") return "failed";
-  if (item.exitCode === null || item.exitCode === undefined) return "incomplete";
-  return item.exitCode === 0 ? "completed" : "failed";
-}
-type WebSearchTool = Extract<
-  NonNullable<Execution["agent"]["tools"]>[number],
-  { type: "web_search" }
->;
-/** A client tool result as Codex's `contentItems`. */
-const contentItems = (command: Extract<RuntimeCommand, { type: "tool_result" }>) =>
-  typeof command.output === "string"
-    ? [{ type: "inputText", text: command.output }]
-    : command.output.map((part) =>
-        part.type === "input_text"
-          ? { type: "inputText", text: part.text }
-          : { type: "inputImage", imageUrl: part.image_url },
-      );
-const searchConfig = (tool: WebSearchTool) => ({
-  context_size: tool.context_size ?? "medium",
-  ...(tool.allowed_domains == null ? {} : { allowed_domains: tool.allowed_domains }),
-  ...(tool.location == null ? {} : { location: tool.location }),
-});
+export { messageErrorCode, turnErrorCode } from "./codex-protocol.js";
 
 export interface CodexOptions extends JobOptions {
   binary: string;
   modelBaseUrl: string;
-  /**
-   * Deployment-owned additions to the generated Codex config: extra `[features]`
-   * flags and `[model_providers.gateway]` keys such as retry counts. Values are
-   * written as TOML literals; they cannot change the provider URL or auth.
-   */
-  codexConfig?: {
-    features?: Record<string, boolean>;
-    provider?: Record<string, string | number | boolean>;
-  };
+  /** See `CodexConfig`. */
+  codexConfig?: CodexConfig;
 }
-const RESERVED_PROVIDER_KEYS = new Set(["name", "base_url", "wire_api", "requires_openai_auth"]);
-const tomlLines = (
-  entries: Record<string, string | number | boolean> | undefined,
-  reserved = new Set<string>(),
-) =>
-  Object.entries(entries ?? {})
-    .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && !reserved.has(key))
-    .map(([key, value]) => `${key} = ${JSON.stringify(value)}`);
 
 /** One instance per attempt. Workspace I/O goes through the remote environment. */
 export class CodexJob extends Job {
@@ -364,10 +82,7 @@ export class CodexJob extends Job {
   private readonly children = new Map<string, ChildState>();
   private rootOutcome?: "completed" | "cancelled";
   private cancelRequested = false;
-  private readonly usageByTurn = new Map<
-    string,
-    { lastTotal: string; usage: z.infer<typeof tokenUsage> }
-  >();
+  private readonly usageByTurn = new Map<string, { lastTotal: string; usage: TokenUsage }>();
   private readonly pendingTools = new Map<string, string | number>();
   private readonly codeInvocations = new Map<
     string,
@@ -416,78 +131,6 @@ export class CodexJob extends Job {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
   }
-  private config(searchMode: string): string {
-    return [
-      'model_provider = "gateway"',
-      `model = ${JSON.stringify(this.execution.model)}`,
-      'approval_policy = "never"',
-      'sandbox_mode = "danger-full-access"',
-      `web_search = ${JSON.stringify(searchMode)}`,
-      ...(this.execution.agent.reasoning?.effort
-        ? [`model_reasoning_effort = ${JSON.stringify(this.execution.agent.reasoning.effort)}`]
-        : []),
-      ...(this.execution.agent.reasoning?.summary
-        ? [`model_reasoning_summary = ${JSON.stringify(this.execution.agent.reasoning.summary)}`]
-        : []),
-      ...(this.execution.agent.text?.verbosity
-        ? [`model_verbosity = ${JSON.stringify(this.execution.agent.text.verbosity)}`]
-        : []),
-      "[features]",
-      `multi_agent = ${this.execution.agent.multi_agent?.enabled ?? false}`,
-      `plugins = ${!!this.execution.capabilityRoots?.length}`,
-      `remote_plugin = ${!!this.execution.capabilityRoots?.length}`,
-      `executor_capability_discovery = ${!!this.execution.capabilityRoots?.length}`,
-      ...(this.execution.agent.tools?.some(
-        (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
-      )
-        ? ["tool_search = true"]
-        : []),
-      ...tomlLines(this.options.codexConfig?.features),
-      "[agents]",
-      `max_concurrent_threads_per_session = ${this.execution.agent.multi_agent?.max_concurrent_subagents ?? 6}`,
-      "[model_providers.gateway]",
-      'name = "Deployment model gateway"',
-      `base_url = ${JSON.stringify(this.options.modelBaseUrl)}`,
-      'wire_api = "responses"',
-      "requires_openai_auth = false",
-      ...tomlLines(this.options.codexConfig?.provider, RESERVED_PROVIDER_KEYS),
-    ].join("\n");
-  }
-  private mcpServers() {
-    return Object.fromEntries(
-      (this.execution.agent.tools ?? [])
-        .filter((tool) => tool.type === "mcp")
-        .map((tool) => {
-          const transport = tool.transport;
-          const headers =
-            transport.type === "http"
-              ? {
-                  ...transport.headers,
-                  ...(transport.authorization ? { Authorization: transport.authorization } : {}),
-                }
-              : undefined;
-          return [
-            tool.server_label,
-            {
-              required: tool.required ?? false,
-              ...(tool.allowed_tools ? { enabled_tools: tool.allowed_tools } : {}),
-              ...(transport.type === "stdio" || tool.connection_origin === "environment"
-                ? { environment_id: "sandbox" }
-                : {}),
-              ...(transport.type === "http"
-                ? { url: transport.server_url, http_headers: headers ?? {} }
-                : {
-                    command: transport.command,
-                    args: transport.args ?? [],
-                    cwd: transport.cwd,
-                    env: transport.env ?? {},
-                    env_vars: transport.env_vars ?? [],
-                  }),
-            },
-          ];
-        }),
-    );
-  }
   /** The app-server is acquired into the resource Scope; its release terminates the process. */
   protected acquire(bundle?: unknown): Effect.Effect<void, unknown, Scope.Scope> {
     return Effect.gen(this, function* () {
@@ -500,10 +143,16 @@ export class CodexJob extends Job {
       const searchTool = this.execution.agent.tools?.find((tool) => tool.type === "web_search");
       const searchMode = searchTool ? (searchTool.mode ?? "live") : "disabled";
       yield* io("codex.config", () =>
-        writeFile(join(this.home, "config.toml"), this.config(searchMode)),
+        writeFile(
+          join(this.home, "config.toml"),
+          configToml(this.execution, this.options, searchMode),
+        ),
       );
       yield* io("codex.environments", () =>
-        writeFile(join(this.home, "environments.toml"), this.environmentsToml()),
+        writeFile(
+          join(this.home, "environments.toml"),
+          environmentsToml(this.execution, this.options.sandboxUrl),
+        ),
       );
       const server = yield* AppServer.acquire({
         binary: this.options.binary,
@@ -545,7 +194,7 @@ export class CodexJob extends Job {
         developerInstructions: this.execution.agent.instructions ?? null,
         serviceTier: this.execution.agent.service_tier ?? null,
         config: {
-          mcp_servers: this.mcpServers(),
+          mcp_servers: mcpServers(this.execution),
           web_search: searchMode,
           ...(searchTool ? { tools: { web_search: searchConfig(searchTool) } } : {}),
         },
@@ -580,11 +229,6 @@ export class CodexJob extends Job {
   private get outputSchema() {
     const format = this.execution.agent.text?.format;
     return format?.type === "json_schema" ? format.schema : null;
-  }
-  private environmentsToml(): string {
-    return this.execution.sandbox
-      ? `default = "sandbox"\ninclude_local = false\n[[environments]]\nid = "sandbox"\nurl = ${JSON.stringify(this.options.sandboxUrl)}\n`
-      : 'default = "none"\ninclude_local = false\n';
   }
   /** Client function tools, the programmatic tool and delegation tools, as Codex dynamic tools. */
   private dynamicTools() {

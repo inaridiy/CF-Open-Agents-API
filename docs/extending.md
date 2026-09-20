@@ -8,24 +8,54 @@ This is the composition in [examples/worker/src/index.ts](../examples/worker/src
 
 ```ts
 import { createOpenAI } from "@ai-sdk/openai";
-import { bearerTenant, defineAgentWorker } from "cf-open-agents-api/cloudflare";
+import {
+  type AgentBindings,
+  bearerTenant,
+  type ContainerBindings,
+  defineAgentWorker,
+} from "cf-open-agents-api/cloudflare";
 import { aiSDKModel, nativeModel } from "cf-open-agents-api/models";
 import { createWorkersAI } from "workers-ai-provider";
 
+// Wrangler bindings the composition reads: the library's Durable Objects, buckets and
+// gateway (AgentBindings, ContainerBindings), plus the secrets and bindings named here.
+// Secrets come from .dev.vars locally and from `wrangler secret put` in production.
+interface Bindings extends AgentBindings, ContainerBindings {
+  AI: Ai;
+  API_TOKEN: string;
+  OPENAI_API_KEY: string;
+}
+
+// Wrangler binds the Durable Objects by these export names and the private model
+// gateway by the `Models` entrypoint; keep them as they are.
 export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
   defineAgentWorker<Bindings>({
+    // Presets: the `agent.model` names clients send. Each maps to a native runtime
+    // (`harness`) and a gateway registry name (`model`). Optional fields: `delegates` lists
+    // the presets a session may start subagents on when multi_agent is enabled (children
+    // share the parent's sandbox); `tiers` names the registry entries Claude Code's
+    // haiku/sonnet/opus subagent tiers resolve to; `webSearch` declares that the model
+    // connection provides hosted web search (a nativeModel connection, not the AI SDK path).
     agents: {
-      coding: {
+      codex: {
         harness: "codex",
         model: "codex",
         delegates: ["claude", "opencode"],
         webSearch: true,
       },
-      claude: { harness: "claude-code", model: "primary", delegates: ["coding", "opencode"] },
-      opencode: { harness: "opencode", model: "primary", delegates: ["coding", "claude"] },
+      claude: {
+        harness: "claude-code",
+        model: "primary",
+        tiers: { haiku: "fast" },
+        delegates: ["codex", "opencode"],
+      },
+      opencode: { harness: "opencode", model: "primary", delegates: ["codex", "claude"] },
       workers: { harness: "codex", model: "workers" },
     },
-    // Registry entries may be factories; a preset is built only when a session selects it.
+    // The private model gateway. Keys are deployment-owned names that presets point at;
+    // runtimes never see provider URLs or keys. Each entry is a factory built only when a
+    // session selects it, so a deployment without one provider's credentials still serves
+    // the other presets. Add a model here, then point a preset's `model` at it.
     models: (env) => ({
       codex: () =>
         nativeModel({
@@ -35,8 +65,13 @@ export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO,
           model: "gpt-6-astra",
         }),
       primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-      workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-4.7-flash")),
+      fast: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-5.6-luna")),
+      workers: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/zai-org/glm-5.3-flash")),
+      workersQwen: () => aiSDKModel(createWorkersAI({ binding: env.AI })("@cf/qwen/qwen3.8-27b")),
     }),
+    // Who may call the API. `bearerTenant` accepts one shared bearer token (API_TOKEN, at
+    // least 32 characters) and maps every caller to the tenant "default"; Service Binding
+    // callers pass the same token. Replace it to resolve tenants from your own auth.
     authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
   });
 export default Agents;
@@ -46,16 +81,19 @@ The `Models` entrypoint is the private model gateway; `MODEL_GATEWAY` binds it f
 
 Each preset (`AgentRegistration`) has:
 
-| Field       | Meaning                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `harness`   | `codex`, `claude-code`, `opencode`, or the name of a custom driver in `harnesses`.                                                                                                                                                                                                                                                                                         |
-| `model`     | The gateway registry name the harness sends as `model`. The gateway swaps it for the real upstream model.                                                                                                                                                                                                                                                                  |
-| `delegates` | Presets a session on this alias may start subagents on when the client enables `multi_agent`. Every listed alias must exist and its harness must be registered, or creation fails with `503 delegate_unavailable`. Children run on the delegate's harness and model inside the parent's sandbox, so list only presets whose model spend you accept on the parent's behalf. |
-| `webSearch` | Declares that this alias's model connection provides hosted web search. `web_search` tools are accepted only when both the harness (`codex` or `claude-code`) and the alias support it. A `nativeModel` Responses or Anthropic connection qualifies; the portable adapter does not.                                                                                        |
+| Field       | Meaning                                                                                                                                                                                                                                                                                                                                                                                |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `harness`   | `codex`, `claude-code`, `opencode`, or the name of a custom driver in `harnesses`.                                                                                                                                                                                                                                                                                                     |
+| `model`     | The gateway registry name the harness sends as `model`. The gateway swaps it for the real upstream model.                                                                                                                                                                                                                                                                              |
+| `delegates` | Presets a session on this alias may start subagents on when the client enables `multi_agent`. Every listed alias must exist and its harness must be registered, or creation fails with `503 delegate_unavailable`. Children run on the delegate's harness and model inside the parent's sandbox, so list only presets whose model spend you accept on the parent's behalf.             |
+| `tiers`     | Gateway registry names a Claude Code session may switch to per model tier: `{ haiku?, sonnet?, opus? }`. The parent's Agent tool accepts `model: "haiku"`, `"sonnet"` or `"opus"` for a native subagent; each alias resolves to the name listed here, and a missing tier falls back to `model`. Pinned with the session at creation and fork, like `model`. Other harnesses ignore it. |
+| `webSearch` | Declares that this alias's model connection provides hosted web search. `web_search` tools are accepted only when both the harness (`codex` or `claude-code`) and the alias support it. A `nativeModel` Responses or Anthropic connection qualifies; the portable adapter does not.                                                                                                    |
 
 A registry entry is a `ModelRegistration`: an adapter, or a factory such as `() => nativeModel(...)` that is called only when a session selects that name. A deployment that lacks one provider's credentials still serves its other presets; the example's `.dev.vars.example` leaves `OPENAI_API_KEY` empty so the `workers` preset runs alone. The gateway performs one inference per request. It has no tool implementations and starts no second agent loop; the runtime owns tool selection, continuation and native history. Switching `harness` changes new sessions and does not convert an existing checkpoint; use a [fork](environments-and-tools.md#fork-a-session) to move a session.
 
-Both example model IDs are in the providers' catalogs, [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and [GLM-4.7-Flash](https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/), checked September 13, 2026. Availability to your account and inference quality are separate from the scripted tests. The deployment supplies its AI SDK provider package; see Cloudflare's [AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
+The registry holds several models per provider so that presets and tiers can point at different ones: `codex` is the native Responses connection to GPT-6 Astra, `primary` and `fast` are GPT-6 Astra and GPT-5.6 Luna through the AI SDK, `workers` is `@cf/zai-org/glm-5.3-flash` and `workersQwen` is `@cf/qwen/qwen3.8-27b` on Workers AI. The `claude` preset resolves its `haiku` tier to `fast`; the CLI's Anthropic variant renders `opus`, `sonnet` and `haiku` native entries instead and gives the `claude` preset `tiers: { haiku: "haiku", sonnet: "sonnet" }`. Client `agent.model` values stay `codex`, `claude`, `opencode` or `workers` in every variant.
+
+The example model IDs are in the providers' catalogs, [GPT-6 Astra and GPT-5.6 Luna](https://developers.openai.com/api/docs/models), [GLM-5.3-Flash](https://developers.cloudflare.com/workers-ai/models/glm-5.3-flash/) and [Qwen 3.8 27B](https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/), checked on 2026-09-19. Availability to your account and inference quality are separate from the scripted tests. The deployment supplies its AI SDK provider package; see Cloudflare's [AI SDK integration](https://developers.cloudflare.com/workers-ai/configuration/ai-sdk/).
 
 ## Model protocols
 
@@ -146,7 +184,7 @@ import { webSearch } from "cf-open-agents-api/tools";
 
 const search = webSearch(async (query, signal) => yourSearchProvider(query, { signal }));
 const session = await client.beta.agents.sessions.create({
-  agent: { model: "coding", tools: [search.spec] },
+  agent: { model: "codex", tools: [search.spec] },
   environment: { type: "none" },
 });
 const stream = client.beta.agents.sessions.stream(session.id, {

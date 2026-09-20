@@ -12,6 +12,7 @@ import { ensureEntryExports } from "./steps/entry.js";
 import { ensureGitignore } from "./steps/gitignore.js";
 import { ensurePackageJson, type PackageJsonOptions, vendorScript } from "./steps/package-json.js";
 import { ensurePnpmBuilds } from "./steps/pnpm-builds.js";
+import { detectRootlessDocker, ensureRootlessDev } from "./steps/rootless.js";
 import { ensureStandaloneSkeleton } from "./steps/standalone.js";
 import { ensureTsconfigExclude } from "./steps/tsconfig.js";
 import { ensureVendor } from "./steps/vendor.js";
@@ -22,6 +23,8 @@ import {
   PRESET_NAMES,
   providerPackages,
 } from "./templates/agents.js";
+import { ROOTLESS_SCRIPT_NAME, rootlessScript } from "./templates/rootless.js";
+import { ENTRY_FILES } from "./templates/standalone.js";
 import {
   clackPrompter,
   clackReporter,
@@ -34,6 +37,8 @@ import {
 import {
   CLI_NAME,
   CLI_VERSION,
+  COMPATIBILITY_DATE,
+  DEMO_VERSIONS,
   LIBRARY_NAME,
   PEER_VERSIONS,
   TOOLCHAIN_VERSIONS,
@@ -56,7 +61,6 @@ export interface InitOptions extends InitPreferences {
   runner?: Runner;
   fetch?: typeof globalThis.fetch;
   env?: NodeJS.ProcessEnv;
-  today?: string;
   token?: () => string;
 }
 
@@ -67,7 +71,6 @@ export interface InitResult {
   agentsPath: string;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
 const fileDependency = (path: string | undefined, fallback: string) =>
   path ? `file:${resolve(path)}` : fallback;
 
@@ -85,25 +88,28 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   const project = locateProject(root, (options.env ?? process.env).npm_config_user_agent);
   const prompter = choosePrompter(options);
   const reporter = chooseReporter(options);
+  const runner = options.runner ?? run;
   const files = new Files(root, options.dryRun);
   reporter.intro(`${CLI_NAME} ${CLI_VERSION}${options.dryRun ? " (dry run)" : ""}`);
   await confirmNewProject(project, prompter);
   const configName =
     project.mode === "retrofit" ? readConfig(files, project).config.name : undefined;
-  const answers = await collectAnswers(project, configName, options, prompter);
+  // The docker call is skipped when a flag already decided.
+  const rootlessDocker = options.rootless === undefined && detectRootlessDocker(runner);
+  const answers = await collectAnswers(project, configName, options, prompter, { rootlessDocker });
   const plan = new Plan();
   if (project.mode === "standalone")
     for (const result of ensureStandaloneSkeleton({
       files,
       name: answers.name,
-      publicRoute: answers.publicRoute,
-      today: options.today ?? today(),
+      compatibilityDate: COMPATIBILITY_DATE,
+      template: answers.template,
     }))
       plan.add(result);
   plan.add(await vendor(options, root, reporter));
   const config = readConfig(files, project).config;
-  const entryPath = resolve(root, config.main ?? "src/index.ts");
-  const inEntry = compositionInEntry(files, project, entryPath);
+  const entryPath = resolve(root, config.main ?? ENTRY_FILES.minimal);
+  const inEntry = compositionInEntry(files, project, answers, entryPath);
   configureWrangler(files, project, answers, options, plan, !inEntry);
   const { agentsPath, composition } = compose(files, entryPath, inEntry, answers, options, plan);
   const secret = describeSecret(composition);
@@ -111,9 +117,11 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   plan.add(ensureDevVarsExample({ files, secret }));
   plan.add(ensureGitignore(files));
   plan.add(ensurePnpmBuilds(files, project.packageManager));
-  plan.add(ensurePackageJson(manifestChanges(files, project, composition, options)));
+  plan.add(ensurePackageJson(manifestChanges(files, project, answers, composition, options)));
+  if (answers.rootless)
+    for (const result of ensureRootlessDev(files, options.force)) plan.add(result);
   if (project.mode === "retrofit") plan.add(ensureTsconfigExclude(files));
-  if (answers.install && !options.dryRun) await install(project, reporter, options.runner ?? run);
+  if (answers.install && !options.dryRun) await install(project, reporter, runner);
   reporter.note(nextSteps(project, answers, agentsPath), "Next steps");
   reporter.plan(plan, options.dryRun ? "Dry run: nothing was written" : "Done");
   return { project, answers, plan, agentsPath };
@@ -129,9 +137,17 @@ async function confirmNewProject(project: Project, prompter: Prompter): Promise<
     throw new CliError("Nothing to do: run inside a Workers project or let the CLI create one.");
 }
 
-/** A new project composes in its entry; so does a project this CLI created earlier. */
-function compositionInEntry(files: Files, project: Project, entryPath: string): boolean {
-  if (project.mode === "standalone") return true;
+/**
+ * The minimal template composes in its entry, and so does a project this CLI created
+ * from it earlier. The demo template and a retrofit keep the composition in `agents.ts`.
+ */
+function compositionInEntry(
+  files: Files,
+  project: Project,
+  answers: InitAnswers,
+  entryPath: string,
+): boolean {
+  if (project.mode === "standalone") return answers.template === "minimal";
   return /defineAgentWorker[<(]/.test(files.read(entryPath) ?? "");
 }
 
@@ -179,6 +195,7 @@ function compose(
     standalone: inEntry,
   };
   plan.add(ensureAgentsFile(files, agentsPath, composition, options.force));
+  // The demo entry already re-exports the classes, so this is a skip there.
   if (!inEntry) plan.add(ensureEntryExports(files, entryPath, agentsPath));
   return { agentsPath, composition };
 }
@@ -186,9 +203,11 @@ function compose(
 function manifestChanges(
   files: Files,
   project: Project,
+  answers: InitAnswers,
   composition: CompositionInput,
   options: InitOptions,
 ): PackageJsonOptions {
+  const demo = project.mode === "standalone" && answers.template === "demo";
   return {
     files,
     force: options.force,
@@ -196,12 +215,18 @@ function manifestChanges(
       [LIBRARY_NAME]: fileDependency(options.library, CLI_VERSION),
       ...PEER_VERSIONS,
       ...providerPackages(composition),
+      ...(demo ? DEMO_VERSIONS : {}),
     },
     devDependencies: {
       [CLI_NAME]: fileDependency(options.cliPackage, CLI_VERSION),
       ...(project.mode === "standalone" ? TOOLCHAIN_VERSIONS : {}),
     },
-    scripts: { postinstall: vendorScript },
+    scripts: {
+      postinstall: vendorScript,
+      ...(answers.rootless
+        ? { [ROOTLESS_SCRIPT_NAME]: rootlessScript(project.packageManager) }
+        : {}),
+    },
   };
 }
 
@@ -251,23 +276,37 @@ function firstPreset(answers: InitAnswers): string {
   return PRESET_NAMES[answers.harnesses[0] ?? "codex"];
 }
 
+/** Step 4: how the freshly started project is exercised. */
+function firstUse(project: Project, answers: InitAnswers): string {
+  if (project.mode === "retrofit")
+    return `Call the API from your Worker with the OpenAI client: new OpenAI({ baseURL: "https://agents.internal/v1", apiKey: env.API_TOKEN, fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)) }).`;
+  if (answers.template === "demo")
+    return "Open http://localhost:8787, type what the agent should build and download the zip.";
+  return `curl -X POST http://localhost:8787/v1/agents/sessions -H "Authorization: Bearer <API_TOKEN from .dev.vars>" -H "Content-Type: application/json" -H "Idempotency-Key: first" -d '{"agent":{"model":"${firstPreset(answers)}"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/hello.txt"}'`;
+}
+
 function nextSteps(project: Project, answers: InitAnswers, agentsPath: string): string {
   const exec = packageManagerExec(project.packageManager).join(" ");
   const composition = agentsPath.slice(project.root.length + 1);
-  const dev =
+  const runScript = (name: string) =>
+    project.packageManager === "npm" ? `npm run ${name}` : `${project.packageManager} ${name}`;
+  const devCommand =
     project.mode === "standalone"
       ? `${exec} wrangler dev`
       : "your dev server (vite dev or wrangler dev)";
-  const use =
-    project.mode === "retrofit"
-      ? `Forward the API from your Worker: app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw)) with AGENTS: Fetcher & AgentRPC.`
-      : `curl -X POST http://localhost:8787/v1/agents/sessions -H "Authorization: Bearer <API_TOKEN from .dev.vars>" -H "Content-Type: application/json" -H "Idempotency-Key: first" -d '{"agent":{"model":"${firstPreset(answers)}"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/hello.txt"}'`;
+  const dev = answers.rootless
+    ? `${runScript(ROOTLESS_SCRIPT_NAME)} (rootless Docker; plain wrangler dev cannot complete a turn until Wrangler supports rootless engines)`
+    : devCommand;
+  const openDemo =
+    project.mode === "standalone" && answers.template === "demo"
+      ? " The deployed demo has no login: anyone with its workers.dev URL can create sessions on your account, so put Cloudflare Access in front of it or replace the page with your own auth (workers_dev: false in wrangler.jsonc keeps it reachable through Service Bindings only)."
+      : "";
   return [
     `1. ${installCommand(project.packageManager)}  (postinstall keeps the image snapshot current)`,
     `2. ${exec} wrangler login  (the AI binding and deployments need your account)`,
     `3. Start Docker, then ${dev}; the first image build takes several minutes.`,
-    `4. ${use}`,
+    `4. ${firstUse(project, answers)}`,
     `5. Presets and models live in ${composition}; the API token and provider key in .dev.vars.`,
-    `6. Production: ${CLI_NAME} setup (R2 buckets and secrets), then ${exec} wrangler deploy.`,
+    `6. Production: ${CLI_NAME} setup (R2 buckets and secrets), then ${exec} wrangler deploy.${openDemo}`,
   ].join("\n");
 }

@@ -16,6 +16,8 @@ import type { SessionObject } from "../session.js";
 /** The per-request view route handlers use; it keeps private helpers off the RPC surface. */
 export interface WorkerAccess<Env> extends AgentRPC {
   env: Env;
+  /** Set by `fetchAs`: the tenant a trusted RPC caller resolved, so the authenticator is skipped. */
+  tenant?: string;
   catalog(tenant: string): DurableObjectStub<CatalogObject>;
   session(tenant: string, id: string): Promise<DurableObjectStub<SessionObject>>;
   validateModel(

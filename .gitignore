@@ -11,6 +11,7 @@ coverage/
 *.tgz
 examples/worker/env.d.ts
 examples/caller/env.d.ts
+examples/demo/env.d.ts
 
 # Canonical release documents are copied into the tarball by prepack.
 packages/agent-api/LICENSE

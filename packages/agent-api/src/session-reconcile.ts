@@ -63,12 +63,35 @@ const fenced = <A>(tick: Tick, f: (record: Fenced<ActiveSession>, tx: SessionTx)
   tick.repo.transaction((tx) => f(tx.fenced(tick.execution), tx));
 const finish = (tick: Tick, status: "cancelled" | "failed", error?: string) =>
   fenced(tick, (record, tx) => complete(tx, tick.config, record, status, error));
-const stopAndFail = (tick: Tick, code: string) =>
-  tick.driver
-    .stop(tick.execution)
-    .pipe(Effect.zipRight(finish(tick, "failed", code)), Effect.asVoid);
 const expired = (execution: Execution) =>
   Clock.currentTimeMillis.pipe(Effect.map((now) => now >= execution.deadline));
+/**
+ * Stop the runtime before the turn is sealed. A stop that cannot be confirmed is retried
+ * by the next alarm, like any transport failure, but only until the turn deadline: past
+ * it the turn is sealed anyway, and the caller learns that the stop is `unknown`, because
+ * nothing confirmed that the runtime's side effects ended.
+ */
+const boundedStop = (tick: Tick) =>
+  tick.driver.stop(tick.execution).pipe(
+    Effect.as("stopped" as const),
+    Effect.catchTag("TransportFailure", (error) =>
+      expired(tick.execution).pipe(
+        Effect.flatMap((late) =>
+          late
+            ? Effect.logWarning("Stop failed past the turn deadline; sealing anyway", error).pipe(
+                Effect.as("unknown" as const),
+              )
+            : Effect.fail(error),
+        ),
+      ),
+    ),
+  );
+/** Stop, then fail with `code`; an unconfirmed stop fails with `outcome_unknown` instead. */
+const stopAndFail = (tick: Tick, code: string) =>
+  boundedStop(tick).pipe(
+    Effect.flatMap((stop) => finish(tick, "failed", stop === "stopped" ? code : "outcome_unknown")),
+    Effect.asVoid,
+  );
 
 /** Cancellation supersedes queued input; its operation id stays until the outcome is durable. */
 const pendingCommands = Effect.fn("session.commands")(function* (tick: Tick) {
@@ -191,7 +214,8 @@ const round = Effect.fn("session.round")(function* (tick: Tick) {
     return "done" as const;
   }
   if (batch.status === "cancelled") {
-    yield* tick.driver.stop(tick.execution);
+    // The runtime reported the cancellation itself, so the outcome is known either way.
+    yield* boundedStop(tick);
     yield* finish(tick, "cancelled");
     return "done" as const;
   }

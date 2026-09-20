@@ -1,8 +1,9 @@
 import { define } from "gunshi";
 
-import { parseHarnesses, parseProvider } from "../answers.js";
+import { parseHarnesses, parseProvider, parseTemplate } from "../answers.js";
 import { runInit } from "../init.js";
 import { HARNESSES, PROVIDERS } from "../templates/agents.js";
+import { TEMPLATES } from "../templates/standalone.js";
 
 export const initCommand = define({
   name: "init",
@@ -23,6 +24,11 @@ export const initCommand = define({
     },
     "dry-run": { type: "boolean", description: "Report what would change without writing" },
     name: { type: "string", description: "Worker name when the configuration has none" },
+    template: {
+      type: "enum",
+      choices: [...TEMPLATES],
+      description: "New project: demo (Hono app around the API) or minimal (the API alone)",
+    },
     provider: { type: "enum", choices: [...PROVIDERS], description: "Model provider" },
     "base-url": { type: "string", description: "openai-compatible: Chat Completions base URL" },
     model: { type: "string", description: "openai-compatible: model id" },
@@ -36,10 +42,16 @@ export const initCommand = define({
     },
     "code-loader": {
       type: "boolean",
+      negatable: true,
       description:
         "Programmatic tool calling through Dynamic Workers (--no-code-loader disables it)",
     },
-    public: { type: "boolean", description: "New project: publish the HTTP API on workers.dev" },
+    rootless: {
+      type: "boolean",
+      negatable: true,
+      description:
+        "Add the dev:rootless script for rootless Docker (default: asked when detected; --no-rootless skips)",
+    },
     "agents-file": {
       type: "string",
       description: "Path of the composition module (default: next to the entry)",
@@ -71,13 +83,14 @@ export const initCommand = define({
       force: Boolean(values.force),
       dryRun: Boolean(values["dry-run"]),
       name: values.name,
+      template: values.template === undefined ? undefined : parseTemplate(values.template),
       provider: values.provider === undefined ? undefined : parseProvider(values.provider),
       baseURL: values["base-url"],
       model: values.model,
       harnesses: values.harnesses === undefined ? undefined : parseHarnesses(values.harnesses),
       workersAi: values["workers-ai"],
       codeLoader: values["code-loader"],
-      publicRoute: values.public,
+      rootless: values.rootless,
       agentsFile: values["agents-file"],
       library: values.library,
       cliPackage: values["cli-package"],

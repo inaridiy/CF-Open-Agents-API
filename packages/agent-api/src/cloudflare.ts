@@ -18,6 +18,7 @@ export {
   type AgentRPC,
   type AgentServiceClasses,
   bearerTenant,
+  tenantFetch,
   createAgentService,
 } from "./service.js";
 export { SessionObject } from "./session.js";

@@ -1,5 +1,46 @@
 # Changelog
 
+`packages/create-cf-open-agents-api/CHANGELOG.md` is a copy of this file that `prepack` makes; edit this one.
+
+## 0.3.0 (2026-09-20)
+
+### Added
+
+- `create-cf-open-agents-api init` in an empty directory asks for a template (`--template demo|minimal`). `demo`, the default, is a Hono + `hono/jsx` app: a prompt form creates a session with `environment: { type: "openai_hosted" }`, a progress page polls items, subagents and artifacts every two seconds, and the files under `/workspace/outputs` download as a zip. It reads the presets from `GET /cf/v1/capabilities` and reaches the API through the `AGENTS` self Service Binding with `tenantFetch`. `minimal` is the API alone, `examples/worker` generated; `examples/demo` is the demo template generated.
+- Rootless Docker: `init` runs `docker info` on Linux and, when the engine is rootless, offers a `dev:rootless` script (`--rootless`, `--no-rootless`) with `scripts/dev-rootless.sh` and `scripts/netns-bridge.mjs`. It runs `wrangler dev` inside rootlesskit's network namespace with `nsenter` and bridges `127.0.0.1:$PORT` back to the host over a Unix socket. `doctor` gains a `docker rootless` check that fails when the engine is rootless and the script is missing, and notes that one `wrangler dev` per Dockerfile may run at a time.
+- `AgentRPC.fetchAs(tenant, request)` serves one HTTP request of the Agents API as the given tenant without the HTTP authenticator, and `tenantFetch(agents, tenant)` from `cf-open-agents-api/cloudflare` wraps it as a `fetch` for the official client that keeps the SDK's `AbortSignal` on the caller's side (a `Request` crossing RPC cannot carry it). The binding is the credential; no `API_TOKEN` is needed over a Service Binding.
+- `AgentRegistration.tiers` (`{ haiku?, sonnet?, opus? }`) names the gateway entries Claude Code's subagent tiers resolve to; a missing tier falls back to the preset's `model`. `GET /cf/v1/capabilities` reports it.
+- The generated registry holds several models per provider: OpenAI `codex` (native Responses, GPT-6 Astra), `primary` and `fast` (GPT-6 Astra and GPT-5.6 Luna through the AI SDK); Workers AI `workers` (`@cf/zai-org/glm-5.3-flash`) and `workersQwen` (`@cf/qwen/qwen3.8-27b`); the Anthropic variant renders `opus`, `sonnet` and `haiku` native entries and gives the `claude` preset `tiers: { haiku: "haiku", sonnet: "sonnet" }`. The composition carries explanatory comments on bindings and secrets, presets, the registry and `authenticate`.
+- Generated `wrangler.jsonc`: `compatibility_date` is the pinned `2026-09-12` instead of today's date (the workerd bundled with the pinned Wrangler lags behind the calendar), the `ai` binding is `{ "binding": "AI", "remote": true }`, and the `types` script is `wrangler types env.d.ts`, the file `tsconfig.json` and `.gitignore` name.
+- [docs/quickstart.md](docs/quickstart.md), the first document for a new user; `pnpm bootstrap` writes the `.dev.vars` of `examples/worker`, `examples/demo` and `examples/caller`.
+- The demo's job page streams the running turn as server-rendered HTML: it opens the session's live SSE, replays the durable log (`GET /cf/v1/sessions/<id>/events?after=`) into the committed transcript, and appends items and text deltas as they arrive, with no client script. A reload rebuilds the page from the log and reattaches at its cursor. `requires_action` is shown as settled, since the demo declares no function tools.
+- `CONNECTION_FAILURE`, exported from `cf-open-agents-api`, is the shared list of transport-failure phrases (reqwest, Node socket codes, `fetch failed`) the Codex classifier and the harness diagnostics hint use.
+- The `dev:rootless` script takes the package manager's wrangler command through `WRANGLER` (`pnpm exec`, `npx`, `yarn`, `bunx`), stops wrangler, both bridges and the nsenter child on exit, and its bridge relays half-closed connections. The package smoke checks the shipped `templates/` and runs a packed demo `init`; the rootless tests run `sh -n` and a real relay through the bridge.
+- README: a walkthrough of `defineAgentWorker` (`agents`, `models`, `authenticate`) and how to enable hosted web search.
+- `listSessions` makes one RPC per session, and sealing a turn closes open subagent turns through a status-filtered query instead of scanning every turn.
+
+### Changed
+
+- The rootless Docker patch is labeled a temporary workaround for Wrangler's local container proxy assuming a rootful bridge (`init` prompt, `doctor`, known issues); it goes away when Wrangler supports rootless engines.
+- `init` and `doctor` run `docker info` once with a 5 second timeout; a stalled engine fails the check instead of hanging the CLI.
+- `init` no longer asks whether to publish on workers.dev and has no `--public` flag: the template decides (`demo` writes `workers_dev: true`, `minimal` writes `workers_dev: false`) and the setting is one line in `wrangler.jsonc` to change at deploy time. The next steps, the CLI README and the QuickStart say that the deployed demo has no login of its own.
+- Library internals: `containers.ts` is split into `containers/` (host, assignment, sandbox, proxies, delegation, checkpoint, diagnostics) and `service.ts` into the Hono app (`http/app.ts`), validation and session reservation modules; public exports are unchanged.
+- Supervisor internals: `codex.ts` is split into `codex-protocol.ts` and `codex-config.ts`; OpenCode's per-turn projection is `OpenCodeTranscript` in its own module with fixture tests.
+- The generated Codex preset and the `examples/worker` preset are named `codex` instead of `coding`. Existing deployments keep whatever preset names they defined; sessions pin their preset at creation, so nothing changes for running sessions.
+
+### Fixed
+
+- The Claude Code driver no longer mixes up content-block ids when extended thinking streams: the answer appeared twice, once `incomplete` with `phase: null`, and the reasoning item was lost. Ids now follow the streamed block index, so an empty text block the CLI drops before a tool call no longer shifts the ids of the blocks after it.
+- Codex connection-level failures reported as `other` (`error sending request for url (http://model.internal/...)`, `Connection reset by peer`) map to `connection_failed` instead of `internal_error`; a failure to reach the exec-server or `sandbox.internal` maps to `sandbox_error`, and a message with an HTTP status outside the table falls back to the transport phrases.
+- OpenCode: a failed `session.status` probe counts as busy and is retried until the deadline, so a steer is not rerun while the loop is still answering it.
+- The supervisor answers `400 invalid_request` to a request body that is not JSON instead of a 500 the HarnessDO retried.
+- Claude Code subagents can use the preset's `tiers`: the HarnessDO persists them with the assignment and its model proxy admits them. Before, a tier that differed from the preset's `model` was answered `403 Model is not assigned to this execution` and the child turn failed.
+- A turn whose runtime `stop` keeps failing is sealed after the turn deadline as `outcome_unknown` instead of re-arming the alarm forever with the session `in_progress`.
+- The HarnessDO model proxy answers a request body that is not JSON with 400 instead of failing internally; `tenantFetch` removes its abort listener once the response arrives.
+- The demo template adds `jsx` and `jsxImportSource` to an existing `tsconfig.json` instead of keeping it silently, which left the Worker throwing `React is not defined`.
+- The `Native harness diagnostics` log carries a `hint` when a line shows a connection failure to `model.internal`, `sandbox.internal`, `mcp.internal` or `delegate.internal`, pointing at rootless Docker.
+- `create-cf-open-agents-api init --no-code-loader` and `--no-rootless` negate their flags.
+
 ## 0.2.1 (2026-09-18)
 
 ### Fixed

@@ -1,6 +1,6 @@
 import type { McpToolConfig } from "../agent-tools.js";
 import type { HarnessName } from "../harnesses.js";
-import type { Checkpoint, Execution, RuntimeBatch } from "../runtime.js";
+import type { Checkpoint, Execution, ModelTiers, RuntimeBatch } from "../runtime.js";
 import { kind } from "./kind.js";
 
 /** The turn a HarnessDO and its Container currently serve; the authorization boundary. */
@@ -9,6 +9,8 @@ export interface Assignment {
   generation: number;
   turnId: string;
   model: string;
+  /** Tier names the model proxy admits besides `model`; see `modelAllowed`. */
+  tiers?: ModelTiers;
   webSearchMode?: "disabled" | "cached" | "live";
   harness: HarnessName;
   dispatched: boolean;

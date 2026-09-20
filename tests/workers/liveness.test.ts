@@ -372,6 +372,58 @@ it("an unregistered executor fails the turn instead of polling forever", async (
   });
 });
 
+it("a stop that keeps failing seals the turn as outcome_unknown once the deadline passes", async () => {
+  const session = await api.beta.agents.sessions.create(params);
+  const result = await runInDurableObject<SessionDO, unknown>(
+    stub(session.id),
+    async (instance) => {
+      let stops = 0;
+      install(
+        instance,
+        driver({
+          poll: async () => ({ status: "failed", cursor: 0, events: [], error: "sandbox_error" }),
+          stop: async () => {
+            stops++;
+            throw new Error("destroy failed");
+          },
+        }),
+      );
+      await instance.submit([message("go")], "initial");
+      await instance.alarm();
+      // Before the deadline a failed stop is a transport failure: the turn stays open and
+      // the next alarm retries it.
+      const retrying = {
+        ...summary(instance),
+        stops,
+        armed: (await storageOf(instance).getAlarm()) !== null,
+      };
+      const state = instance.db.require(SessionKinds.state, "session");
+      if (state.execution)
+        instance.db.put(SessionKinds.state, "session", {
+          ...state,
+          execution: { ...state.execution, deadline: Date.now() - 1 },
+        });
+      await instance.alarm();
+      const sealed = { ...summary(instance), stops };
+      await storageOf(instance).deleteAlarm();
+      await instance.alarm();
+      return { retrying, sealed, armedAgain: (await storageOf(instance).getAlarm()) !== null };
+    },
+  );
+  expect(result).toMatchObject({
+    retrying: { status: "in_progress", turns: ["in_progress"], stops: 1, armed: true },
+    // Nothing confirmed that the runtime's side effects ended: the outcome is unknown.
+    sealed: {
+      status: "failed",
+      error: "outcome_unknown",
+      turns: ["failed"],
+      lastEvent: "agent.session.failed",
+      stops: 2,
+    },
+    armedAgain: false,
+  });
+});
+
 it.each([
   [
     "typed",

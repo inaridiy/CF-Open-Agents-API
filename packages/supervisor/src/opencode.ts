@@ -12,7 +12,6 @@ import type {
   Event,
   Message,
   Part,
-  Session,
   ToolPart,
 } from "@opencode-ai/sdk/v2/types";
 import {
@@ -28,14 +27,20 @@ import { Buffer } from "./buffer.js";
 import { type NativeOptions, ToolJob } from "./job.js";
 import { CommandRejected, describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
 import { imageContent } from "./media.js";
+import { type ChildState, type EventScope, OpenCodeTranscript } from "./opencode-transcript.js";
 import { awaitReady, NativeExited, NativeStartupFailed, NativeTurnFailed } from "./process.js";
 
 type Client = ReturnType<typeof createOpencodeClient>;
+/** The part of the client `untilIdle` reads, so a test can stand in for the server. */
+export type StatusClient = {
+  session: {
+    status: (request: object, options: { signal: AbortSignal }) => Promise<{ data?: unknown }>;
+  };
+};
 type PromptRequest = Parameters<Client["session"]["prompt"]>[0];
 type PromptParts = NonNullable<PromptRequest["parts"]>;
 type OutputFormat = NonNullable<PromptRequest["format"]>;
 type Permission = "allow" | "deny";
-type EventScope = { subagentId: string; turnId: string };
 
 /** OpenCode provider variants carry the reasoning effort the gateway forwards upstream. */
 const EFFORT_VARIANTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -52,14 +57,6 @@ const BARRIER_BOUND = "10 seconds";
 
 const RUNTIME = "opencode";
 
-interface ChildState {
-  readonly sessionId: string;
-  readonly subagentId: string;
-  readonly turnId: string;
-  readonly openedAt: number;
-  name: string | null;
-  closed: boolean;
-}
 interface RunningTool {
   readonly sessionId: string;
   readonly tool: string;
@@ -340,232 +337,20 @@ export class OpenCodeJob extends ToolJob {
   private turn(client: Client): Effect.Effect<void, unknown> {
     return Effect.scoped(
       Effect.gen(this, function* () {
-        const usage = new Map<string, AssistantMessage>();
-        const started = Date.now();
-        const record = (info: AssistantMessage) => {
-          if (info.sessionID !== this.sessionId || info.time.created < started) return false;
-          usage.set(info.id, info);
-          return true;
-        };
-        const publishUsage = (messages: Iterable<AssistantMessage>, scope?: EventScope) => {
-          const list = [...messages];
-          const input = list.reduce(
-            (sum, message) =>
-              sum + message.tokens.input + message.tokens.cache.read + message.tokens.cache.write,
-            0,
-          );
-          const output = list.reduce(
-            (sum, message) => sum + message.tokens.output + message.tokens.reasoning,
-            0,
-          );
-          this.emit({
-            type: "usage",
-            id: `usage:${scope?.turnId ?? this.execution.turnId}`,
-            usage: {
-              input_tokens: input,
-              output_tokens: output,
-              total_tokens: input + output,
-              input_tokens_details: {
-                cached_tokens: list.reduce((sum, message) => sum + message.tokens.cache.read, 0),
-              },
-              output_tokens_details: {
-                reasoning_tokens: list.reduce((sum, message) => sum + message.tokens.reasoning, 0),
-              },
-            },
-            ...scope,
-          });
-        };
-        const childUsage = new Map<string, Map<string, AssistantMessage>>();
-        const parts = new Map<string, Part["type"]>();
-        /** Completed text parts wait for their step to finish so their phase is known. */
-        const pendingText = new Map<string, { id: string; text: string; scope?: EventScope }[]>();
-        const emittedText = new Set<string>();
-        const flushText = (messageId: string, phase: "commentary" | "final_answer") => {
-          for (const entry of pendingText.get(messageId) ?? []) {
-            if (emittedText.has(entry.id)) continue;
-            emittedText.add(entry.id);
-            this.emit({ type: "text", id: entry.id, text: entry.text, phase, ...entry.scope });
-          }
-          pendingText.delete(messageId);
-        };
-        const phaseOf = (finish: string) =>
-          finish.includes("tool") ? "commentary" : "final_answer";
-        const scopeOf = (sessionId: string): EventScope | undefined => {
-          if (sessionId === this.sessionId) return undefined;
-          const child = this.children.get(sessionId);
-          return child ? { subagentId: child.subagentId, turnId: child.turnId } : undefined;
-        };
-        const openChild = (info: Session) => {
-          if (!info.parentID || info.parentID !== this.sessionId) return;
-          const existing = this.children.get(info.id);
-          if (existing) {
-            if (info.title && existing.name !== info.title) existing.name = info.title;
-            return;
-          }
-          const suffix = info.id.replace(/[^a-zA-Z0-9]/g, "");
-          const child: ChildState = {
-            sessionId: info.id,
-            subagentId: `subagent_${suffix}`,
-            turnId: `turn_${suffix}`,
-            openedAt: Math.floor((info.time?.created ?? Date.now()) / 1000),
-            name: info.title || null,
-            closed: false,
-          };
-          this.children.set(info.id, child);
-          this.emit({
-            type: "subagent",
-            id: child.subagentId,
-            parentId: null,
-            name: child.name,
-            instructions: null,
-            openedAt: child.openedAt,
-            status: "active",
-          });
-          this.emit({
-            type: "subagent_turn",
-            id: child.turnId,
-            subagentId: child.subagentId,
-            status: "in_progress",
-            startedAt: child.openedAt,
-            completedAt: null,
-          });
-        };
-        const closeChild = (child: ChildState, status: "completed" | "failed") => {
-          if (child.closed) return;
-          child.closed = true;
-          for (const messageId of Array.from(pendingText.keys()))
-            if (pendingText.get(messageId)?.some((entry) => entry.scope?.turnId === child.turnId))
-              flushText(messageId, "final_answer");
-          this.emit({
-            type: "subagent_turn",
-            id: child.turnId,
-            subagentId: child.subagentId,
-            status,
-            startedAt: child.openedAt,
-            completedAt: Math.floor(Date.now() / 1000),
-          });
-          this.emit({
-            type: "subagent",
-            id: child.subagentId,
-            parentId: null,
-            name: child.name,
-            instructions: null,
-            openedAt: child.openedAt,
-            status: "closed",
-          });
-        };
-        const collectPart = (part: Part) => {
-          const scope = scopeOf(part.sessionID);
-          if (part.sessionID !== this.sessionId && !scope) return;
-          parts.set(part.id, part.type);
-          if (part.type === "tool") this.trackTool(part);
-          if (part.type === "reasoning")
-            this.emit({
-              type: "reasoning",
-              id: part.id,
-              summary: [part.text],
-              status: part.time.end ? "completed" : "in_progress",
-              ...scope,
-            });
-          if (part.type === "text" && part.time?.end && !emittedText.has(part.id)) {
-            const pending = pendingText.get(part.messageID) ?? [];
-            if (!pending.some((entry) => entry.id === part.id))
-              pending.push({ id: part.id, text: part.text, ...(scope ? { scope } : {}) });
-            pendingText.set(part.messageID, pending);
-          }
-          // A step that ends with tool calls makes its text commentary; a final step answers.
-          if (part.type === "step-finish") flushText(part.messageID, phaseOf(part.reason));
-        };
-        const onAssistantMessage = (info: AssistantMessage) => {
-          const scope = scopeOf(info.sessionID);
-          if (info.sessionID === this.sessionId) {
-            this.answered.add(info.parentID);
-            if (record(info)) publishUsage(usage.values());
-          } else if (scope) {
-            const list = childUsage.get(info.sessionID) ?? new Map<string, AssistantMessage>();
-            list.set(info.id, info);
-            childUsage.set(info.sessionID, list);
-            publishUsage(list.values(), scope);
-          }
-          if (
-            (info.sessionID === this.sessionId || scope) &&
-            info.finish &&
-            pendingText.has(info.id)
-          )
-            flushText(info.id, phaseOf(info.finish));
-        };
-        const onTextDelta = (sessionID: string, partID: string, delta: string) => {
-          const scope = scopeOf(sessionID);
-          if (sessionID !== this.sessionId && !scope) return;
-          if (parts.get(partID) === "reasoning")
-            this.emit({
-              type: "reasoning_delta",
-              id: partID,
-              summaryIndex: 0,
-              text: delta,
-              ...scope,
-            });
-          else this.emit({ type: "delta", id: partID, text: delta, ...scope });
-        };
-        const onSessionUpdated = (info: Session) => {
-          openChild(info);
-          if (info.id !== this.sessionId) return;
-          const token = info.metadata?.cf_sync;
-          const barrier = typeof token === "string" ? this.barriers.get(token) : undefined;
-          if (barrier) Deferred.unsafeDone(barrier, Effect.void);
-        };
-        const onEvent = (event: Event) => {
-          if (process.env.CF_OPENCODE_TRACE)
-            this.options.diagnostics(`opencode-event ${trace(event)}`);
-          switch (event.type) {
-            case "session.created":
-              openChild(event.properties.info);
-              return;
-            case "session.updated":
-              onSessionUpdated(event.properties.info);
-              return;
-            case "message.updated":
-              if (event.properties.info.role === "assistant")
-                onAssistantMessage(event.properties.info);
-              return;
-            case "message.part.updated":
-              collectPart(event.properties.part);
-              return;
-            case "message.part.delta":
-              if (event.properties.field === "text")
-                onTextDelta(
-                  event.properties.sessionID,
-                  event.properties.partID,
-                  event.properties.delta,
-                );
-              return;
-            case "session.status": {
-              if (event.properties.status.type !== "retry") return;
-              const { attempt, message, next } = event.properties.status;
-              this.options.diagnostics(
-                `opencode retry session=${event.properties.sessionID} attempt=${attempt} next_in_ms=${Math.max(0, next - Date.now())}: ${message}`,
-              );
-              return;
-            }
-            case "session.idle": {
-              const child = this.children.get(event.properties.sessionID);
-              if (child) closeChild(child, "completed");
-              if (event.properties.sessionID === this.sessionId) this.idle.notify();
-              return;
-            }
-            case "session.error": {
-              const child = this.children.get(event.properties.sessionID ?? "");
-              if (child) closeChild(child, "failed");
-              if (event.properties.error)
-                this.options.diagnostics(
-                  `opencode session.error session=${event.properties.sessionID ?? "none"}: ${event.properties.error.name}`,
-                );
-              return;
-            }
-            default:
-              return;
-          }
-        };
+        const transcript = new OpenCodeTranscript({
+          sessionId: this.sessionId,
+          turnId: this.execution.turnId,
+          children: this.children,
+          emit: (event) => this.emit(event),
+          trackTool: (part) => this.trackTool(part),
+          answered: (id) => this.answered.add(id),
+          echoed: (token) => {
+            const barrier = this.barriers.get(token);
+            if (barrier) Deferred.unsafeDone(barrier, Effect.void);
+          },
+          idle: () => this.idle.notify(),
+          diagnostics: (line) => this.options.diagnostics(line),
+        });
         let streamError: unknown;
         const subscribed = yield* Deferred.make<void>();
         // Subscribing and reading share one `io`, so the fiber's signal ends the SSE
@@ -573,7 +358,7 @@ export class OpenCodeJob extends ToolJob {
         const consume = async (signal: AbortSignal) => {
           const events = await client.event.subscribe({}, { signal });
           Deferred.unsafeDone(subscribed, Effect.void);
-          for await (const event of events.stream as AsyncIterable<Event>) onEvent(event);
+          for await (const event of events.stream as AsyncIterable<Event>) transcript.accept(event);
         };
         yield* io("opencode.events", consume).pipe(
           Effect.catchAll((error) =>
@@ -645,18 +430,17 @@ export class OpenCodeJob extends ToolJob {
         // The event feed can lag behind the prompt response; once it has caught up
         // the final usage report covers every inference of this turn.
         yield* this.barrier(client);
-        record(last.info);
-        publishUsage(usage.values());
-        for (const child of this.children.values()) closeChild(child, "completed");
-        for (const messageId of Array.from(pendingText.keys()))
-          flushText(messageId, "final_answer");
+        transcript.record(last.info);
+        transcript.publishUsage();
+        transcript.closeChildren();
+        transcript.flushAll();
         const finalText = last.parts.filter(
           (part): part is Extract<Part, { type: "text" }> => part.type === "text",
         );
         if (last.info.structured !== undefined) {
           // The public answer is the validated structured value, like Codex's outputSchema.
           const id = finalText.at(-1)?.id ?? `structured:${last.info.id}`;
-          for (const part of finalText) emittedText.add(part.id);
+          for (const part of finalText) transcript.claim(part.id);
           this.emit({
             type: "text",
             id,
@@ -665,29 +449,42 @@ export class OpenCodeJob extends ToolJob {
           });
         } else
           for (const part of finalText)
-            if (!emittedText.has(part.id)) {
-              emittedText.add(part.id);
+            if (transcript.claim(part.id))
               this.emit({ type: "text", id: part.id, text: part.text, phase: "final_answer" });
-            }
       }),
     );
   }
-  /** Waits until OpenCode reports the session idle, bounded by the execution deadline. */
-  private untilIdle(client: Client): Effect.Effect<void> {
+  /**
+   * Waits until OpenCode reports the session idle, bounded by the execution deadline.
+   * A probe that fails says nothing about the loop, so it reads as busy and is
+   * retried after the wait: reading it as idle could rerun a steer the loop is
+   * still answering.
+   */
+  protected untilIdle(client: StatusClient): Effect.Effect<void> {
     return Effect.gen(this, function* () {
+      let reported = false;
       for (;;) {
         // Captured before the status read: an idle event that lands during it still wakes the wait.
         const woken = this.idle.wait();
         const status = yield* io("opencode.status", (signal) =>
           client.session.status({}, { signal: this.signals(signal) }),
         ).pipe(
-          Effect.map((response) => response.data),
-          Effect.orElseSucceed(() => {}),
+          Effect.map((response) => Option.some(response.data)),
+          Effect.catchAll((error) =>
+            Effect.sync(() => {
+              if (!reported) this.options.diagnostics(`opencode status: ${describeFailure(error)}`);
+              reported = true;
+              return Option.none();
+            }),
+          ),
         );
-        const busy =
-          status && typeof status === "object" && this.sessionId in status
-            ? (status as Record<string, { type?: string }>)[this.sessionId]?.type !== "idle"
-            : false;
+        const busy = Option.match(status, {
+          onNone: () => true,
+          onSome: (data) =>
+            data && typeof data === "object" && this.sessionId in data
+              ? (data as Record<string, { type?: string }>)[this.sessionId]?.type !== "idle"
+              : false,
+        });
         if (!busy || this.closing) return;
         yield* within(woken, "250 millis");
         if (Date.now() > this.execution.deadline) return;
@@ -846,41 +643,4 @@ export class OpenCodeJob extends ToolJob {
       Effect.ignore,
     );
   }
-}
-
-function trace(event: Event): string {
-  const properties = (event as { properties?: Record<string, unknown> }).properties ?? {};
-  const summary: Record<string, unknown> = { type: event.type };
-  if ("sessionID" in properties) summary.sessionID = properties.sessionID;
-  if ("part" in properties) {
-    const part = properties.part as Part;
-    summary.part = {
-      type: part.type,
-      id: part.id,
-      messageID: part.messageID,
-      ...(part.type === "tool"
-        ? {
-            tool: part.tool,
-            callID: part.callID,
-            status: part.state.status,
-            ...(part.state.status === "error" ? { error: part.state.error.slice(0, 300) } : {}),
-          }
-        : {}),
-      ...(part.type === "step-finish" ? { reason: part.reason } : {}),
-      ...(part.type === "text" ? { end: !!part.time?.end } : {}),
-    };
-  }
-  if ("info" in properties) {
-    const info = properties.info as Record<string, unknown>;
-    summary.info = {
-      id: info.id,
-      role: info.role,
-      finish: info.finish,
-      parentID: info.parentID,
-      error: (info.error as { name?: string } | undefined)?.name,
-      structured: info.structured !== undefined,
-    };
-  }
-  if ("status" in properties) summary.status = properties.status;
-  return JSON.stringify(summary);
 }

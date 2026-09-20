@@ -2,7 +2,7 @@
 
 The example in `examples/worker` is one Worker that exports every class: `Agents` (the API, also the default export), `SessionDO`, `TenantCatalogDO`, `HarnessDO`, `SandboxDO`, `ContainerProxy` and the `Models` entrypoint. It binds two Container images, two R2 buckets, a loopback Service Binding to `Models`, a `CODE_LOADER` worker loader and the `AI` binding. `HarnessDO` uses the `basic` instance type and `SandboxDO` uses `standard-1`; tune both after measurement. The Sandbox package and its image both pin `0.13.0-next.751.1`.
 
-Running any harness needs this repository's Docker images: `docker/Harness.Dockerfile` (the supervisor, Codex and OpenCode on Node 24) and `docker/Sandbox.Dockerfile` (Cloudflare's sandbox image plus `python3` and Codex `exec-server`). Wrangler builds them from `examples/worker/wrangler.jsonc`; a project set up by the [CLI](../packages/create-cf-open-agents-api/README.md) builds the same Dockerfiles from its `.cf-open-agents-api/` snapshot.
+Running any harness needs this repository's Docker images: `docker/Harness.Dockerfile` (the supervisor, Codex and OpenCode on Node 24) and `docker/Sandbox.Dockerfile` (Cloudflare's sandbox image plus `python3` and Codex `exec-server`). Wrangler builds them from `examples/worker/wrangler.jsonc` (and from `examples/demo/wrangler.jsonc`, the demo app with the same composition); a project set up by the [CLI](../packages/create-cf-open-agents-api/README.md) builds the same Dockerfiles from its `.cf-open-agents-api/` snapshot.
 
 ## Production walkthrough with the CLI
 
@@ -45,7 +45,7 @@ pnpm exec wrangler deploy
 
    `BACKUP_BUCKET_NAME` is a plain variable read by the Sandbox SDK. `LOCAL_BACKUPS` is read by the library and must stay unset in production; it switches backups to Wrangler's local bucket emulation. The sandbox container itself never receives R2 or model credentials, only short-lived presigned URLs.
 
-4. Decide how the API is reached. The example sets `workers_dev: false` and `preview_urls: false`; a Service Binding works without any public route. Add a custom domain or route only if you host the HTTP API, and replace the single-tenant authenticator first.
+4. Decide how the API is reached. The minimal template and `examples/worker` set `workers_dev: false` and `preview_urls: false`; a Service Binding works without any public route. The demo template publishes on workers.dev by default and its page has no login, so put Cloudflare Access in front of it or replace the page with your own auth before sharing the URL (`workers_dev: false` keeps it off workers.dev). Add a custom domain or route only if you host the HTTP API, and replace the single-tenant authenticator first.
 
 5. Deploy:
 
@@ -69,7 +69,7 @@ pnpm exec wrangler deploy
 
 ## Presets and models
 
-The example registers four presets. `coding` runs Codex through `nativeModel` with the Responses protocol, so images, native reasoning, hosted web search (`webSearch: true`) and structured output reach OpenAI unchanged. `claude` and `opencode` run the other runtimes through the portable AI SDK adapter against the same key. `workers` runs Codex against Workers AI. `coding`, `claude` and `opencode` list each other as `delegates`. See [extending](extending.md) for the options.
+The example registers four presets: `codex`, `claude`, `opencode` and `workers` (the `codex` preset was named `coding` before 0.3.0; sessions pin the preset name they were created with). `codex` runs Codex through `nativeModel` with the Responses protocol, so images, native reasoning, hosted web search (`webSearch: true`) and structured output reach OpenAI unchanged. `claude` and `opencode` run the other runtimes through the portable AI SDK adapter against the same key on the `primary` registry entry; `claude` resolves its `haiku` subagent tier to the `fast` entry (`tiers`). `workers` runs Codex against Workers AI. The registry also holds `workersQwen`, a second Workers AI model no preset uses yet. `codex`, `claude` and `opencode` list each other as `delegates`. See [extending](extending.md) for the options.
 
 The gateway enforces a session's search mode at model egress: `disabled` removes the search tool, `cached` disables external web access, `live` enables it. This also corrects Codex `0.154.0` promoting cached search to live under full-access execution.
 
@@ -103,7 +103,9 @@ pnpm test:containers
 
 It uses a fresh persistence directory and a scripted model. For each harness it verifies native shell execution, the Claude Code and OpenCode tool replacements, a configured environment with a pinned skill, an inline plugin, a service-origin MCP server with a Vault credential, artifacts, isolation from the harness filesystem, a second turn after both containers are destroyed, sandbox reuse across completed turns and restore after cancellation, programmatic tool calling with parallel client calls, explicit cancellation, an abandoned workspace call ending as `programmatic_execution_uncertain`, a same-harness fork, a delegated subagent on the next runtime sharing the workspace, and a cross-runtime fork with the inherited workspace and transcript. The Codex fixture also covers Files API uploads, environment listings, image input, cached search at model egress, usage and an `environment: none` session. It cleans up the containers it created and leaves logs and local R2/SQLite state in the printed temporary directory. `CF_SMOKE_HARNESSES=opencode` narrows the run to one runtime.
 
-Cloudflare's local container proxy needs a route back to workerd. Rootless Docker with `--detach-netns` can place the Docker bridge in a different namespace from both the host and `docker run --network host`. In that configuration, run the smoke inside rootlesskit's network namespace. On Linux with the standard user service:
+Cloudflare's local container proxy needs a route back to workerd. It expects the Docker bridge gateway (`172.17.0.1`) in workerd's own network namespace, which holds for rootful Docker and Docker Desktop. With rootless Docker the bridge lives in rootlesskit's network namespace, so the containers start but every request from them back to the Worker (`model.internal`, `sandbox.internal`) is refused and every turn fails; see the [known issue](known-issues.md). The remedy is to run wrangler inside rootlesskit's network namespace with `nsenter`, with a private bind mount of rootlesskit's `resolv.conf` over `/etc/resolv.conf` so name resolution works there. A project set up by the CLI gets this as `pnpm dev:rootless` (`create-cf-open-agents-api init` offers it when it detects a rootless engine, `init --rootless` adds it explicitly); the script also bridges `127.0.0.1:8787` back to the host, so the browser and SSH port forwarding work as usual.
+
+In this repository, `pnpm test:containers` uses the same recipe by hand. On Linux with the standard user service:
 
 ```sh
 # These variables describe this task; they do not change the Docker daemon.
@@ -119,6 +121,6 @@ nsenter --user="/proc/$cf_open_agents_pid/ns/user" \
 rm "$cf_open_agents_dns"
 ```
 
-The DNS address is slirp4netns's default; use your rootlesskit resolver if you changed it. The bind mount is private to the test process. No host routes, daemon configuration or system resolver change. Rootful Docker does not need this.
+`10.0.2.3` is slirp4netns's default resolver; `$XDG_RUNTIME_DIR/dockerd-rootless/resolv.conf`, which the generated script bind-mounts, names the same resolver and works when you changed it. The `--net` path above is the `--detach-netns` layout; without that flag use `/proc/$cf_open_agents_pid/ns/net`. The bind mount is private to the test process. No host routes, daemon configuration or system resolver change. Rootful Docker does not need this.
 
 See [known issues](known-issues.md) for diagnostics that appear in successful local runs.

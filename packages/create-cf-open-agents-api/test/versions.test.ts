@@ -42,4 +42,16 @@ it("the generated pins agree with the workspace", () => {
   expect(readFileSync(join(packageRoot, "package.json"), "utf8")).toContain(
     `"version": "${versions.CLI_VERSION}"`,
   );
+  const demo = manifest("examples/demo/package.json");
+  for (const [name, version] of Object.entries(versions.DEMO_VERSIONS))
+    expect(demo.dependencies?.[name], name).toBe(version);
+  for (const [name, version] of Object.entries(versions.PROVIDER_VERSIONS))
+    if (name !== "@ai-sdk/anthropic") expect(demo.dependencies?.[name], name).toBe(version);
+});
+
+it("the compatibility date is the one the workspace examples run with", () => {
+  for (const file of ["examples/worker/wrangler.jsonc", "examples/demo/wrangler.jsonc"])
+    expect(readFileSync(join(repoRoot, file), "utf8"), file).toContain(
+      `"compatibility_date": "${versions.COMPATIBILITY_DATE}"`,
+    );
 });

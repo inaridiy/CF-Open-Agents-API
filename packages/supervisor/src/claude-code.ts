@@ -116,6 +116,29 @@ function reasoningOptions(reasoning: Execution["agent"]["reasoning"]): {
   if (!level) return { effort: undefined, thinking };
   return { effort: level === "minimal" ? "low" : level, thinking };
 }
+/**
+ * The CLI resolves the `haiku`, `sonnet` and `opus` aliases a subagent may ask for
+ * through these variables; each tier is a gateway name, else the session's model.
+ * `ANTHROPIC_DEFAULT_HAIKU_MODEL` is also the CLI's small-fast model for its own
+ * helper calls (title, quota and prompt-hook probes, which
+ * `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` suppresses), so `tiers.haiku` must
+ * name a preset that accepts the same protocol as the session's model.
+ */
+export function tierEnv(
+  execution: Pick<Execution, "model" | "tiers">,
+): Record<
+  | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+  | "ANTHROPIC_DEFAULT_SONNET_MODEL"
+  | "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  string
+> {
+  const { model, tiers } = execution;
+  return {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: tiers?.haiku ?? model,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: tiers?.sonnet ?? model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: tiers?.opus ?? model,
+  };
+}
 /** Map a Claude Code result to the public turn error code; native detail goes to diagnostics. */
 export function claudeTurnError(result: SDKResultMessage): TurnErrorCode | undefined {
   if (result.subtype === "success" && !result.is_error) return undefined;
@@ -151,6 +174,45 @@ export function claudeTurnError(result: SDKResultMessage): TurnErrorCode | undef
       return "invalid_request";
     default:
       return "internal_error";
+  }
+}
+
+/**
+ * Aligns the ids of completed blocks with the streamed ones. With partial messages
+ * the SDK delivers one `assistant` message per completed block, all under the same
+ * message id with a single-element `content`, and drops a text block that stayed
+ * empty (`0 thinking, 1 text(""), 2 text("Calling."), 3 tool_use` arrive as three
+ * messages). Each part therefore takes the next stream block of its type that has
+ * not been consumed, skipping text blocks that received no text, so `text` and
+ * `reasoning` carry the id their deltas were streamed under. Without a stream
+ * record (no partial messages, a full `content` array) the position is the index.
+ */
+export class StreamBlocks {
+  private readonly byMessage = new Map<
+    string,
+    { index: number; type: string; received: boolean; consumed: boolean }[]
+  >();
+  started(messageId: string, index: number, type: string): void {
+    const blocks = this.byMessage.get(messageId) ?? [];
+    blocks.push({ index, type, received: false, consumed: false });
+    this.byMessage.set(messageId, blocks);
+  }
+  received(messageId: string, index: number): void {
+    const block = this.byMessage.get(messageId)?.find((entry) => entry.index === index);
+    if (block) block.received = true;
+  }
+  assign(messageId: string, type: string, position: number): number {
+    const blocks = this.byMessage.get(messageId);
+    if (!blocks) return position;
+    const block = blocks.find(
+      (entry) => !entry.consumed && entry.type === type && (type !== "text" || entry.received),
+    );
+    if (!block) return position;
+    block.consumed = true;
+    return block.index;
+  }
+  clear(): void {
+    this.byMessage.clear();
   }
 }
 
@@ -357,9 +419,7 @@ export class ClaudeCodeJob extends ToolJob {
           CLAUDE_CONFIG_DIR: this.home,
           ANTHROPIC_API_KEY: "private-worker-gateway",
           ANTHROPIC_BASE_URL: this.options.modelBaseUrl.replace(/\/v1\/?$/, ""),
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: this.execution.model,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: this.execution.model,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: this.execution.model,
+          ...tierEnv(this.execution),
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
         },
       },
@@ -484,6 +544,9 @@ export class ClaudeCodeJob extends ToolJob {
       return "abandoned";
     }
     if (pendingWork) return undefined;
+    // Message ids are unique to one turn; the per-message bookkeeping ends with it.
+    this.streamMessage.clear();
+    this.blocks.clear();
     this.finalize(message);
     this.finished = true;
     input.close();
@@ -667,8 +730,8 @@ export class ClaudeCodeJob extends ToolJob {
     this.flushTexts((entry) => sameScope(entry) && entry.messageId !== messageId, "commentary");
     if (content.some((part) => part.type === "tool_use" || part.type === "server_tool_use"))
       this.flushTexts((entry) => sameScope(entry) && entry.messageId === messageId, "commentary");
-    for (const [index, part] of content.entries()) {
-      const id = `${messageId}:${index}`;
+    for (const [position, part] of content.entries()) {
+      const id = `${messageId}:${this.blocks.assign(messageId, part.type, position)}`;
       if (part.type === "text") {
         if (scope) {
           const child = this.child({ taskToolUseId: parentToolUseId ?? undefined });
@@ -737,7 +800,10 @@ export class ClaudeCodeJob extends ToolJob {
           this.scopeOf(message.parent_tool_use_id),
         );
   }
+  /** Streamed message id per scope (`root` or the parent tool use), set by `message_start`. */
   private readonly streamMessage = new Map<string, string>();
+  /** Block positions the stream announced per message id, consumed by `acceptAssistant`. */
+  private readonly blocks = new StreamBlocks();
   private acceptStream(
     event: Extract<SDKMessage, { type: "stream_event" }>["event"],
     parentToolUseId: string | null,
@@ -750,6 +816,8 @@ export class ClaudeCodeJob extends ToolJob {
     }
     const messageId = this.streamMessage.get(key);
     if (!messageId) return;
+    if (event.type === "content_block_start")
+      this.blocks.started(messageId, event.index, event.content_block.type);
     if (event.type === "content_block_start" && event.content_block.type === "thinking") {
       this.emit({
         type: "reasoning",
@@ -766,7 +834,8 @@ export class ClaudeCodeJob extends ToolJob {
         ...scope,
       });
     }
-    if (event.type === "content_block_delta" && event.delta.type === "thinking_delta")
+    if (event.type === "content_block_delta" && event.delta.type === "thinking_delta") {
+      this.blocks.received(messageId, event.index);
       this.emit({
         type: "reasoning_delta",
         id: `${messageId}:${event.index}`,
@@ -774,13 +843,18 @@ export class ClaudeCodeJob extends ToolJob {
         text: event.delta.thinking,
         ...scope,
       });
-    if (event.type === "content_block_delta" && event.delta.type === "text_delta")
+    }
+    // An empty delta carries nothing, and the CLI drops a text block that stays empty.
+    if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+      if (!event.delta.text) return;
+      this.blocks.received(messageId, event.index);
       this.emit({
         type: "delta",
         id: `${messageId}:${event.index}`,
         text: event.delta.text,
         ...scope,
       });
+    }
   }
   private recordUsage(message: SDKResultMessage): void {
     this.resultSettled.notify();

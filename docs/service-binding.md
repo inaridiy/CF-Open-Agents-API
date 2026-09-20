@@ -16,36 +16,50 @@ For local development, follow the [README walkthrough](../README.md#first-run-fr
 
 When the API lives in the same Worker as your application (the setup CLI's retrofit), the binding points at the Worker itself: `{ "binding": "AGENTS", "service": "<your worker>", "entrypoint": "Agents" }`. Everything below applies unchanged; `env.AGENTS` is the same `Fetcher & AgentRPC`.
 
-Configure the same `API_TOKEN` on both Workers for the example's single-tenant authenticator. It must contain at least 32 unpredictable characters. The provider's `OPENAI_API_KEY` belongs only on the Agent Worker.
+`API_TOKEN` (at least 32 unpredictable characters) is read by the example's single-tenant authenticator for HTTP callers; a Service Binding caller that uses `tenantFetch` does not need it. The provider's `OPENAI_API_KEY` belongs only on the Agent Worker.
 
 ## Connect the official client
 
+The binding is the credential. `tenantFetch(env.AGENTS, tenant)` returns a `fetch` for the official client that serves every request as the given tenant through the binding's `fetchAs` RPC method, skipping the HTTP authenticator like the other [RPC methods](rpc.md): the trusted Worker names the tenant, and no `API_TOKEN` travels over the binding.
+
 ```ts
+import { type AgentRPC, tenantFetch } from "cf-open-agents-api/cloudflare";
 import OpenAI from "openai";
 
 interface Env {
-  AGENTS: Fetcher;
-  API_TOKEN: string;
+  AGENTS: Fetcher & AgentRPC;
 }
-function agentClient(env: Env) {
+function agentClient(env: Env, tenant: string) {
   return new OpenAI({
-    apiKey: env.API_TOKEN,
+    apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
     baseURL: "https://agents.internal/v1",
-    fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
+    fetch: tenantFetch(env.AGENTS, tenant),
   });
 }
 ```
 
-The custom `fetch` sends the request to the binding, including its path, headers, body and abort signal. There is no DNS lookup for `agents.internal`. The request still passes through the Agent Worker's HTTP authentication and validation. For a multi-tenant application, replace `bearerTenant` with an authenticator that derives the tenant from verified credentials.
+The request reaches the binding with its path, headers and body; there is no DNS lookup for `agents.internal`. Use `tenantFetch` rather than calling `fetchAs` from the client's `fetch` yourself: a `Request` handed to an RPC method travels by structured clone, which cannot carry the SDK's `AbortSignal` (`DataCloneError: AbortSignal serialization is not enabled`), so `tenantFetch` builds the request without the signal and honors it on the caller's side (the promise rejects with an `AbortError`; the in-flight request completes). `env.AGENTS.fetchAs(tenant, request)` itself is fine for a hand-built request without a signal, such as `new Request("https://agents.internal/cf/v1/capabilities")`, which is how the demo reads the preset list. Validation, idempotency and session ownership within the tenant are unchanged. The same trust rule as for RPC applies: derive `tenant` from your own verified identity (the authenticated user, your service's tenant), never from a request body or header a client controls.
+
+When the caller only holds a token, or forwards end-user requests that must pass through the Agent Worker's own authenticator, use the binding's plain `fetch` with the bearer token instead:
+
+```ts
+new OpenAI({
+  apiKey: env.API_TOKEN,
+  baseURL: "https://agents.internal/v1",
+  fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
+});
+```
+
+That request passes through `authenticate` (the example's `bearerTenant`), so both Workers need the same `API_TOKEN`. For a multi-tenant application on this path, replace `bearerTenant` with an authenticator that derives the tenant from verified credentials.
 
 ## Run a turn and read its result
 
 Inside your Worker handler, create an idle session, then subscribe and submit input together:
 
 ```ts
-const client = agentClient(env);
+const client = agentClient(env, "default");
 const session = await client.beta.agents.sessions.create(
-  { agent: { model: "coding" }, environment: { type: "openai_hosted" } },
+  { agent: { model: "codex" }, environment: { type: "openai_hosted" } },
   { headers: { "Idempotency-Key": "session-for-task-123" } },
 );
 
@@ -63,7 +77,7 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 return Response.json({ session_id: session.id, answer });
 ```
 
-Keep the session ID for later turns. Call `sessions.stream` again with new input and a new idempotency key after the session returns to `idle`. A failed turn also returns the session to `idle` (with `session.error` set) unless the outcome was indeterminate; then the session is `failed` and you fork it. Streaming does not extend the lifetime of an unrelated Worker request: forward the stream to your client or wait for the result inside your handler. For detached jobs, submit input, return the session ID, and retrieve results in a later request.
+Keep the session ID for later turns. Call `sessions.stream` again with new input and a new idempotency key after the session returns to `idle`. A failed turn also returns the session to `idle` with `session.error` set, so a client that only looks at `status` cannot tell completion from failure; read `session.error` and the latest turn's `error`, as the [demo app](../examples/demo/src/index.tsx) does. Only an indeterminate outcome leaves the session `failed`; then you fork it. Streaming does not extend the lifetime of an unrelated Worker request: forward the stream to your client or wait for the result inside your handler. For detached jobs, submit input, return the session ID, and retrieve results in a later request.
 
 Input sent while a turn is running steers it: the message is added to the live turn on every harness. If the runtime has already finished, the message runs as the next turn instead.
 
@@ -76,7 +90,7 @@ Provide application tools in `agent.tools` when creating the session. The SDK st
 ```ts
 const clockSession = await client.beta.agents.sessions.create({
   agent: {
-    model: "coding",
+    model: "codex",
     tools: [
       {
         type: "function",

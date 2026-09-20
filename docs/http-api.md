@@ -18,7 +18,7 @@ const client = new OpenAI({
   apiKey: process.env.AGENT_API_TOKEN,
 });
 const session = await client.beta.agents.sessions.create(
-  { agent: { model: "coding" }, environment: { type: "openai_hosted" } },
+  { agent: { model: "codex" }, environment: { type: "openai_hosted" } },
   { headers: { "Idempotency-Key": "task-123-session" } },
 );
 for await (const event of client.beta.agents.sessions.stream(session.id, {
@@ -40,7 +40,7 @@ curl https://agents.example.com/v1/agents/sessions \
   -H "Authorization: Bearer $AGENT_API_TOKEN" \
   -H 'OpenAI-Beta: agents=v1' -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: task-123-session' \
-  -d '{"agent":{"model":"coding"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/report.txt, then summarize it."}'
+  -d '{"agent":{"model":"codex"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/report.txt, then summarize it."}'
 ```
 
 The response is the session object (abbreviated):
@@ -53,7 +53,7 @@ The response is the session object (abbreviated):
   "error": null,
   "required_actions": [],
   "agent": {
-    "model": "coding",
+    "model": "codex",
     "tools": [],
     "multi_agent": { "enabled": false, "max_concurrent_subagents": null }
   },
@@ -72,6 +72,6 @@ The response is the session object (abbreviated):
 }
 ```
 
-Poll `GET /v1/agents/sessions/<id>` with the same header until `status` is `idle`, `requires_action` or `failed`. `GET /v1/agents/sessions/<id>/items` and `/turns` hold the result. A `2xx` on the create request only means the task was accepted. Every response carries `x-request-id`; permanent `409` conflicts carry `x-should-retry: false`. Add `"stream": true` to the create body to receive an SSE stream that ends when the initial turn settles.
+Poll `GET /v1/agents/sessions/<id>` with the same header until `status` is `idle`, `requires_action` or `failed`. `GET /v1/agents/sessions/<id>/items` and `/turns` hold the result. A failed turn also puts the session back to `idle` with `error` set, so a client that only looks at `status` cannot tell completion from failure; read the session's `error` and the turn's `error`, as the [demo app](../examples/demo/src/index.tsx) does. A `2xx` on the create request only means the task was accepted. Every response carries `x-request-id`; permanent `409` conflicts carry `x-should-retry: false`. Add `"stream": true` to the create body to receive an SSE stream that ends when the initial turn settles.
 
 Live SSE is `GET /v1/agents/sessions/<id>/events`; reconnecting to it does not replay history. `GET /cf/v1/sessions/<id>/events?after=<seq>` replays the durable log from a sequence number, and `POST /cf/v1/sessions/<id>/fork` continues a committed session; both are extensions of this implementation. See [forks](environments-and-tools.md#fork-a-session).

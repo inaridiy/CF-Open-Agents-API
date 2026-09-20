@@ -13,7 +13,8 @@ export type ListField =
   | "environment_id"
   | "turn_id"
   | "item.turn_id"
-  | "resource.purpose";
+  | "resource.purpose"
+  | "status";
 export interface ListFilter {
   field?: ListField;
   value?: string;

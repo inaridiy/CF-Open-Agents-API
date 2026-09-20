@@ -106,9 +106,92 @@ it("runDoctor combines the file checks with the tool checks through the runner",
     const report = runDoctor({ dir, runner, cliVersion: versions.CLI_VERSION });
     expect(report.ok).toBe(false);
     expect(failing(report.checks)).toEqual(["docker", "wrangler login"]);
-    expect(calls).toEqual(["npx wrangler --version", "docker info", "npx wrangler whoami"]);
+    expect(calls).toEqual([
+      "npx wrangler --version",
+      "docker info --format {{json .SecurityOptions}}",
+      "npx wrangler whoami",
+    ]);
     writeFileSync(join(dir, ".dev.vars"), "API_TOKEN=short\n");
     expect(failing(runDoctor({ dir, offline: true }).checks)).toEqual([".dev.vars API_TOKEN"]);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+it("a docker info that times out fails the docker check and skips the rootless check", async () => {
+  const dir = copyFixture("vite-project");
+  try {
+    await runInit({
+      dir,
+      yes: true,
+      force: false,
+      dryRun: false,
+      env: offline,
+      reporter: silent(),
+      rootless: false,
+    });
+    const timeouts: (number | undefined)[] = [];
+    const stalled = (
+      command: string,
+      args: readonly string[],
+      options?: { timeoutMs?: number },
+    ) => {
+      if (command === "docker") {
+        timeouts.push(options?.timeoutMs);
+        return { ok: false, stdout: "", stderr: "timed out", timedOut: true };
+      }
+      if (args.includes("--version")) return { ok: true, stdout: "4.131.1\n", stderr: "" };
+      return { ok: true, stdout: "You are logged in", stderr: "" };
+    };
+    const report = runDoctor({ dir, runner: stalled, cliVersion: versions.CLI_VERSION });
+    expect(timeouts).toEqual([5000]);
+    expect(failing(report.checks)).toEqual(["image snapshot", "docker"]);
+    expect(report.checks.find((check) => check.name === "docker")?.detail).toMatch(
+      /did not answer within 5000 ms/,
+    );
+  } finally {
+    cleanup(dir);
+  }
+});
+
+it("a rootless engine needs the dev:rootless script", async () => {
+  const dir = copyFixture("vite-project");
+  try {
+    const rootless = (command: string, args: readonly string[]) => {
+      if (command === "docker")
+        return {
+          ok: true,
+          stdout: '["name=seccomp,profile=builtin","name=rootless"]\n',
+          stderr: "",
+        };
+      if (args.includes("--version")) return { ok: true, stdout: "4.131.1\n", stderr: "" };
+      return { ok: true, stdout: "You are logged in", stderr: "" };
+    };
+    await runInit({
+      dir,
+      yes: true,
+      force: false,
+      dryRun: false,
+      env: offline,
+      reporter: silent(),
+      rootless: false,
+    });
+    const without = runDoctor({ dir, runner: rootless, cliVersion: versions.CLI_VERSION });
+    expect(failing(without.checks)).toEqual(["image snapshot", "docker rootless"]);
+    expect(without.checks.find((check) => check.name === "docker rootless")?.detail).toMatch(
+      /init --rootless.*temporary workaround/,
+    );
+    await runInit({
+      dir,
+      yes: true,
+      force: false,
+      dryRun: false,
+      env: offline,
+      reporter: silent(),
+      rootless: true,
+    });
+    const withScript = runDoctor({ dir, runner: rootless, cliVersion: versions.CLI_VERSION });
+    expect(failing(withScript.checks)).toEqual(["image snapshot"]);
   } finally {
     cleanup(dir);
   }

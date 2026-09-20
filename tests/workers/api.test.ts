@@ -250,6 +250,64 @@ it("resolves deployment-owned delegation targets when subagents are enabled", as
   expect(capabilities.agents["test-lead"]?.delegates).toEqual(["test-tools"]);
 });
 
+it("pins a preset's model tiers with the session and reports them in capabilities", async () => {
+  const api = client();
+  const session = await api.beta.agents.sessions.create({
+    ...params,
+    agent: { model: "test-tiers" },
+    input: "hello",
+  });
+  await runDurableObjectAlarm(stub(session.id));
+  const turn = (await api.beta.agents.sessions.turns.list(session.id)).data[0];
+  expect(JSON.parse(await env.SCRIPTED.getByName(turn?.id ?? "").started())).toMatchObject({
+    model: "fixture-model",
+    tiers: { haiku: "fixture-small", opus: "fixture-large" },
+  });
+  const persisted = await runInDurableObject<SessionDO, SessionRecord>(
+    stub(session.id),
+    (instance) => instance.db.require(SessionKinds.state, "session"),
+  );
+  expect(persisted.tiers).toEqual({ haiku: "fixture-small", opus: "fixture-large" });
+  // A preset without tiers pins none, so the driver falls back to the model.
+  const plain = await api.beta.agents.sessions.create({ ...params, input: "hello" });
+  await runDurableObjectAlarm(stub(plain.id));
+  const plainTurn = (await api.beta.agents.sessions.turns.list(plain.id)).data[0];
+  expect(JSON.parse(await env.SCRIPTED.getByName(plainTurn?.id ?? "").started())).toMatchObject({
+    tiers: null,
+  });
+  // A delegate target carries its own tiers to the child's execution.
+  const lead = await api.beta.agents.sessions.create({
+    ...params,
+    agent: { model: "test-tiers-lead", multi_agent: { enabled: true } },
+    input: "hello",
+  });
+  await runDurableObjectAlarm(stub(lead.id));
+  const leadTurn = (await api.beta.agents.sessions.turns.list(lead.id)).data[0];
+  expect(JSON.parse(await env.SCRIPTED.getByName(leadTurn?.id ?? "").started())).toMatchObject({
+    delegates: [
+      {
+        alias: "test-tiers",
+        harness: "fixture",
+        model: "fixture-model",
+        tiers: { haiku: "fixture-small", opus: "fixture-large" },
+      },
+    ],
+  });
+  const capabilities = await (
+    await exports.default.fetch(
+      new Request("https://api.test/cf/v1/capabilities", {
+        headers: { authorization: "Bearer tenant-a" },
+      }),
+    )
+  ).json<{ agents: Record<string, { model: string; tiers?: Record<string, string> }> }>();
+  expect(capabilities.agents["test-tiers"]).toEqual({
+    harness: "fixture",
+    model: "fixture-model",
+    tiers: { haiku: "fixture-small", opus: "fixture-large" },
+  });
+  expect(capabilities.agents.test?.tiers).toBeUndefined();
+});
+
 it("provides durable replay through a separate extension", async () => {
   const session = await client().beta.agents.sessions.create({ ...params, input: "hello" });
   await runDurableObjectAlarm(stub(session.id));
