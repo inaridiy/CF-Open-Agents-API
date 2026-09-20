@@ -19,16 +19,16 @@ Format only the files you change: `pnpm exec oxfmt <files>`. Markdown is formatt
 
 Run commands from the repository root. Pick the rows that match the change; CI runs the whole matrix. Scripted suites use local fixtures and need no production credentials. State clearly which evidence came from scripted inference and which from a real provider.
 
-| Change                                                             | Checks and completion evidence                                                                                           |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| Prose, agent instructions, skill inventory                         | `pnpm check:docs`, `pnpm check:harness`, `pnpm exec oxfmt --check <files>`; read the diff                                |
-| Development checker scripts                                        | The two checks above plus `pnpm test:scripts` and `pnpm lint`                                                            |
-| API, session, storage logic, runtime dependencies or test behavior | `pnpm check`; a correctness fix needs a behavioral regression test at the affected boundary                              |
-| Supervisor, model gateway, native protocols or checkpoint formats  | `pnpm check`, `pnpm test:codex`, `pnpm test:harnesses`; exercise the affected runtime and history recovery               |
-| Container transport, sandbox tools, R2 restore or Docker images    | The applicable rows above plus `pnpm test:containers`; see [local runtime notes](docs/deployment.md#local-runtime-notes) |
-| Public package exports, dependencies or release assembly           | `pnpm check`, `pnpm test:package`; native and container checks when their dependency tree changes                        |
-| Worker bindings, configuration or deployment packaging             | `pnpm types`, `pnpm build`, `pnpm deploy:check`; transport changes also need the container smoke                         |
-| The setup CLI, its templates or the generated project files        | `pnpm build`, `pnpm test:cli`, `pnpm lint`, `pnpm test:package`; a template change also needs `pnpm check:docs`          |
+| Change                                                             | Checks and completion evidence                                                                                                                                                                                        |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prose, agent instructions, skill inventory                         | `pnpm check:docs`, `pnpm check:harness`, `pnpm exec oxfmt --check <files>`; read the diff                                                                                                                             |
+| Development checker scripts                                        | The two checks above plus `pnpm test:scripts` and `pnpm lint`                                                                                                                                                         |
+| API, session, storage logic, runtime dependencies or test behavior | `pnpm check`; a correctness fix needs a behavioral regression test at the affected boundary                                                                                                                           |
+| Supervisor, model gateway, native protocols or checkpoint formats  | `pnpm check`, `pnpm test:codex`, `pnpm test:harnesses`; exercise the affected runtime and history recovery                                                                                                            |
+| Container transport, sandbox tools, R2 restore or Docker images    | The applicable rows above plus `pnpm test:containers`; see [local runtime notes](docs/deployment.md#local-runtime-notes)                                                                                              |
+| Public package exports, dependencies or release assembly           | `pnpm check`, `pnpm test:package`; native and container checks when their dependency tree changes                                                                                                                     |
+| Worker bindings, configuration or deployment packaging             | `pnpm types`, `pnpm build`, `pnpm deploy:check`; transport changes also need the container smoke                                                                                                                      |
+| The setup CLI, its templates or the generated project files        | `pnpm build`, `pnpm test:cli`, `pnpm lint`, `pnpm test:package`; a template change also needs `pnpm check:docs` and `examples/demo` and `examples/worker` regenerated, since the CLI tests compare them byte for byte |
 
 What each suite covers:
 
@@ -38,7 +38,7 @@ What each suite covers:
 - `pnpm test:containers` (`scripts/test-containers.mjs`, `tests/containers`): the real Worker, Container and R2 path in Wrangler's local emulation with Docker. Needs Docker and `python3`; see [deployment](docs/deployment.md#local-runtime-notes) for the rootless recipe.
 - `pnpm test:package`: packs the library and typechecks a consumer against the tarball.
 - `pnpm test:scripts`: unit tests of the checker, bootstrap and container scripts. The label test imports the built library, so run `pnpm build` first.
-- `pnpm test:cli` (`packages/create-cf-open-agents-api/test`, vitest in Node): `init` against fixture projects (retrofit, standalone, idempotency, dry run, conflicts, `--force`), the snapshot, `doctor`, `setup` through a fake runner, the pins against the workspace manifests, and every rendered composition formatted with oxfmt and typechecked against the built library. Run `pnpm build` first; the standalone test compares the output with `examples/worker` byte for byte.
+- `pnpm test:cli` (`packages/create-cf-open-agents-api/test`, vitest in Node): `init` against fixture projects (retrofit, standalone, idempotency, dry run, conflicts, `--force`), the snapshot, `doctor`, `setup` through a fake runner, the pins against the workspace manifests, and every rendered composition formatted with oxfmt and typechecked against the built library. Run `pnpm build` first; the standalone tests compare the output with `examples/worker` (minimal template) and `examples/demo` (demo template) byte for byte.
 
 Match recurring diagnostics against [known issues](docs/known-issues.md). See [scope and completion](#scope-and-completion) for boundaries.
 
@@ -46,11 +46,11 @@ Match recurring diagnostics against [known issues](docs/known-issues.md). See [s
 
 - `packages/agent-api/src/protocol.ts`: wire schemas, public types, `parse` and `parseEffect`, limits such as the image cap.
 - `errors.ts`: the layered tagged error vocabulary, `toApiError` (the only status and code table), `isPermanent`, the RPC envelope; `api-error.ts`: the `ApiError` projection; `effect.ts`: `io`, `attempt`, `OperationError`, the boundary runners.
-- `service.ts`: the composition root, the `AgentWorker` RPC methods, the Hono app and its error handler; `http/`: one route module per resource (sessions, agents, environments, files, skills, vaults, capabilities).
+- `service.ts`: the composition root, the `AgentWorker` RPC methods, `tenantFetch` and `bearerTenant`; `service-validation.ts`: request validation against the presets; `session-reservation.ts`: the session record creation and fork share; `http/app.ts`: the Hono app and its error handler; `http/`: one route module per resource (sessions, agents, environments, files, skills, vaults, capabilities).
 - `session.ts`: `SessionObject`, its runtime, the synchronous RPC reads and the SSE stream; `session-services.ts`: the `Drivers`, `Alarm` and `Repo` services; `session-state.ts`: the synchronous state machine; `session-reconcile.ts`: the reconciler tick; `session-events.ts`: projection of runtime events into public items and events.
 - `persistence/`: the repository seam (`Kind`, `RecordStore`, `MemoryStore`, `Repo`, `SessionTx` and `SessionRepo`, `HarnessTx`, `Fenced`); `storage.ts`: `SqlStore`, Kysely queries executed synchronously in SQLite, row and page budgets.
 - `catalog.ts`: the tenant catalog; `runtime.ts`: Effect schemas, the `RuntimeDriver` contract and `fromPromiseDriver`.
-- `containers.ts`: HarnessDO and SandboxDO, sandbox reuse, model and tool egress, delegated children, checkpoints, the container drivers.
+- `containers.ts`: HarnessDO and SandboxDO and the container drivers; `containers/`: `host.ts` (bindings and services), `assignment.ts` (the execution authority and `modelAllowed`), `sandbox.ts` (sandbox reuse), `proxies.ts` (model, MCP and media egress), `delegation.ts` (delegated children), `checkpoint.ts` (checkpoints and artifacts), `diagnostics.ts` (the harness diagnostics hint).
 - `container-environments.ts`, `environment-config.ts`, `environments.ts`: hosted environment setup, uploads, inheritance.
 - `skills.ts`, `skill-zip.ts`, `capability-archive.ts`, `files.ts`, `vaults.ts`: tenant-owned skills, input files and credentials.
 - `programmatic.ts`, `programmatic-contract.ts`: isolated code execution and its tool bridge.

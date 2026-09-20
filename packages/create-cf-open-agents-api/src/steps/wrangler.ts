@@ -246,7 +246,9 @@ function ensureAi(state: State): void {
   if (!state.input.workersAi) return;
   const ai = config(state).ai;
   if (!ai) {
-    set(state, ["ai"], { binding: "AI" });
+    // Workers AI has no local emulator; `remote: true` states that and silences the
+    // `AI bindings always access remote resources` warning on every `wrangler dev`.
+    set(state, ["ai"], { binding: "AI", remote: true });
     return;
   }
   if (ai.binding !== "AI")

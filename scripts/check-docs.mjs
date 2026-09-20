@@ -36,7 +36,11 @@ for (const entrypoint of Object.keys(library.exports)) {
   const specifier = library.name + (entrypoint === "." ? "" : entrypoint.slice(1));
   assert(packageReadme.includes(`\`${specifier}\``), `Document the ${specifier} entrypoint`);
 }
-for (const file of ["examples/worker/wrangler.jsonc", "tests/containers/wrangler.jsonc"]) {
+for (const file of [
+  "examples/worker/wrangler.jsonc",
+  "examples/demo/wrangler.jsonc",
+  "tests/containers/wrangler.jsonc",
+]) {
   const config =
     /** @type {{ name: string, services: { binding: string, service: string }[], vars: Record<string, string>, r2_buckets: { binding: string, bucket_name: string }[] }} */ (
       JSON.parse(await readFile(new URL(`../${file}`, import.meta.url), "utf8"))

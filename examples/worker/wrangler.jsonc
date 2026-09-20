@@ -80,6 +80,7 @@
     "BACKUP_BUCKET_NAME": "cf-open-agents-api-workspaces"
   },
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
+    "remote": true
   }
 }

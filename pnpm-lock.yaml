@@ -75,6 +75,39 @@ importers:
         specifier: 7.15.0
         version: 7.15.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.2)
 
+  examples/demo:
+    dependencies:
+      '@ai-sdk/openai':
+        specifier: 4.0.65
+        version: 4.0.65(zod@4.6.2)
+      '@ai-sdk/provider':
+        specifier: 4.0.13
+        version: 4.0.13
+      ai:
+        specifier: 7.0.97
+        version: 7.0.97(zod@4.6.2)
+      cf-open-agents-api:
+        specifier: workspace:*
+        version: link:../../packages/agent-api
+      effect:
+        specifier: 3.22.2
+        version: 3.22.2
+      fflate:
+        specifier: 0.8.3
+        version: 0.8.3
+      hono:
+        specifier: 4.13.8
+        version: 4.13.8
+      openai:
+        specifier: 7.15.0
+        version: 7.15.0(undici@7.29.1)(ws@8.21.0)(zod@4.6.2)
+      workers-ai-provider:
+        specifier: 4.0.0
+        version: 4.0.0(@ai-sdk/anthropic@4.0.53(zod@4.6.2))(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2))
+      zod:
+        specifier: 4.6.2
+        version: 4.6.2
+
   examples/worker:
     dependencies:
       '@ai-sdk/openai':
@@ -1874,6 +1907,10 @@ packages:
 
   hono@4.13.7:
     resolution: {integrity: sha512-c8/gF9ac8Y78/agExVocyLevgR+JlpNB444Py0FSX8pJoPdYUfUzRcXtYEYGwt6l19qIlVZPN5Mfsw9jFShmQQ==}
+    engines: {node: '>=16.9.0'}
+
+  hono@4.13.8:
+    resolution: {integrity: sha512-/Gng7NfoykZl2pjukW5Z6+8Yxm3BPRf86GTbQnt0SbySkvax4fyL4H3HhY1cCpBGmiW9XDRFzRV+CXK2W8QudQ==}
     engines: {node: '>=16.9.0'}
 
   http-errors@2.0.1:
@@ -3985,6 +4022,8 @@ snapshots:
       function-bind: 1.1.2
 
   hono@4.13.7: {}
+
+  hono@4.13.8: {}
 
   http-errors@2.0.1:
     dependencies:

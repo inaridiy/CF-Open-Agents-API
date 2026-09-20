@@ -7,6 +7,7 @@ import { expect, it } from "vitest";
 
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { createModelGateway, nativeModel } from "../../packages/agent-api/src/models.js";
+import { StreamBlocks } from "../../packages/supervisor/src/claude-code.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
 
@@ -99,13 +100,18 @@ async function anthropicFixture(script: (request: Request, index: number) => Rep
       headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
     });
   });
-  const gateway = createModelGateway(() => ({
-    primary: nativeModel({
+  // Two registry names over one upstream: the upstream request's `model` tells which
+  // name the harness sent, since the gateway swaps each for its own upstream model.
+  const registry = (model: string) =>
+    nativeModel({
       protocol: "anthropic",
       baseURL: `${upstream.url}/v1`,
       apiKey: "fixture-key",
-      model: "fixture-model",
-    }),
+      model,
+    });
+  const gateway = createModelGateway(() => ({
+    primary: registry("fixture-model"),
+    small: registry("fixture-small"),
   }));
   const model = await serveFetch((request) => gateway.fetch(request, {}));
   return {
@@ -296,6 +302,76 @@ it("maps reasoning effort, summary display and structured output onto the SDK", 
   } finally {
     await h.close();
   }
+});
+
+it("keeps streamed and completed block ids aligned when the CLI omits a block", async () => {
+  // With partial messages the SDK reports each completed block as its own assistant
+  // message under one message id and drops a text block that stayed empty; the ids
+  // must still follow the stream's block index.
+  const h = await harness((request, index) => {
+    const tool = toolName(request, /function_0$/);
+    if (index === 0 && tool)
+      return {
+        blocks: [
+          { type: "thinking", thinking: "Weighing the answer." },
+          { type: "text", text: "" },
+          { type: "text", text: "Calling." },
+          { type: "tool_use", id: "toolu_1", name: tool, input: { query: "durable" } },
+        ],
+        stop_reason: "tool_use",
+      };
+    return { blocks: [{ type: "text", text: "Here is the answer." }] };
+  });
+  try {
+    const execution = h.execution({});
+    const start = await h.post("/jobs", { execution, operationId: "start" });
+    expect(start.ok, start.body).toBe(true);
+    const batch = await h.finish(execution.turnId, () => "found");
+    const all = events(batch);
+    const reasoning = all.filter((event) => event.type === "reasoning");
+    const deltas = all.filter((event) => event.type === "delta");
+    const texts = all.filter((event) => event.type === "text");
+    expect(reasoning.length, h.context()).toBeGreaterThan(0);
+    const [first] = reasoning;
+    const prefix = first?.id.replace(/:\d+$/, "") ?? "";
+    expect(prefix, h.context()).not.toBe("");
+    expect(new Set(reasoning.map((event) => event.id))).toEqual(new Set([`${prefix}:0`]));
+    // The empty text block (index 1) never completes, so nothing is announced under its id.
+    expect(all.filter((event) => "id" in event && event.id === `${prefix}:1`)).toEqual([]);
+    expect(deltas.filter((event) => event.id.startsWith(prefix)).map((event) => event.id)).toEqual([
+      `${prefix}:2`,
+    ]);
+    expect(texts.map((event) => ({ id: event.id, text: event.text, phase: event.phase }))).toEqual([
+      { id: `${prefix}:2`, text: "Calling.", phase: "commentary" },
+      expect.objectContaining({ text: "Here is the answer.", phase: "final_answer" }),
+    ]);
+    const answer = texts[1];
+    const answerDeltas = deltas.filter((event) => event.id === answer?.id);
+    expect(answerDeltas.map((event) => event.text).join("")).toBe("Here is the answer.");
+    expect(
+      reasoning.some((event) => event.type === "reasoning" && event.status === "completed"),
+    ).toBe(true);
+  } finally {
+    await h.close();
+  }
+});
+
+it("assigns each completed part the stream index of its type, skipping empty text", () => {
+  // The probe's sequence: the CLI completes three of the four streamed blocks.
+  const blocks = new StreamBlocks();
+  blocks.started("msg", 0, "thinking");
+  blocks.received("msg", 0);
+  blocks.started("msg", 1, "text");
+  blocks.started("msg", 2, "text");
+  blocks.received("msg", 2);
+  blocks.started("msg", 3, "tool_use");
+  expect(blocks.assign("msg", "thinking", 0)).toBe(0);
+  expect(blocks.assign("msg", "text", 0)).toBe(2);
+  expect(blocks.assign("msg", "tool_use", 0)).toBe(3);
+  // Without a stream record the position in `content` is the index.
+  expect(blocks.assign("other", "text", 1)).toBe(1);
+  blocks.clear();
+  expect(blocks.assign("msg", "text", 0)).toBe(0);
 });
 
 it("announces commentary before a tool call and the closing message as the answer", async () => {
@@ -557,6 +633,52 @@ it("projects native subagents with scoped tool calls and output", async () => {
     expect(JSON.stringify(childRequest?.system)).toContain("delegated subtask");
     expect(toolName(childRequest as Request, /function_0$/)).toBeDefined();
     expect(toolName(childRequest as Request, /^(Task|Agent)$/)).toBeUndefined();
+  } finally {
+    await h.close();
+  }
+});
+
+it("resolves a subagent's haiku tier to the preset's gateway name", async () => {
+  const h = await harness((request) => {
+    const agentTool = toolName(request, /^(Task|Agent)$/);
+    const isChild = typeof request.messages[0]?.content === "string";
+    if (isChild) return { blocks: [{ type: "text", text: "child done" }] };
+    if (agentTool && !text(request).includes("tool_result"))
+      return {
+        blocks: [
+          {
+            type: "tool_use",
+            id: "toolu_p1",
+            name: agentTool,
+            input: { description: "small task", prompt: "SUBTASK: summarize", model: "haiku" },
+          },
+        ],
+        stop_reason: "tool_use",
+      };
+    return { blocks: [{ type: "text", text: "parent done" }] };
+  });
+  try {
+    const execution = h.execution({
+      tiers: { haiku: "small" },
+      agent: { model: "primary", tools: [lookup], multi_agent: { enabled: true } },
+      maxConcurrentSubagents: 2,
+    });
+    const start = await h.post("/jobs", { execution, operationId: "start" });
+    expect(start.ok, start.body).toBe(true);
+    await h.finish(execution.turnId, () => "unused");
+    const models = h.fixture.requests.map((request) => ({
+      child: typeof request.messages[0]?.content === "string",
+      model: request.model,
+    }));
+    // The parent stays on the session's model; the haiku child is the mapped tier.
+    expect(
+      models.filter((entry) => !entry.child).map((entry) => entry.model),
+      h.context(),
+    ).toEqual(expect.arrayContaining(["fixture-model"]));
+    expect(
+      models.filter((entry) => entry.child).map((entry) => entry.model),
+      h.context(),
+    ).toEqual(["fixture-small"]);
   } finally {
     await h.close();
   }

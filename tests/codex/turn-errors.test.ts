@@ -189,6 +189,59 @@ it("maps every documented codexErrorInfo variant without throwing", () => {
 });
 
 /**
+ * Codex 0.154.0 reports a gateway or exec-server it could not reach as `other` with
+ * reqwest's or tokio's transport wording; nothing in the variant says so.
+ */
+it("maps connection-level failures reported as other to connection_failed", () => {
+  expect(
+    turnErrorCode(
+      "other",
+      "stream disconnected before completion: error sending request for url (http://model.internal/v1/responses)",
+    ),
+  ).toBe("connection_failed");
+  // The exec-server is the sandbox's transport, so its failure is the sandbox's code.
+  expect(
+    turnErrorCode(
+      "other",
+      "failed to connect to exec-server websocket `ws://sandbox.internal/`: IO error: Connection reset by peer (os error 104)",
+    ),
+  ).toBe("sandbox_error");
+  // A status that maps to nothing leaves the transport wording to decide.
+  expect(
+    turnErrorCode(
+      "other",
+      "unexpected status 408 Request Timeout: stream disconnected before completion",
+    ),
+  ).toBe("connection_failed");
+  expect(
+    turnErrorCode(
+      "other",
+      "error sending request for url (http://model.internal/v1/responses): Connection refused",
+    ),
+  ).toBe("connection_failed");
+  expect(turnErrorCode("other", "dns error: failed to lookup address information")).toBe(
+    "connection_failed",
+  );
+  expect(turnErrorCode("other", "network is unreachable (os error 101)")).toBe("connection_failed");
+  expect(turnErrorCode("other", "timed out connecting to http://model.internal")).toBe(
+    "connection_failed",
+  );
+  // A message that carries the upstream status keeps the status mapping.
+  expect(
+    turnErrorCode(
+      "other",
+      "stream disconnected before completion: unexpected status 503 Service Unavailable",
+    ),
+  ).toBe("server_overloaded");
+  expect(turnErrorCode("other", "unexpected status 429 Too Many Requests: connection reset")).toBe(
+    "rate_limit_exceeded",
+  );
+  // Unrelated wording still falls through.
+  expect(turnErrorCode("other", "the model produced no output")).toBe("internal_error");
+  expect(turnErrorCode("other", "connection: keep-alive header rejected")).toBe("internal_error");
+});
+
+/**
  * Codex 0.154.0 carries `turn/start.outputSchema` to the gateway as the Responses
  * API `text.format` object (`{ type: "json_schema", strict: true, schema, name }`),
  * next to `text.verbosity`; it never sends `output_config` or `response_format`.

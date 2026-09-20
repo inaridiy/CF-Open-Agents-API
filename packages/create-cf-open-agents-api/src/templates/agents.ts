@@ -23,15 +23,24 @@ export interface CompositionInput {
 }
 
 const WIDTH = 100;
+/** The public preset name each runtime gets; clients send it as `agent.model`. */
 export const PRESET_NAMES: Record<Harness, string> = {
-  codex: "coding",
+  codex: "codex",
   "claude-code": "claude",
   opencode: "opencode",
 };
-const DEFAULT_MODELS = {
+/**
+ * Catalog model ids the generated registry points at. Checked against the providers'
+ * catalogs on 2026-09-19; the comments in the rendered file name the catalog pages.
+ */
+export const DEFAULT_MODELS = {
   openai: "gpt-6-astra",
-  anthropic: "claude-opus-5",
-  "workers-ai": "@cf/zai-org/glm-4.7-flash",
+  openaiFast: "gpt-5.6-luna",
+  anthropicOpus: "claude-opus-5",
+  anthropicSonnet: "claude-sonnet-5",
+  anthropicHaiku: "claude-haiku-4-5-20251001",
+  workers: "@cf/zai-org/glm-5.3-flash",
+  workersQwen: "@cf/qwen/qwen3.8-27b",
 } as const;
 
 /** The secret the generated composition reads for the provider, if any. */
@@ -48,10 +57,13 @@ export function providerSecret(provider: Provider): string | undefined {
   }
 }
 
+type Tier = "haiku" | "sonnet" | "opus";
 interface Preset {
   name: string;
   harness: Harness;
   model: string;
+  /** Gateway names Claude Code's subagent tiers resolve to; a missing tier uses `model`. */
+  tiers?: Partial<Record<Tier, string>>;
   webSearch: boolean;
 }
 interface ModelEntry {
@@ -107,6 +119,34 @@ function arrowEntry(name: string, expression: string, indent: number): ModelEntr
   return { name, lines };
 }
 
+/** The portable pair every non-native harness uses: a primary model and a smaller, cheaper one. */
+function portableEntries(
+  pieces: Pieces,
+  module: string,
+  factory: string,
+  secret: string,
+  primary: string,
+  fast: string,
+): void {
+  pieces.helpers.add("aiSDKModel");
+  pieces.imports.set(module, [factory]);
+  pieces.models.push(
+    arrowEntry("primary", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${primary}"))`, 6),
+    arrowEntry("fast", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${fast}"))`, 6),
+  );
+}
+function portablePresets(pieces: Pieces, harnesses: readonly Harness[]): void {
+  for (const harness of harnesses)
+    pieces.presets.push({
+      name: PRESET_NAMES[harness],
+      harness,
+      model: "primary",
+      // The Agent tool's `model: "haiku"` picks the cheaper entry for a native subagent.
+      ...(harness === "claude-code" ? { tiers: { haiku: "fast" } } : {}),
+      webSearch: false,
+    });
+}
+
 function openaiPieces(input: CompositionInput, pieces: Pieces): void {
   const secret = "OPENAI_API_KEY";
   pieces.bindings.add(`${secret}: string;`);
@@ -116,26 +156,18 @@ function openaiPieces(input: CompositionInput, pieces: Pieces): void {
     pieces.models.push(
       nativeEntry("codex", "responses", "https://api.openai.com/v1", secret, DEFAULT_MODELS.openai),
     );
-    pieces.presets.push({ name: "coding", harness: "codex", model: "codex", webSearch: true });
+    pieces.presets.push({ name: "codex", harness: "codex", model: "codex", webSearch: true });
   }
-  if (portable.length > 0) {
-    pieces.helpers.add("aiSDKModel");
-    pieces.imports.set("@ai-sdk/openai", ["createOpenAI"]);
-    pieces.models.push(
-      arrowEntry(
-        "primary",
-        `aiSDKModel(createOpenAI({ apiKey: env.${secret} })("${DEFAULT_MODELS.openai}"))`,
-        6,
-      ),
+  if (portable.length > 0)
+    portableEntries(
+      pieces,
+      "@ai-sdk/openai",
+      "createOpenAI",
+      secret,
+      DEFAULT_MODELS.openai,
+      DEFAULT_MODELS.openaiFast,
     );
-  }
-  for (const harness of portable)
-    pieces.presets.push({
-      name: PRESET_NAMES[harness],
-      harness,
-      model: "primary",
-      webSearch: false,
-    });
+  portablePresets(pieces, portable);
 }
 
 function anthropicPieces(input: CompositionInput, pieces: Pieces): void {
@@ -144,57 +176,53 @@ function anthropicPieces(input: CompositionInput, pieces: Pieces): void {
   const portable = input.harnesses.filter((harness) => harness !== "claude-code");
   if (input.harnesses.includes("claude-code")) {
     pieces.helpers.add("nativeModel");
+    const native = (name: string, model: string) =>
+      nativeEntry(name, "anthropic", "https://api.anthropic.com/v1", secret, model);
     pieces.models.push(
-      nativeEntry(
-        "claude",
-        "anthropic",
-        "https://api.anthropic.com/v1",
-        secret,
-        DEFAULT_MODELS.anthropic,
-      ),
+      native("opus", DEFAULT_MODELS.anthropicOpus),
+      native("sonnet", DEFAULT_MODELS.anthropicSonnet),
+      native("haiku", DEFAULT_MODELS.anthropicHaiku),
     );
     pieces.presets.push({
       name: "claude",
       harness: "claude-code",
-      model: "claude",
+      model: "opus",
+      tiers: { haiku: "haiku", sonnet: "sonnet" },
       webSearch: true,
     });
   }
-  if (portable.length > 0) {
-    pieces.helpers.add("aiSDKModel");
-    pieces.imports.set("@ai-sdk/anthropic", ["createAnthropic"]);
-    pieces.models.push(
-      arrowEntry(
-        "primary",
-        `aiSDKModel(createAnthropic({ apiKey: env.${secret} })("${DEFAULT_MODELS.anthropic}"))`,
-        6,
-      ),
+  if (portable.length > 0)
+    portableEntries(
+      pieces,
+      "@ai-sdk/anthropic",
+      "createAnthropic",
+      secret,
+      DEFAULT_MODELS.anthropicOpus,
+      DEFAULT_MODELS.anthropicHaiku,
     );
-  }
-  for (const harness of portable)
-    pieces.presets.push({
-      name: PRESET_NAMES[harness],
-      harness,
-      model: "primary",
-      webSearch: false,
-    });
+  portablePresets(pieces, portable);
 }
 
-function workersEntry(pieces: Pieces): void {
+function workersEntries(pieces: Pieces): void {
   pieces.helpers.add("aiSDKModel");
   pieces.imports.set("workers-ai-provider", ["createWorkersAI"]);
   pieces.bindings.add("AI: Ai;");
   pieces.models.push(
     arrowEntry(
       "workers",
-      `aiSDKModel(createWorkersAI({ binding: env.AI })("${DEFAULT_MODELS["workers-ai"]}"))`,
+      `aiSDKModel(createWorkersAI({ binding: env.AI })("${DEFAULT_MODELS.workers}"))`,
+      6,
+    ),
+    arrowEntry(
+      "workersQwen",
+      `aiSDKModel(createWorkersAI({ binding: env.AI })("${DEFAULT_MODELS.workersQwen}"))`,
       6,
     ),
   );
 }
 
 function workersAiPieces(input: CompositionInput, pieces: Pieces): void {
-  workersEntry(pieces);
+  workersEntries(pieces);
   for (const harness of input.harnesses)
     pieces.presets.push({
       name: PRESET_NAMES[harness],
@@ -250,11 +278,16 @@ function collect(input: CompositionInput): Pieces {
       compatiblePieces(input, pieces);
   }
   if (input.workersAi && input.provider !== "workers-ai") {
-    workersEntry(pieces);
+    workersEntries(pieces);
     const harness = input.harnesses.includes("codex") ? "codex" : (input.harnesses[0] ?? "codex");
     pieces.presets.push({ name: "workers", harness, model: "workers", webSearch: false });
   }
   return pieces;
+}
+
+/** The preset names a composition defines, in rendering order. */
+function presetNames(input: CompositionInput): string[] {
+  return collect(input).presets.map((preset) => preset.name);
 }
 
 /** The provider secret with a `.dev.vars` comment naming the presets that need it. */
@@ -263,7 +296,7 @@ export function describeSecret(
 ): { name: string; comment: string } | undefined {
   const name = providerSecret(input.provider);
   if (!name) return;
-  const presets = collect(input).presets.map((preset) => preset.name);
+  const presets = presetNames(input);
   const needing = presets.filter((preset) => preset !== "workers");
   const free = presets.filter((preset) => preset === "workers");
   const list =
@@ -283,6 +316,12 @@ function presetLines(preset: Preset, presets: readonly Preset[]): string[] {
     .filter((other) => other !== preset && other.name !== "workers")
     .map((other) => other.name);
   const fields = [`harness: "${preset.harness}"`, `model: "${preset.model}"`];
+  if (preset.tiers)
+    fields.push(
+      `tiers: { ${Object.entries(preset.tiers)
+        .map(([tier, model]) => `${tier}: "${model}"`)
+        .join(", ")} }`,
+    );
   if (preset.name !== "workers" && delegates.length > 0)
     fields.push(`delegates: [${quoted(delegates)}]`);
   if (preset.webSearch) fields.push("webSearch: true");
@@ -319,6 +358,9 @@ export function renderComposition(input: CompositionInput): string {
   const lines = [
     ...importLines(pieces),
     "",
+    "// Wrangler bindings the composition reads: the library's Durable Objects, buckets and",
+    "// gateway (AgentBindings, ContainerBindings), plus the secrets and bindings named here.",
+    "// Secrets come from .dev.vars locally and from `wrangler secret put` in production.",
     "interface Bindings extends AgentBindings, ContainerBindings {",
     ...sortedNames(pieces.bindings).map((binding) => `  ${binding}`),
     "}",
@@ -327,17 +369,25 @@ export function renderComposition(input: CompositionInput): string {
     "// gateway by the `Models` entrypoint; keep them as they are.",
     "export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =",
     "  defineAgentWorker<Bindings>({",
-    "    // `delegates` lists the presets a session may start subagents on when",
-    "    // multi_agent is enabled; children share the parent's sandbox.",
-    "    // `webSearch` declares that the alias's model connection provides hosted web search.",
+    "    // Presets: the `agent.model` names clients send. Each maps to a native runtime",
+    "    // (`harness`) and a gateway registry name (`model`). Optional fields: `delegates` lists",
+    "    // the presets a session may start subagents on when multi_agent is enabled (children",
+    "    // share the parent's sandbox); `tiers` names the registry entries Claude Code's",
+    "    // haiku/sonnet/opus subagent tiers resolve to; `webSearch` declares that the model",
+    "    // connection provides hosted web search (a nativeModel connection, not the AI SDK path).",
     "    agents: {",
     ...pieces.presets.flatMap((preset) => presetLines(preset, pieces.presets)),
     "    },",
-    "    // Each entry is a factory: a preset is built only when a session selects it, so a",
-    "    // deployment without one provider's credentials can still serve the other presets.",
+    "    // The private model gateway. Keys are deployment-owned names that presets point at;",
+    "    // runtimes never see provider URLs or keys. Each entry is a factory built only when a",
+    "    // session selects it, so a deployment without one provider's credentials still serves",
+    "    // the other presets. Add a model here, then point a preset's `model` at it.",
     "    models: (env) => ({",
     ...pieces.models.flatMap((entry) => entry.lines.map((line) => `      ${line}`)),
     "    }),",
+    "    // Who may call the API. `bearerTenant` accepts one shared bearer token (API_TOKEN, at",
+    '    // least 32 characters) and maps every caller to the tenant "default"; Service Binding',
+    "    // callers pass the same token. Replace it to resolve tenants from your own auth.",
     '    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),',
     "  });",
   ];

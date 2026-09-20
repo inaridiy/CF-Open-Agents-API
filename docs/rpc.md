@@ -17,13 +17,15 @@ When the caller can import the deployment's Worker class, Cloudflare's `Service<
 
 RPC bypasses the HTTP authenticator. Your caller must authenticate its own users and derive the tenant ID from that verified identity. Never forward a tenant ID from a request body. The service still checks session ownership within the tenant.
 
+`fetchAs(tenant, request)` is the RPC method behind the recommended client setup: it serves one HTTP request of the Agents API as `tenant` without the authenticator. The official OpenAI client uses it through `tenantFetch(env.AGENTS, tenant)` from `cf-open-agents-api/cloudflare` (`fetch: tenantFetch(env.AGENTS, tenant)`), which strips the SDK's `AbortSignal` before the request crosses the RPC boundary and honors it on the caller's side, and can then stream, upload files or list artifacts over the binding without a bearer token. Call `fetchAs` directly only with a hand-built `Request` that has no signal. The [Service Binding guide](service-binding.md#connect-the-official-client) shows the client; the methods below return typed objects instead.
+
 ## Create, submit and retrieve
 
 ```ts
 const tenant = authenticatedUser.tenantId;
 const session = await env.AGENTS.createSession(
   tenant,
-  { agent: { model: "coding" }, environment: { type: "openai_hosted" } },
+  { agent: { model: "codex" }, environment: { type: "openai_hosted" } },
   "task-123-session",
 );
 await env.AGENTS.submitEvents(
@@ -64,4 +66,4 @@ Expected failures reject with an `Error` whose `name` encodes the status and cod
 
 Cancel with `submitEvents(tenant, sessionId, [{ type: "agent.session.input.cancel" }])`. Retrieve until the turn stops, then call `deleteSession(tenant, sessionId)`; deletion needs an inactive session. Reusing an idempotency key with different input rejects with `idempotency_conflict`. After a `failed` session, continue with `forkSession(tenant, sessionId, { agent: { model: "claude" } }, "task-123-fork")`; omit `agent` to stay on the same preset.
 
-The RPC surface covers session execution and result retrieval. Use binding HTTP through the OpenAI client for streaming and the other resources; the [library API](library-api.md#session-rpc-methods) lists the methods.
+The typed methods cover session execution and result retrieval. Streaming and the other resources go through the OpenAI client with `tenantFetch`; the [library API](library-api.md#session-rpc-methods) lists every method.

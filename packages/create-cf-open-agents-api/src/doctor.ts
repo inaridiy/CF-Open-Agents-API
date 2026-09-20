@@ -1,14 +1,16 @@
 import { join, resolve } from "node:path";
 
-import { packageManagerExec, run, type Runner } from "./exec.js";
+import { packageManagerExec, run, type Runner, type RunResult } from "./exec.js";
 import { readIfExists } from "./fs.js";
 import { parseJsonc } from "./jsonc.js";
-import { locateProject, type Project, type WranglerConfig } from "./project.js";
+import { locateProject, type Project, readManifest, type WranglerConfig } from "./project.js";
 import { parseDevVars } from "./steps/dev-vars.js";
+import { DOCKER_INFO_TIMEOUT_MS, dockerInfo, rootlessEngine } from "./steps/rootless.js";
 import { readVendorManifest, type VendorManifest } from "./steps/vendor.js";
 import { BUCKETS, CONTAINERS, DURABLE_OBJECTS } from "./steps/wrangler.js";
+import { ROOTLESS_SCRIPT_NAME } from "./templates/rootless.js";
 import { MINIMUM_TOKEN_LENGTH } from "./token.js";
-import { CLI_VERSION, CTX_EXPORTS_DATE, TOOLCHAIN_VERSIONS } from "./versions.js";
+import { CLI_NAME, CLI_VERSION, CTX_EXPORTS_DATE, TOOLCHAIN_VERSIONS } from "./versions.js";
 
 export interface Check {
   name: string;
@@ -161,7 +163,8 @@ function toolChecks(project: Project, runner: Runner): Check[] {
     cwd: project.root,
   });
   const version = /(\d+\.\d+\.\d+)/.exec(wrangler.stdout)?.[1];
-  const docker = runner("docker", ["info"], { cwd: project.root });
+  // One call, bounded by a timeout, answers both the engine and the rootless check.
+  const docker = dockerInfo(runner, project.root);
   const whoami = runner(exec[0] ?? "npx", [...exec.slice(1), "wrangler", "whoami"], {
     cwd: project.root,
   });
@@ -175,17 +178,43 @@ function toolChecks(project: Project, runner: Runner): Check[] {
         ? `${version} (this CLI was tested with ${TOOLCHAIN_VERSIONS.wrangler})`
         : "not installed",
     ),
-    check(
-      "docker",
-      docker.ok,
-      docker.ok ? "engine reachable" : "docker info failed; local containers need a running engine",
-    ),
+    check("docker", docker.ok, dockerDetail(docker)),
+    ...(process.platform === "linux" && rootlessEngine(docker) ? rootlessCheck(project) : []),
     check(
       "wrangler login",
       loggedIn,
       loggedIn
         ? "authenticated"
         : "run wrangler login (the AI binding calls your account even in wrangler dev)",
+    ),
+  ];
+}
+
+function dockerDetail(docker: RunResult): string {
+  if (docker.ok) return "engine reachable";
+  if (docker.timedOut)
+    return `docker info did not answer within ${DOCKER_INFO_TIMEOUT_MS} ms; is the engine running?`;
+  return "docker info failed; local containers need a running engine";
+}
+
+/**
+ * With rootless Docker `wrangler dev` starts but the containers cannot reach the Worker,
+ * so every turn fails; the project needs the `dev:rootless` script `init` offers. The
+ * script is a temporary workaround until Wrangler supports rootless engines.
+ */
+function rootlessCheck(project: Project): Check[] {
+  const scripts = readManifest(project.root)?.scripts;
+  const present =
+    typeof scripts === "object" &&
+    scripts !== null &&
+    typeof (scripts as Record<string, unknown>)[ROOTLESS_SCRIPT_NAME] === "string";
+  return [
+    check(
+      "docker rootless",
+      present,
+      present
+        ? `use the ${ROOTLESS_SCRIPT_NAME} script instead of wrangler dev (a temporary workaround: Wrangler's local container proxy assumes a rootful bridge)`
+        : `plain wrangler dev cannot complete a turn; run ${CLI_NAME} init --rootless to add the ${ROOTLESS_SCRIPT_NAME} script (a temporary workaround until Wrangler supports rootless engines)`,
     ),
   ];
 }
@@ -210,6 +239,7 @@ export function runDoctor(options: DoctorOptions): DoctorReport {
     ok: checks.every((item) => item.ok),
     notes: [
       "Containers need the Workers Paid plan; deployment fails without it.",
+      "Run one wrangler dev per Dockerfile at a time: a second session on the same Docker engine removes the first one's image tags (see the known issues).",
       "Named environments (env.*) are not checked.",
     ],
   };

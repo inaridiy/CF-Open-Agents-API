@@ -106,6 +106,7 @@ export { HARNESSES, type HarnessName } from "./harnesses.js";
 export { programmaticInputSchema, programmaticTool } from "./programmatic-contract.js";
 export * from "./protocol.js";
 export type * from "./runtime.js";
+export { CONNECTION_FAILURE } from "./transport-failure.js";
 export {
   batchSchema,
   checkpointSchema,

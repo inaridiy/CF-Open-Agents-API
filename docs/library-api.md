@@ -21,7 +21,7 @@ pnpm --filter cf-open-agents-api pack --pack-destination /tmp/cf-open-agents-pac
 | Import                          | Exports                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `cf-open-agents-api`            | Wire schemas and types, `parse` and `parseEffect`, the tagged error classes with `DomainError`, `DomainTag`, `Capability`, `isDomainError`, `toApiError`, `caughtFailure`, `projectApiError` and `isPermanent`, `ApiError` and `remoteApiError`, `HARNESSES`, runtime schemas, `RuntimeDriver`, `PromiseRuntimeDriver` and `fromPromiseDriver`, workspace tool contracts, `io`, `attempt`, `OperationError`, `decode`, `decodeEffect`, `runPromise`, `runSync` |
-| `cf-open-agents-api/cloudflare` | `defineAgentWorker`, `AgentWorkerOptions`, `AgentWorkerClasses`, `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, `bearerTenant`, `CatalogObject`, `SessionObject`, `HarnessContainer`, `SandboxContainer`, `ContainerProxy`, `createHarness`, `containerHarnesses`, `codexDriver`, `claudeCodeDriver`, `openCodeDriver`, `containerDriver`, `containerEnvironments`, `EnvironmentDriver`, `EnvironmentSpec`                          |
+| `cf-open-agents-api/cloudflare` | `defineAgentWorker`, `AgentWorkerOptions`, `AgentWorkerClasses`, `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, `bearerTenant`, `tenantFetch`, `CatalogObject`, `SessionObject`, `HarnessContainer`, `SandboxContainer`, `ContainerProxy`, `createHarness`, `containerHarnesses`, `codexDriver`, `claudeCodeDriver`, `openCodeDriver`, `containerDriver`, `containerEnvironments`, `EnvironmentDriver`, `EnvironmentSpec`           |
 | `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `modelAdapter`, `createModelGateway`, `ModelRegistration`, `sanitizeProviderError`, `fetchWithoutRedirect`                                                                                                                                                                                                                                                                                               |
 | `cf-open-agents-api/tools`      | `defineTool`, `webSearch`, `knowledgeSearch`, `publishSkill`, `loadSkill`, `skillReader`, `installSkill`                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -34,7 +34,7 @@ The root import has no Cloudflare runtime dependency, so its types and schemas c
 ```ts
 export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
   defineAgentWorker<Bindings>({
-    agents: { coding: { harness: "codex", model: "codex", webSearch: true } },
+    agents: { codex: { harness: "codex", model: "codex", webSearch: true } },
     models: (env) => ({
       codex: () =>
         nativeModel({
@@ -51,17 +51,17 @@ export default Agents;
 
 Wrangler binds the Durable Objects by these export names and the model gateway by the `Models` entrypoint (`services: [{ binding: "MODEL_GATEWAY", service: "<this worker>", entrypoint: "Models" }]`). A Worker with its own default export re-exports the classes from a separate module and reaches the API through a second self binding, `AGENTS` → entrypoint `Agents`; the [setup CLI](../packages/create-cf-open-agents-api/README.md) writes both forms. `HarnessDO` is the `HarnessContainer` class itself: the Container SDK keys its outbound handler registry by class name, so never subclass it; pass a `createHarness(...)` class through the `harness` option instead.
 
-| Option                       | Purpose                                                                                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `agents`                     | Presets: public model names mapped to `{ harness, model, delegates?, webSearch? }`                                                                           |
-| `models(env)`                | The gateway registry: names the presets refer to, mapped to `nativeModel`, `aiSDKModel`, `openAICompatibleModel` or a factory built on first use             |
-| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null`; `bearerTenant` is the single-tenant example                                                                |
-| `harnesses(env)`             | Runtime drivers by name; defaults to `containerHarnesses`. Supplying it makes the composition explicit: `environments` and `objects` then default to nothing |
-| `environments(env)`          | Hosted environment driver; defaults to `containerEnvironments`. Without it `openai_hosted` configuration is rejected                                         |
-| `objects(env)`               | R2 bucket for environment configuration, input files, skills and artifacts; defaults to `env.CHECKPOINTS`                                                    |
-| `harness`                    | A `createHarness(...)` class to export as `HarnessDO`                                                                                                        |
-| `maxTurnMs`                  | Turn deadline; default 15 minutes                                                                                                                            |
-| `pollIntervalMs`             | Reconciler alarm interval and the budget of one tick; default 5 seconds. The container drivers long-poll within it                                           |
+| Option                       | Purpose                                                                                                                                                                                         |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agents`                     | Presets: public model names mapped to `{ harness, model, delegates?, tiers?, webSearch? }`; `tiers` names the gateway models a Claude Code subagent's `haiku`/`sonnet`/`opus` alias resolves to |
+| `models(env)`                | The gateway registry: names the presets refer to, mapped to `nativeModel`, `aiSDKModel`, `openAICompatibleModel` or a factory built on first use                                                |
+| `authenticate(request, env)` | Resolve an HTTP request to a tenant ID or `null`; `bearerTenant` is the single-tenant example                                                                                                   |
+| `harnesses(env)`             | Runtime drivers by name; defaults to `containerHarnesses`. Supplying it makes the composition explicit: `environments` and `objects` then default to nothing                                    |
+| `environments(env)`          | Hosted environment driver; defaults to `containerEnvironments`. Without it `openai_hosted` configuration is rejected                                                                            |
+| `objects(env)`               | R2 bucket for environment configuration, input files, skills and artifacts; defaults to `env.CHECKPOINTS`                                                                                       |
+| `harness`                    | A `createHarness(...)` class to export as `HarnessDO`                                                                                                                                           |
+| `maxTurnMs`                  | Turn deadline; default 15 minutes                                                                                                                                                               |
+| `pollIntervalMs`             | Reconciler alarm interval and the budget of one tick; default 5 seconds. The container drivers long-poll within it                                                                              |
 
 The overloads decide what is required: with `ContainerBindings` in `Env` every driver has a default; without them `harnesses` is required. `createAgentService(options)` remains the lower-level factory: it returns `AgentWorker` and `SessionDO` configured together, and a composition that needs something else (its own gateway entrypoint, several services in one Worker) subclasses and exports those, `CatalogObject`, `HarnessContainer`, `SandboxContainer` and `ContainerProxy`, plus a `WorkerEntrypoint` that delegates to `createModelGateway(...).fetch`.
 
@@ -71,19 +71,20 @@ The overloads decide what is required: with `ContainerBindings` in `Env` every d
 
 Every method takes a trusted `tenant` first. Types come from the exported schemas; `PageQuery` accepts `after`, `limit` and `order`.
 
-| Method                                       | Result                                                                                    |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `createSession(tenant, parameters, key?)`    | `AgentSession`                                                                            |
-| `forkSession(tenant, id, parameters?, key?)` | `AgentSession`; `/cf/v1` extension, see [forks](environments-and-tools.md#fork-a-session) |
-| `retrieveSession(tenant, id)`                | `AgentSession`                                                                            |
-| `listSessions(tenant, query?)`               | `ListPage<AgentSession>`; optional `agent_id` filter                                      |
-| `submitEvents(tenant, id, events, key?)`     | `void`                                                                                    |
-| `listItems(tenant, id, query?)`              | `ListPage<AgentSessionItem>`                                                              |
-| `listTurns(tenant, id, query?)`              | `ListPage<Turn>`                                                                          |
-| `retrieveTurn(tenant, id, turnId)`           | `Turn`                                                                                    |
-| `deleteSession(tenant, id)`                  | `{ id, object: "agent.session.deleted", deleted: true }`                                  |
+| Method                                       | Result                                                                                        |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `fetchAs(tenant, request)`                   | `Response`; serves one HTTP request of the Agents API as `tenant`, skipping the authenticator |
+| `createSession(tenant, parameters, key?)`    | `AgentSession`                                                                                |
+| `forkSession(tenant, id, parameters?, key?)` | `AgentSession`; `/cf/v1` extension, see [forks](environments-and-tools.md#fork-a-session)     |
+| `retrieveSession(tenant, id)`                | `AgentSession`                                                                                |
+| `listSessions(tenant, query?)`               | `ListPage<AgentSession>`; optional `agent_id` filter                                          |
+| `submitEvents(tenant, id, events, key?)`     | `void`                                                                                        |
+| `listItems(tenant, id, query?)`              | `ListPage<AgentSessionItem>`                                                                  |
+| `listTurns(tenant, id, query?)`              | `ListPage<Turn>`                                                                              |
+| `retrieveTurn(tenant, id, turnId)`           | `Turn`                                                                                        |
+| `deleteSession(tenant, id)`                  | `{ id, object: "agent.session.deleted", deleted: true }`                                      |
 
-All results are promises. Defaults and validation match the HTTP operations. Streaming and the other official resources go through `AGENTS.fetch` with the OpenAI client.
+All results are promises. Defaults and validation match the HTTP operations. Streaming and the other official resources go through the OpenAI client with `tenantFetch(agents, tenant)` as its `fetch`: it calls `fetchAs`, so the trusted Worker names the tenant and no bearer token crosses the binding. It exists because a `Request` passed to an RPC method is structured-cloned and cannot carry the SDK's `AbortSignal`; `tenantFetch` sends the request without the signal and rejects with an `AbortError` on the caller's side when the signal fires. `AGENTS.fetch` remains the path through the HTTP authenticator for a caller that only holds a token. See the [Service Binding guide](service-binding.md#connect-the-official-client).
 
 ## Effect extension contracts
 

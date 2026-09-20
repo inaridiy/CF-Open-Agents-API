@@ -213,6 +213,8 @@ export class ScriptedHarness extends DurableObject {
             input: execution.input,
             delegates: execution.delegates ?? null,
             maxConcurrentSubagents: execution.maxConcurrentSubagents ?? null,
+            model: execution.model,
+            tiers: execution.tiers ?? null,
           }
         : null,
     );
@@ -288,6 +290,17 @@ const service = createAgentService<TestEnv>({
     "test-longpoll": { harness: "fixture-longpoll", model: "fixture-model" },
     // Cross-runtime delegation is deployment configuration, not a runtime capability.
     "test-lead": { harness: "fixture", model: "fixture-model", delegates: ["test-tools"] },
+    // Model tiers a Claude Code subagent may ask for; pinned with the session like `model`.
+    "test-tiers": {
+      harness: "fixture",
+      model: "fixture-model",
+      tiers: { haiku: "fixture-small", opus: "fixture-large" },
+    },
+    "test-tiers-lead": {
+      harness: "fixture",
+      model: "fixture-model",
+      delegates: ["test-tiers"],
+    },
     "test-misconfigured": { harness: "fixture", model: "fixture-model", delegates: ["absent"] },
   },
   harnesses: (env) => ({

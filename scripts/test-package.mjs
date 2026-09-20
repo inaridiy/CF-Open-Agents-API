@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,7 +56,18 @@ try {
   run("pnpm", ["--filter", cli.name, "pack", "--pack-destination", directory], root);
   const cliTarball = join(directory, `${cli.name}-${cli.version}.tgz`);
   const cliEntries = execFileSync("tar", ["-tzf", cliTarball], { encoding: "utf8" }).split("\n");
-  for (const file of ["LICENSE", "NOTICE", "README.md", "dist/cli.js", "dist/index.js"])
+  for (const file of [
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "dist/cli.js",
+    "dist/index.js",
+    "templates/demo/index.tsx",
+    "templates/demo/ui.tsx",
+    "templates/demo/README.md",
+    "templates/rootless/dev-rootless.sh",
+    "templates/rootless/netns-bridge.mjs",
+  ])
     assert(cliEntries.includes(`package/${file}`), `Missing packaged CLI ${file}`);
   assert(
     !cliEntries.some((entry) => entry.startsWith("package/test/")),
@@ -167,6 +178,32 @@ assert.equal(webSearch(async () => []).spec.name, "web_search");
   );
   assert.match(planned, /Dry run: nothing was written/);
   assert.match(planned, /src\/agents\.ts/);
+  // A new demo project reads templates/ from the tarball, not from the repository.
+  const empty = join(directory, "empty");
+  await mkdir(empty);
+  const demo = execFileSync(
+    "pnpm",
+    [
+      "exec",
+      cli.name,
+      "init",
+      "--yes",
+      "--dry-run",
+      "--template",
+      "demo",
+      "--rootless",
+      "--source",
+      root,
+      empty,
+    ],
+    {
+      cwd: directory,
+      encoding: "utf8",
+      env: { ...process.env, CF_OPEN_AGENTS_API_SKIP_VENDOR: "1" },
+    },
+  );
+  for (const file of ["src/index.tsx", "src/ui.tsx", "README.md", "scripts/dev-rootless.sh"])
+    assert.match(demo, new RegExp(`- ${file.replace(/[./]/g, "\\$&")}`), `Planned ${file}`);
   console.log(
     "Packed entrypoints, license files, a consumer-owned Effect driver and the packed CLI passed.",
   );

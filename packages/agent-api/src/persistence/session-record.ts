@@ -9,6 +9,7 @@ import {
   type Checkpoint,
   type Execution,
   executionSchema,
+  type ModelTiers,
   type RuntimeCommand,
 } from "../runtime.js";
 
@@ -21,6 +22,8 @@ interface SessionBase {
   readonly driver: string;
   readonly revision: string;
   readonly model: string;
+  /** Pinned with `model` from the preset; absent on records written before tiers existed. */
+  readonly tiers?: ModelTiers;
   readonly generation: number;
   readonly checkpoint: Checkpoint | null;
   readonly cursor: number;

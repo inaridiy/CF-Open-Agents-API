@@ -84,6 +84,23 @@ const post = (url: string, path: string, body: unknown) =>
 const unhandled: unknown[] = [];
 process.on("unhandledRejection", (reason) => unhandled.push(reason));
 
+it("a request body that is not JSON is a 400 the HarnessDO does not retry", async () => {
+  const supervisor = createSupervisor({ ...baseOptions, binary: "unused" });
+  try {
+    for (const path of ["/jobs", "/jobs/turn_parent/control"]) {
+      const response = await supervisor.app.request(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{not json",
+      });
+      expect(response.status, path).toBe(400);
+      expect(await response.json()).toMatchObject({ code: "invalid_request" });
+    }
+  } finally {
+    await supervisor.stop();
+  }
+});
+
 it("a delegated child that overflows the event log fails the parent instead of the process", async () => {
   // One relayed batch carries more text than the retained log may hold.
   const oversized = "x".repeat(EVENT_LOG_LIMIT / 4 + 1);

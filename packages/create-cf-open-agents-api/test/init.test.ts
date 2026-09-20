@@ -9,6 +9,7 @@ import {
   cleanup,
   cliPath,
   copyFixture,
+  emptyDirectory,
   type Manifest,
   offline,
   read,
@@ -24,6 +25,7 @@ const base = (dir: string, extra: Partial<InitOptions> = {}): InitOptions => ({
   dryRun: false,
   env: offline,
   reporter: silent(),
+  rootless: false,
   token: () => "t".repeat(40),
   ...extra,
 });
@@ -195,11 +197,18 @@ it("provider and harness flags shape the composition", async () => {
     expect(agents).toMatch(/protocol: "anthropic"/);
     expect(agents).not.toMatch(/createAnthropic/);
     expect(agents).toMatch(
-      /claude: \{ harness: "claude-code", model: "claude", webSearch: true \}/,
+      /claude: \{\n\s+harness: "claude-code",\n\s+model: "opus",\n\s+tiers: \{ haiku: "haiku", sonnet: "sonnet" \},\n\s+webSearch: true,\n\s+\},/,
+    );
+    expect(agents).toMatch(/opus: \(\) =>\n\s+nativeModel\(\{[\s\S]*?model: "claude-opus-5"/);
+    expect(agents).toMatch(
+      /haiku: \(\) =>\n\s+nativeModel\(\{[\s\S]*?model: "claude-haiku-4-5-20251001"/,
     );
     expect(agents).toMatch(/workers: \{ harness: "claude-code", model: "workers" \}/);
-    expect(agents).not.toMatch(/coding:/);
-    expect(read(dir, "wrangler.jsonc")).toMatch(/"ai": \{\n\s+"binding": "AI"\n\s+\}/);
+    expect(agents).toMatch(/workersQwen: \(\) =>/);
+    expect(agents).not.toMatch(/codex:/);
+    expect(read(dir, "wrangler.jsonc")).toMatch(
+      /"ai": \{\n\s+"binding": "AI",\n\s+"remote": true\n\s+\}/,
+    );
     expect(read(dir, "wrangler.jsonc")).not.toMatch(/CODE_LOADER/);
     expect(parseDevVars(read(dir, ".dev.vars")).get("ANTHROPIC_API_KEY")).toBe("");
     const manifest = readJson<Manifest>(dir, "package.json");
@@ -218,6 +227,22 @@ it("--library and --cli-package write file: dependencies for pre-publication run
     const manifest = readJson<Manifest>(dir, "package.json");
     expect(manifest.dependencies["cf-open-agents-api"]).toBe("file:/tmp/lib.tgz");
     expect(manifest.devDependencies["create-cf-open-agents-api"]).toBe("file:/tmp/cli.tgz");
+  } finally {
+    cleanup(dir);
+  }
+});
+
+it("the demo publishes on workers.dev and warns that the page has no login", () => {
+  const dir = emptyDirectory();
+  try {
+    const output = execFileSync(
+      "node",
+      [cliPath, "init", "--yes", "--template", "demo", "--no-rootless", dir],
+      { env: { ...process.env, ...offline }, encoding: "utf8", stdio: "pipe" },
+    );
+    expect(output).toMatch(/no login/);
+    expect(output).toMatch(/workers_dev: false/);
+    expect(read(dir, "wrangler.jsonc")).toMatch(/"workers_dev": true/);
   } finally {
     cleanup(dir);
   }

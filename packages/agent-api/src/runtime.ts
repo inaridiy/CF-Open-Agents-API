@@ -71,12 +71,21 @@ export const checkpointSchema = Schema.Struct({
     }),
   ),
 });
+/** Gateway names a Claude Code session resolves the `haiku`, `sonnet` and `opus` aliases to. */
+export const modelTiersSchema = Schema.Struct({
+  haiku: Schema.optional(Schema.String),
+  sonnet: Schema.optional(Schema.String),
+  opus: Schema.optional(Schema.String),
+});
+export type ModelTiers = typeof modelTiersSchema.Type;
 export const executionSchema = Schema.Struct({
   sessionId: Schema.String.pipe(Schema.pattern(/^sess_[a-zA-Z0-9]+$/)),
   turnId: Schema.String.pipe(Schema.pattern(/^turn_[a-zA-Z0-9]+$/)),
   generation: Schema.Int.pipe(Schema.positive()),
   harness: Schema.String,
   model: Schema.String,
+  /** Pinned from the preset with `model`; a missing tier falls back to `model`. */
+  tiers: Schema.optional(modelTiersSchema),
   agent: agentConfig,
   input: Schema.mutable(Schema.Array(inputMessage)),
   checkpoint: Schema.NullOr(checkpointSchema),
@@ -89,7 +98,12 @@ export const executionSchema = Schema.Struct({
   /** Deployment presets this turn may delegate to; present only when subagents are enabled. */
   delegates: Schema.optional(
     Schema.Array(
-      Schema.Struct({ alias: Schema.String, harness: Schema.String, model: Schema.String }),
+      Schema.Struct({
+        alias: Schema.String,
+        harness: Schema.String,
+        model: Schema.String,
+        tiers: Schema.optional(modelTiersSchema),
+      }),
     ),
   ),
   maxConcurrentSubagents: Schema.optional(Schema.Int.pipe(Schema.positive())),
@@ -420,6 +434,14 @@ export interface AgentRegistration {
    * harness and the alias support it; the portable AI SDK path cannot.
    */
   webSearch?: boolean;
+  /**
+   * Gateway registry names a Claude Code session may switch to per model tier. The
+   * parent's Agent tool accepts `model: "haiku" | "sonnet" | "opus"` for a native
+   * subagent; each alias resolves to the name listed here, and a missing tier falls
+   * back to `model`. Pinned with the session at creation and fork, like `model`.
+   * Other harnesses ignore it.
+   */
+  tiers?: ModelTiers;
 }
 
 export interface ServiceOptions<Env> {

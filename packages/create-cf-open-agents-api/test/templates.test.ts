@@ -83,7 +83,7 @@ it("describes the provider secret with the presets that need it", () => {
   ).toEqual({
     name: "OPENAI_API_KEY",
     comment:
-      "# Required for the coding, claude and opencode presets; leave empty to use only `workers`.",
+      "# Required for the codex, claude and opencode presets; leave empty to use only `workers`.",
   });
   expect(
     describeSecret({

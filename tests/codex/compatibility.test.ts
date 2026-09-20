@@ -134,7 +134,7 @@ it.each(["configured", "defaults"] as const)(
       harness: "codex",
       model: "search-fixture",
       agent: {
-        model: "coding",
+        model: "codex",
         reasoning: { summary: "detailed" },
         tools: [
           {

@@ -50,7 +50,7 @@ export interface WranglerConfig {
   r2_buckets?: WranglerBinding[];
   services?: WranglerBinding[];
   vars?: Record<string, unknown>;
-  ai?: { binding?: string };
+  ai?: { binding?: string; remote?: boolean };
   worker_loaders?: WranglerBinding[];
   env?: Record<string, unknown>;
 }

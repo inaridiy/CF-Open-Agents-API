@@ -1,11 +1,14 @@
 import { join } from "node:path";
 
 import type { Files } from "../fs.js";
+import { openJsonc, parseJsonc, setValue } from "../jsonc.js";
 import type { StepResult } from "../plan.js";
+import { DEMO_FILES, demoFile } from "../templates/demo.js";
 import {
   gitignoreSkeleton,
   packageSkeleton,
   type SkeletonInput,
+  type Template,
   tsconfigSkeleton,
   wranglerSkeleton,
 } from "../templates/standalone.js";
@@ -21,10 +24,51 @@ export function ensureStandaloneSkeleton(options: StandaloneOptions): StepResult
     if (options.files.exists(path)) return { status: "skipped", file };
     return options.files.write(path, content);
   };
-  return [
+  const results = [
     write("package.json", packageSkeleton(options)),
-    write("tsconfig.json", tsconfigSkeleton()),
+    ensureTsconfig(options.files, options.template),
     write("wrangler.jsonc", wranglerSkeleton(options)),
     write(".gitignore", gitignoreSkeleton()),
   ];
+  if (options.template === "demo")
+    for (const file of Object.keys(DEMO_FILES)) results.push(write(file, demoFile(file)));
+  return results;
+}
+
+/** The compiler options `hono/jsx` needs; without them the Worker throws `React is not defined`. */
+const JSX_OPTIONS: Readonly<Record<string, string>> = {
+  jsx: "react-jsx",
+  jsxImportSource: "hono/jsx",
+};
+
+interface TsConfig {
+  compilerOptions?: Record<string, unknown>;
+}
+
+/**
+ * A new tsconfig comes from the template. An existing one is kept, except that the demo
+ * adds the two JSX options it lacks, preserving the rest of the file.
+ */
+function ensureTsconfig(files: Files, template: Template): StepResult {
+  const file = "tsconfig.json";
+  const path = join(files.root, file);
+  const text = files.read(path);
+  if (text === undefined) return files.write(path, tsconfigSkeleton(template));
+  if (template !== "demo") return { status: "skipped", file };
+  const current = parseJsonc<TsConfig>(text, file).compilerOptions ?? {};
+  const missing = Object.entries(JSX_OPTIONS).filter(([key]) => !(key in current));
+  if (missing.length === 0) return { status: "skipped", file };
+  let document = openJsonc(text);
+  for (const [key, value] of missing)
+    document = setValue(document, ["compilerOptions", key], value);
+  const kept = Object.entries(JSX_OPTIONS)
+    .filter(([key, value]) => key in current && current[key] !== value)
+    .map(([key, value]) => `${key} (the demo expects "${value}")`);
+  return files.write(
+    path,
+    document.text,
+    `${file} now sets ${missing.map(([key, value]) => `${key}: "${value}"`).join(" and ")} for hono/jsx${
+      kept.length > 0 ? `; kept your ${kept.join(", ")}` : ""
+    }.`,
+  );
 }

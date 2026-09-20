@@ -1,0 +1,91 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "cf-open-agents-api-demo",
+  "workers_dev": true,
+  "preview_urls": false,
+  "main": "src/index.tsx",
+  "compatibility_date": "2026-09-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "worker_loaders": [
+    {
+      "binding": "CODE_LOADER"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SESSIONS",
+        "class_name": "SessionDO"
+      },
+      {
+        "name": "CATALOG",
+        "class_name": "TenantCatalogDO"
+      },
+      {
+        "name": "HARNESS",
+        "class_name": "HarnessDO"
+      },
+      {
+        "name": "SANDBOX",
+        "class_name": "SandboxDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SessionDO", "TenantCatalogDO", "HarnessDO", "SandboxDO"]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "HarnessDO",
+      "image": "../../docker/Harness.Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "basic",
+      "max_instances": 10
+    },
+    {
+      "class_name": "SandboxDO",
+      "image": "../../docker/Sandbox.Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "standard-1",
+      "max_instances": 10
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "CHECKPOINTS",
+      "bucket_name": "cf-open-agents-api-demo-checkpoints"
+    },
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "cf-open-agents-api-demo-workspaces"
+    }
+  ],
+  "services": [
+    {
+      "binding": "MODEL_GATEWAY",
+      "service": "cf-open-agents-api-demo",
+      "entrypoint": "Models"
+    },
+    {
+      "binding": "AGENTS",
+      "service": "cf-open-agents-api-demo",
+      "entrypoint": "Agents"
+    }
+  ],
+  "vars": {
+    "BACKUP_BUCKET_NAME": "cf-open-agents-api-demo-workspaces"
+  },
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  }
+}

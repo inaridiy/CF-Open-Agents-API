@@ -122,5 +122,8 @@ export default defineConfig({
     // Fixture projects the setup CLI is tested against and the files its tests render.
     "**/test/fixtures/**",
     "**/test/.tmp-*/**",
+    // Files the setup CLI copies into generated projects; they have no tsconfig here, so the
+    // type-aware rules see `any`. examples/demo holds the same files and is linted.
+    "packages/create-cf-open-agents-api/templates/**",
   ],
 });

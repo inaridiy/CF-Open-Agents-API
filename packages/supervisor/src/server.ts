@@ -6,6 +6,7 @@ import {
   executionSchema,
   HARNESSES,
   type HarnessName,
+  io,
   runPromise,
   workspaceRequestSchema,
 } from "cf-open-agents-api";
@@ -111,6 +112,13 @@ const parse = <T>(schema: z.ZodType<T>, input: unknown): Effect.Effect<T, Invali
       ? Effect.succeed(result.data)
       : new InvalidRequest({ issues: z.prettifyError(result.error) });
   });
+/** The request body as JSON; a body that is not JSON is the client's error, not a transient one. */
+const jsonBody = (c: {
+  req: { json: () => Promise<unknown> };
+}): Effect.Effect<unknown, InvalidRequest> =>
+  io("request.body", () => c.req.json()).pipe(
+    Effect.mapError(() => new InvalidRequest({ issues: "Request body is not valid JSON" })),
+  );
 const decodeBody = <A, I>(schema: Schema.Schema<A, I>, input: unknown) =>
   Schema.decodeUnknown(schema, { onExcessProperty: "error" })(input).pipe(
     Effect.mapError((error) => new InvalidRequest({ issues: error.message })),
@@ -306,11 +314,11 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   app.onError((error) => toResponse(error));
   app.get("/health", () => Response.json({ harnesses: HARNESSES, ready: true }));
   app.get("/diagnostics", () => Response.json({ lines: recent }));
-  app.post("/jobs", async (c) => {
-    const raw: unknown = await c.req.json();
-    return runPromise(
-      lifecycle
-        .withPermits(1)(
+  app.post("/jobs", (c) =>
+    runPromise(
+      Effect.gen(function* () {
+        const raw = yield* jsonBody(c);
+        return yield* lifecycle.withPermits(1)(
           Effect.gen(function* () {
             const body = yield* decodeBody(jobRequest, raw);
             const job = yield* admit(body);
@@ -318,10 +326,10 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
             if (Option.isSome(job)) yield* job.value.start(body.checkpoint);
             return Response.json({ accepted: true });
           }),
-        )
-        .pipe(Effect.provide(layer)),
-    );
-  });
+        );
+      }).pipe(Effect.provide(layer)),
+    ),
+  );
   /**
    * `?after=N` answers at once with the retained events after `N`. `&wait=<ms>`
    * (capped at 25 s) makes an empty answer wait that long for the next event or
@@ -344,19 +352,21 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       ),
     ),
   );
-  app.post("/jobs/:turn/control", async (c) => {
-    const raw: unknown = await c.req.json();
-    return runPromise(
-      lifecycle.withPermits(1)(
-        Effect.gen(function* () {
-          const body = yield* decodeBody(controlRequest, raw);
-          const job = yield* lookup(c.req.param("turn"));
-          yield* job.control(body.operationId, body.command);
-          return c.body(null, 204);
-        }),
-      ),
-    );
-  });
+  app.post("/jobs/:turn/control", (c) =>
+    runPromise(
+      Effect.gen(function* () {
+        const raw = yield* jsonBody(c);
+        return yield* lifecycle.withPermits(1)(
+          Effect.gen(function* () {
+            const body = yield* decodeBody(controlRequest, raw);
+            const job = yield* lookup(c.req.param("turn"));
+            yield* job.control(body.operationId, body.command);
+            return c.body(null, 204);
+          }),
+        );
+      }),
+    ),
+  );
   app.get("/jobs/:turn/checkpoint", (c) =>
     runPromise(
       lifecycle.withPermits(1)(
@@ -376,19 +386,18 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       }),
     ),
   );
-  app.post("/jobs/:turn/workspace", async (c) => {
-    const raw: unknown = await c.req.json();
-    return runPromise(
+  app.post("/jobs/:turn/workspace", (c) =>
+    runPromise(
       Effect.gen(function* () {
-        const input = yield* parse(workspaceRequestSchema, raw);
+        const input = yield* parse(workspaceRequestSchema, yield* jsonBody(c));
         const job = yield* lookup(c.req.param("turn"));
         const workspace = job.workspace?.bind(job);
         return workspace
           ? Response.json(yield* workspace(input.tool, input.arguments))
           : c.body(null, 404);
       }),
-    );
-  });
+    ),
+  );
   app.get("/jobs/:turn/code-tools", (c) =>
     runPromise(
       Effect.gen(function* () {
@@ -399,19 +408,18 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       }),
     ),
   );
-  app.post("/jobs/:turn/code-tool", async (c) => {
-    const raw: unknown = await c.req.json();
-    return runPromise(
+  app.post("/jobs/:turn/code-tool", (c) =>
+    runPromise(
       Effect.gen(function* () {
-        const input = yield* parse(codeToolRequest, raw);
+        const input = yield* parse(codeToolRequest, yield* jsonBody(c));
         const job = yield* lookup(c.req.param("turn"));
         const codeTool = job.codeTool?.bind(job);
         return codeTool
           ? Response.json(yield* codeTool(input.name, input.arguments, input.invocation))
           : c.body(null, 404);
       }),
-    );
-  });
+    ),
+  );
   app.post("/stop", (c) => runPromise(stop.pipe(Effect.as(c.body(null, 204)))));
   return { app, stop: () => runPromise(stop), shutdown: stop };
 }

@@ -20,6 +20,44 @@ Keep the official OpenAI client. Point it at your Worker. The Worker owns the AP
 
 If you only need a single model call with tools, this project is more than you need. If you need OpenAI's hosted environments exactly as OpenAI runs them, use OpenAI.
 
+## Quick start
+
+The setup CLI creates a Worker with the API and a small demo app: a prompt form, a job page that streams the turn as it runs, and a zip of the files the agent wrote. Node 24, pnpm and a running Docker engine are the prerequisites; Workers AI needs no provider key.
+
+```sh
+mkdir my-agents && cd my-agents
+pnpm dlx create-cf-open-agents-api@alpha init     # choose the demo template and a provider; Workers AI needs no key
+pnpm install
+pnpm exec wrangler login
+pnpm dev                                            # or pnpm dev:rootless when init offered it
+```
+
+Open <http://localhost:8787>, type a prompt, pick a preset and press Build. The [QuickStart](docs/quickstart.md) explains what happens under the hood, where the presets and keys live, and the first questions that come up.
+
+![A finished job with the transcript, thinking and the zip download](docs/images/demo-job.png)
+
+To add the API to a Worker you already have, run `init` in its directory instead; it writes the bindings into `wrangler.jsonc`, the composition into `src/agents.ts` and the Docker build context into `.cf-open-agents-api/`:
+
+```sh
+pnpm dlx create-cf-open-agents-api@alpha init
+pnpm install
+pnpm exec wrangler login
+pnpm dev
+```
+
+Then hand the `AGENTS` binding to the official client:
+
+```ts
+import { tenantFetch } from "cf-open-agents-api/cloudflare";
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
+  baseURL: "https://agents.internal/v1",
+  fetch: tenantFetch(env.AGENTS, "default"),
+});
+```
+
 ## Architecture
 
 ```mermaid
@@ -58,7 +96,7 @@ One Worker exports every class. Each session has its own SessionDO, HarnessDO an
 | pnpm                    | `11.1.2`, the pinned `packageManager`.                                                                                                                                                                                          |
 | Docker                  | A running engine for `pnpm dev`, `pnpm dev:caller`, `pnpm test:containers` and `pnpm deploy:check`. The two images in `docker/` need roughly 5 GB; the first build installs Node, Codex and OpenCode and takes several minutes. |
 | Cloudflare account      | Workers Paid plan (Containers require it), Durable Objects with SQLite, R2, and Workers AI if you use the `workers` preset.                                                                                                     |
-| Model credentials       | An OpenAI API key for the `coding`, `claude` and `opencode` presets, or nothing beyond your Cloudflare account for the `workers` preset (Workers AI).                                                                           |
+| Model credentials       | An OpenAI API key for the `codex`, `claude` and `opencode` presets, or nothing beyond your Cloudflare account for the `workers` preset (Workers AI).                                                                            |
 | Codex `0.154.0` on PATH | Only for `pnpm test:codex` and `pnpm test:harnesses`. pnpm installs the pinned Claude Agent SDK and OpenCode.                                                                                                                   |
 | `python3`               | Only for `pnpm test:containers`; the smoke builds a plugin archive with it.                                                                                                                                                     |
 
@@ -66,26 +104,19 @@ What you pay for in production: Container run time (a harness container on the `
 
 ## Add it to your Worker
 
-The setup CLI, [`create-cf-open-agents-api`](packages/create-cf-open-agents-api/README.md), adds the API to a Workers project you already have (a Vite + `@cloudflare/vite-plugin` app, a Hono Worker, anything Wrangler deploys) or creates a new Worker for it. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition from your provider and runtime choices, snapshots the Docker build context into `.cf-open-agents-api/`, and creates `.dev.vars` with a random token. Run it in the project directory:
+The setup CLI, [`create-cf-open-agents-api`](packages/create-cf-open-agents-api/README.md), adds the API to a Workers project you already have (a Vite + `@cloudflare/vite-plugin` app, a Hono Worker, anything Wrangler deploys) or creates a new Worker for it, with the demo app or the API alone. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition from your provider and runtime choices (presets, the gateway registry, `tiers` for Claude Code subagents, `authenticate`), snapshots the Docker build context into `.cf-open-agents-api/`, and creates `.dev.vars` with a random token. On a rootless Docker engine it offers a `dev:rootless` script. The commands are in the [Quick start](#quick-start); `--yes` takes the defaults.
 
-```sh
-pnpm dlx create-cf-open-agents-api@alpha init   # asks about provider, runtimes and tool calling; --yes takes the defaults
-pnpm install
-pnpm exec wrangler login                        # the AI binding and deployments need your account
-pnpm dev                                        # Docker must be running; the first image build takes several minutes
-```
-
-Your Worker then forwards `/v1/*` to its own `AGENTS` binding (`app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw))`) or calls the typed RPC methods on it. `create-cf-open-agents-api setup` creates the R2 buckets and puts the production secrets, `doctor` checks the toolchain and the configuration. Until the packages reach npm, the CLI README explains how to point it at a checkout and packed tarballs.
+Your Worker reaches the API through its own `AGENTS` binding: the official client with `tenantFetch` (below), the typed RPC methods, or a forwarded route (`app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw))`) for callers that hold the bearer token. `create-cf-open-agents-api setup` creates the R2 buckets and puts the production secrets, `doctor` checks the toolchain and the configuration.
 
 ## First run from this repository
 
-The `workers` preset runs Codex against Workers AI. Workers AI has no local emulator: `wrangler dev` sends `AI` binding calls to your account, so you must be logged in (`wrangler login`) and the calls count against your Workers AI usage. `examples/worker` is the Worker this repository deploys and the template the CLI generates; `examples/caller` is a Worker that consumes it.
+The `workers` preset runs Codex against Workers AI. Workers AI has no local emulator: `wrangler dev` sends `AI` binding calls to your account, so you must be logged in (`wrangler login`) and the calls count against your Workers AI usage. `examples/worker` is the Worker this repository deploys and the CLI's minimal template; `examples/demo` is the demo template; `examples/caller` is a Worker that consumes the API over a Service Binding.
 
 ```sh
 git clone https://github.com/inaridiy/CF-Open-Agents-API.git
 cd CF-Open-Agents-API
 pnpm install --frozen-lockfile
-pnpm bootstrap        # writes examples/worker/.dev.vars and examples/caller/.dev.vars with one random API_TOKEN
+pnpm bootstrap        # writes the worker, demo and caller .dev.vars with one random API_TOKEN
 # Leave OPENAI_API_KEY empty if you have no OpenAI key: presets are built only
 # when a session selects them, and the `workers` preset never calls OpenAI.
 pnpm dev:caller       # builds the library first, then both Docker images
@@ -103,22 +134,23 @@ curl http://localhost:8788/sdk/sessions \
 
 Poll `GET /sdk/sessions/<id>` with the same header until `session.status` is `idle`, `requires_action` or `failed`. The response includes the items and turns. `DELETE /sdk/sessions/<id>` removes the session. The [caller source](examples/caller/src/index.ts) implements this journey through both the SDK (`/sdk`) and typed RPC (`/rpc`).
 
-Use `"model":"coding"` with a real `OPENAI_API_KEY` for the full Codex experience (native Responses, images, hosted web search, structured output). Use `claude` or `opencode` to run the other runtimes against the same key through the portable AI SDK adapter.
+Use `"model":"codex"` with a real `OPENAI_API_KEY` for the full Codex experience (native Responses, images, hosted web search, structured output). Use `claude` or `opencode` to run the other runtimes against the same key through the portable AI SDK adapter.
 
 ## Use it from your Worker
 
-Bind the Agent Worker as a service named `AGENTS`, then hand its `fetch` to the official client:
+Bind the Agent Worker as a service named `AGENTS` (the CLI writes a self binding to the `Agents` entrypoint), then give the official client `tenantFetch` as its `fetch`. The binding is the credential: the trusted Worker names the tenant, and no bearer token crosses it.
 
 ```ts
+import { tenantFetch } from "cf-open-agents-api/cloudflare";
 import OpenAI from "openai";
 
 const client = new OpenAI({
+  apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
   baseURL: "https://agents.internal/v1",
-  apiKey: env.API_TOKEN,
-  fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
+  fetch: tenantFetch(env.AGENTS, "default"),
 });
 const session = await client.beta.agents.sessions.create(
-  { agent: { model: "coding" }, environment: { type: "openai_hosted" } },
+  { agent: { model: "codex" }, environment: { type: "openai_hosted" } },
   { headers: { "Idempotency-Key": "report-session-1" } },
 );
 for await (const event of client.beta.agents.sessions.stream(session.id, {
@@ -131,17 +163,18 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 }
 ```
 
-`agents.internal` is a routing label; the request never leaves the Service Binding. `openai_hosted` is the SDK's wire name and selects a Cloudflare sandbox here. `coding` is a preset your deployment defines; clients pick presets and never see provider URLs or keys.
+`agents.internal` is a routing label; the request never leaves the Service Binding. `openai_hosted` is the SDK's wire name and selects a Cloudflare sandbox here. `codex` is a preset your deployment defines; clients pick presets and never see provider URLs or keys. `"default"` is the tenant: derive it from your own verified identity, never from a request body. A caller that only holds the bearer token uses `env.AGENTS.fetch` with `apiKey: env.API_TOKEN` instead and passes through the HTTP authenticator.
 
-| Connection                                      | Start here                                                                |
-| ----------------------------------------------- | ------------------------------------------------------------------------- |
-| Another Worker, Service Binding, OpenAI client  | [Service Binding guide](docs/service-binding.md)                          |
-| Another Worker, typed RPC without HTTP          | [RPC guide](docs/rpc.md)                                                  |
-| Node, Python or anything else over HTTPS        | [HTTP guide](docs/http-api.md)                                            |
-| Adding the API to your Worker with the CLI      | [create-cf-open-agents-api](packages/create-cf-open-agents-api/README.md) |
-| Embedding the library in your own Worker        | [Library API](docs/library-api.md)                                        |
-| Files, skills, templates, MCP, subagents, forks | [Environments and tools](docs/environments-and-tools.md)                  |
-| Presets, model adapters, custom drivers         | [Extending](docs/extending.md)                                            |
+| Connection                                       | Start here                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| The demo, the first session, the first questions | [QuickStart](docs/quickstart.md)                                          |
+| Another Worker, Service Binding, OpenAI client   | [Service Binding guide](docs/service-binding.md)                          |
+| Another Worker, typed RPC without HTTP           | [RPC guide](docs/rpc.md)                                                  |
+| Node, Python or anything else over HTTPS         | [HTTP guide](docs/http-api.md)                                            |
+| Adding the API to your Worker with the CLI       | [create-cf-open-agents-api](packages/create-cf-open-agents-api/README.md) |
+| Embedding the library in your own Worker         | [Library API](docs/library-api.md)                                        |
+| Files, skills, templates, MCP, subagents, forks  | [Environments and tools](docs/environments-and-tools.md)                  |
+| Presets, model adapters, custom drivers          | [Extending](docs/extending.md)                                            |
 
 ## How a turn works
 
@@ -152,20 +185,86 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 5. When the runtime finishes, the turn enters `checkpointing`. The supervisor captures the runtime's home directory, HarnessDO stores it in R2, backs up `/workspace`, and publishes `/workspace/outputs` as artifacts. The turn becomes `completed` only after those references are committed.
 6. A failed turn returns the session to `idle` with `session.error` set, and the next turn restores the last committed checkpoint. Only an outcome nobody can confirm (`outcome_unknown`, `programmatic_execution_uncertain`) leaves the session `failed`; fork it to continue.
 
-## What you control
+## Compose the Worker with `defineAgentWorker`
 
-- Presets: each public `agent.model` maps to a harness, a gateway model name, optional `delegates` (presets a session may start subagents on) and a `webSearch` flag.
-- Models: `nativeModel` passes a provider protocol through unchanged; `aiSDKModel` and `openAICompatibleModel` translate any AI SDK model, including Workers AI, into what the runtime speaks.
-- Environments: network policy, packages, files, skills, plugins and setup commands, per session or through templates.
-- Tools: client function tools, MCP servers with Vault credentials, deferred tool loading, programmatic tool calling in isolated Dynamic Workers.
+One call builds everything the deployment exports: the `Agents` entrypoint (HTTP routes and typed RPC), the `Models` gateway entrypoint, and the four Durable Object classes. The setup CLI writes this file for you; this is the whole of it, with the three options you will actually edit:
+
+```ts
+import {
+  type AgentBindings,
+  bearerTenant,
+  type ContainerBindings,
+  defineAgentWorker,
+} from "cf-open-agents-api/cloudflare";
+import { aiSDKModel, nativeModel } from "cf-open-agents-api/models";
+import { createOpenAI } from "@ai-sdk/openai";
+
+interface Bindings extends AgentBindings, ContainerBindings {
+  API_TOKEN: string;
+  OPENAI_API_KEY: string;
+}
+
+export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
+  defineAgentWorker<Bindings>({
+    // Presets: the names clients send as `agent.model`. Each picks a native runtime
+    // (`harness`) and a gateway entry (`model`); a session pins both at creation.
+    agents: {
+      codex: { harness: "codex", model: "codex", webSearch: true, delegates: ["claude"] },
+      claude: { harness: "claude-code", model: "primary", tiers: { haiku: "fast" } },
+    },
+    // The private gateway: deployment-owned names → provider connections. Keys stay here;
+    // runtimes and sandboxes only ever see the name. Each entry is built on first use.
+    models: (env) => ({
+      codex: () =>
+        nativeModel({
+          protocol: "responses",
+          baseURL: "https://api.openai.com/v1",
+          apiKey: env.OPENAI_API_KEY,
+          model: "gpt-6-astra",
+        }),
+      primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+      fast: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-5.6-luna")),
+    }),
+    // Who may call the HTTP API, and as which tenant. Service Binding callers name the
+    // tenant themselves (`tenantFetch`) and never pass through this function.
+    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
+  });
+export default Agents;
+```
+
+- `agents` are presets. Clients choose a preset and never see provider URLs, model ids or keys. `delegates` lists the presets a session may start subagents on when `multi_agent` is enabled; `tiers` names the gateway entries a Claude Code subagent's `haiku`, `sonnet` and `opus` request resolves to.
+- `models` is the gateway registry. `nativeModel` passes a provider's own protocol through unchanged, so reasoning state, images and hosted tools survive. `aiSDKModel` and `openAICompatibleModel` translate any AI SDK or Chat Completions model, including Workers AI, into what the runtime speaks.
+- `authenticate` maps an HTTP request to a tenant. Replace `bearerTenant` with your own verification (Access, JWT, session cookie) for multi-tenant deployments.
+
+`harnesses`, `environments`, `objects`, `maxTurnMs` and `pollIntervalMs` have defaults; the [Library API](docs/library-api.md#composition) lists them. Environments (network policy, packages, files, skills, setup commands) and tools (function tools, MCP servers with Vault credentials, programmatic tool calling) are configured per session or through templates; see [Environments and tools](docs/environments-and-tools.md).
+
+### Enable hosted web search
+
+Web search is a hosted tool of the model provider, so it needs two things: a preset that declares it, and a client that asks for it.
+
+1. The preset's `model` must be a `nativeModel` entry (the provider's own protocol) and the preset sets `webSearch: true`. Codex gets the Responses search tool, Claude Code gets Anthropic's hosted `WebSearch`. The portable `aiSDKModel` and `openAICompatibleModel` adapters cannot carry hosted search, and OpenCode has none; there, expose search as a function tool.
+2. The client adds the tool to the session's agent:
+
+```ts
+const session = await client.beta.agents.sessions.create({
+  agent: {
+    model: "codex",
+    tools: [{ type: "web_search", mode: "live", allowed_domains: ["developer.mozilla.org"] }],
+  },
+  environment: { type: "openai_hosted" },
+  input: "Check the current MDN guidance on the View Transitions API and summarize it.",
+});
+```
+
+`mode` is `live` (the default), `cached`, or `disabled`; `allowed_domains`, `context_size` and `location` are forwarded to Codex and `allowed_domains` is enforced on Claude Code. A preset without `webSearch: true` rejects the tool, so a deployment decides which presets may reach the web. `GET /cf/v1/capabilities` shows the flag per preset. Details and the image example are in [Environments and tools](docs/environments-and-tools.md#images-web-search-and-streamed-progress).
 
 ## Develop
 
-`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `packages/create-cf-open-agents-api` the setup CLI, `examples/worker` the deployable composition (and the CLI's standalone template) and `examples/caller` a consuming Worker. Local suites use scripted models and need no provider credentials.
+`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `packages/create-cf-open-agents-api` the setup CLI, `examples/worker` the deployable composition (and the CLI's minimal template), `examples/demo` the demo app (the CLI's demo template) and `examples/caller` a consuming Worker. Local suites use scripted models and need no provider credentials.
 
 | Command                   | Purpose                                                                 |
 | ------------------------- | ----------------------------------------------------------------------- |
-| `pnpm bootstrap`          | Write both example `.dev.vars` files with one random API token          |
+| `pnpm bootstrap`          | Write the worker, demo and caller `.dev.vars` files with one API token  |
 | `pnpm dev:caller`         | Run the caller and its Agent Worker together (caller on localhost:8788) |
 | `pnpm dev`                | Run the Agent Worker alone on localhost:8787                            |
 | `pnpm check`              | Docs, harness, scripts, types, lint, Worker tests and build             |
@@ -183,8 +282,8 @@ for await (const event of client.beta.agents.sessions.stream(session.id, {
 | `pnpm test:containers`    | Real local Containers and R2 recovery with scripted inference           |
 | `pnpm test:package`       | Pack the library and typecheck a consumer against it                    |
 | `pnpm build`              | Build ESM and declaration files                                         |
-| `pnpm types`              | Generate the example Workers' binding types                             |
-| `pnpm deploy:check`       | Dry-run both deployments and build the images without deploying         |
+| `pnpm types`              | Generate the binding types of the three example Workers                 |
+| `pnpm deploy:check`       | Dry-run the three example deployments and build the images              |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for which checks a change needs, [deployment](docs/deployment.md) for production and [known issues](docs/known-issues.md) for diagnostics you may see in local runs.
 

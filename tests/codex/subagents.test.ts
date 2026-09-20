@@ -158,7 +158,7 @@ it.each(["complete", "cancel", "immediate"])(
       harness: "codex",
       model: "gpt-5.4",
       agent: {
-        model: "coding",
+        model: "codex",
         multi_agent: { enabled: true, max_concurrent_subagents: 2 },
         reasoning: { effort: "high" },
         text: { verbosity: "low" },

@@ -1,10 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { Effect } from "effect";
-import { type Context, Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
-import type { HostedSkill } from "openai/resources/beta/agents/agents";
+import type { Hono } from "hono";
 
-import { sessionTools } from "./agent-tools.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource, ReservationResult, ReserveResult } from "./catalog.js";
 import { attempt, io, runPromise } from "./effect.js";
@@ -12,41 +9,19 @@ import {
   type HostedConfiguration,
   hostedConfigurationSchema,
   publicHostedConfiguration,
-  type TemplateConfiguration,
 } from "./environment-config.js";
 import type { EnvironmentSpec } from "./environments.js";
-import { mergeEnvironment } from "./environments.js";
 import {
-  BodyTooLarge,
-  type Capability,
   CapabilityUnsupported,
-  caughtFailure,
   decodeRpc,
-  DelegateUnavailable,
   EnvironmentDriverUnavailable,
-  ImageLimitExceeded,
-  InvalidJson,
   InvalidTenant,
-  isPermanent,
-  McpPlacementInvalid,
-  ModelNotRegistered,
-  ReservedToolName,
   SessionNotFound,
-  toApiError,
-  Unauthorized,
 } from "./errors.js";
-import { INPUT_FILE_LIMIT, type ResolvedInputFile } from "./files.js";
-import { registerAgentRoutes } from "./http/agents.js";
-import { registerCapabilityRoutes } from "./http/capabilities.js";
+import { buildApplication } from "./http/app.js";
 import type { RouteEnv, WorkerAccess } from "./http/context.js";
-import { registerEnvironmentRoutes } from "./http/environments.js";
-import { registerFileRoutes } from "./http/files.js";
-import { registerSessionRoutes } from "./http/sessions.js";
-import { registerSkillRoutes } from "./http/skills.js";
-import { registerVaultRoutes } from "./http/vaults.js";
 import type {
   Agent,
-  AgentConfig,
   AgentSession,
   AgentSessionItem,
   CreateSession,
@@ -63,24 +38,43 @@ import {
   eventsSchema,
   forkSessionSchema,
   identifier,
-  IMAGE_LIMIT,
   inputMessages,
   pageSchema,
   parseEffect,
-  remoteImageURLs,
-  reservedDelegationName,
   sessionPageSchema,
 } from "./protocol.js";
-import type { AgentRegistration, RuntimeDriver, ServiceOptions } from "./runtime.js";
-import type { SessionRecord } from "./session.js";
-import { type ForkSource, ForkSourceResult, SessionObject, SubmitResult } from "./session.js";
-import { type ResolvedSkill, SKILL_UPLOAD_LIMIT } from "./skills.js";
+import type { ServiceOptions } from "./runtime.js";
+import {
+  checkInputImages,
+  hasImageInput,
+  validateMcp,
+  validateModel,
+} from "./service-validation.js";
+import {
+  type Catalog,
+  configuresCapabilities,
+  forkedCheckpoint,
+  forkedEnvironment,
+  hostedConfiguration,
+  newSessionRecord,
+  publicEnvironmentFiles,
+  resolveInputFiles,
+  resolveSkills,
+  savedAgentConfig,
+} from "./session-reservation.js";
+import { ForkSourceResult, SessionObject, SubmitResult } from "./session.js";
 
 export interface AgentBindings {
   SESSIONS: DurableObjectNamespace<SessionObject>;
   CATALOG: DurableObjectNamespace<CatalogObject>;
 }
 export interface AgentRPC {
+  /**
+   * Serve one HTTP request of the Agents API as `tenant`, skipping the HTTP authenticator:
+   * the trusted caller already knows who it acts for, like the other RPC methods. Hand it
+   * to the official client as its `fetch` and no bearer token is needed over the binding.
+   */
+  fetchAs(tenant: string, request: Request): Promise<Response>;
   createSession(tenant: string, parameters: CreateSession, key?: string): Promise<AgentSession>;
   /** `/cf/v1` extension: continue a session's committed state, optionally on another runtime. */
   forkSession(
@@ -115,7 +109,6 @@ export interface AgentServiceClasses<Env> {
   AgentWorker: new (ctx: ExecutionContext, env: Env) => WorkerEntrypoint<Env> & AgentRPC;
   SessionDO: new (ctx: DurableObjectState, env: Env) => SessionObject<Env>;
 }
-
 /** One composition root configures both the API and the authoritative SessionDO. */
 export function createAgentService<Env extends AgentBindings>(
   options: ServiceOptions<Env>,
@@ -144,48 +137,6 @@ export function createAgentService<Env extends AgentBindings>(
           return this.env.SESSIONS.getByName(JSON.stringify([tenant, id]));
         }),
       );
-    }
-    /** Reject configurations the selected driver cannot execute before any state exists. */
-    private validateModel(model: string, agent: ModelAgent, sandbox: boolean) {
-      return Effect.gen(this, function* () {
-        const registration = options.agents[model];
-        const driver = registration && options.harnesses(this.env)[registration.harness];
-        if (!registration || !driver) return yield* new ModelNotRegistered({ alias: model });
-        const tools = agent.tools ?? [];
-        const unsupported = (capability: Capability) =>
-          new CapabilityUnsupported({ capability, harness: driver.name });
-        const configuration = configurationGap(tools, agent, sandbox, registration, driver);
-        if (configuration) return yield* unsupported(configuration);
-        if (reservedDelegationName(agent)) return yield* new ReservedToolName();
-        if (agent.multi_agent?.enabled) {
-          const alias = unavailableDelegate(registration, options.agents, () =>
-            options.harnesses(this.env),
-          );
-          if (alias !== undefined) return yield* new DelegateUnavailable({ alias });
-        }
-        const tooling = toolCapabilityGap(tools, registration, driver);
-        if (tooling) return yield* unsupported(tooling);
-        return { registration, driver };
-      });
-    }
-    /** MCP placement rules that depend on the environment rather than the driver. */
-    private validateMcp(agent: AgentConfig, hosted: boolean) {
-      return Effect.gen(function* () {
-        for (const tool of agent.tools ?? []) {
-          if (tool.type !== "mcp") continue;
-          const environmentOrigin =
-            tool.transport.type === "stdio" || tool.connection_origin === "environment";
-          if (environmentOrigin && !hosted)
-            return yield* new McpPlacementInvalid({ rule: "environment_required" });
-          if (tool.transport.type === "stdio" && tool.connection_origin === "service")
-            return yield* new McpPlacementInvalid({ rule: "stdio_in_service" });
-          if (
-            environmentOrigin &&
-            (tool.credential_id || Object.keys(tool.request_metadata ?? {}).length)
-          )
-            return yield* new CapabilityUnsupported({ capability: "environment_mcp_credentials" });
-        }
-      });
     }
     /** Large bodies are compared by digest so the reservation row stays small. */
     private fingerprint(value: unknown) {
@@ -293,17 +244,22 @@ export function createAgentService<Env extends AgentBindings>(
           ...input.agent,
         });
         const hosted = input.environment.type !== "none";
-        const { registration, driver } = yield* this.validateModel(agent.model, agent, hosted);
+        const { registration, driver } = yield* validateModel(
+          options,
+          this.env,
+          agent.model,
+          agent,
+          hosted,
+        );
         if (hasImageInput(input.input) && !driver.capabilities.images)
           return yield* new CapabilityUnsupported({
             capability: "image_input",
             harness: driver.name,
           });
         for (const id of input.vault_ids ?? []) yield* io("api.vault", () => catalog.vault(id));
-        yield* this.validateMcp(agent, hosted);
+        yield* validateMcp(agent, hosted);
         const resource = agentResource({ ...agent, name: saved?.name, tools: agent.tools });
         if (saved) resource.id = saved.id;
-        const now = Math.floor(Date.now() / 1_000);
         const sessionId = identifier("sess");
         const environmentId = identifier("env");
         const configured = yield* parseEffect(
@@ -323,28 +279,16 @@ export function createAgentService<Env extends AgentBindings>(
           { sessionId, environmentId, inputFiles, skills: resolvedSkills },
           configured,
         );
-        const session: AgentSession = {
-          id: sessionId,
-          object: "agent.session",
-          agent: {
-            id: resource.id,
-            instructions: resource.instructions,
-            model: resource.model,
-            name: resource.name,
-            multi_agent: resource.multi_agent,
-            reasoning: resource.reasoning,
-            service_tier: resource.service_tier,
-            text: resource.text,
-            tools: sessionTools(agent.tools ?? []),
-          },
-          created_at: now,
-          last_active_at: now,
-          status: "idle",
-          error: null,
-          required_actions: [],
+        const record = newSessionRecord({
+          tenant,
+          sessionId,
+          agentId: resource.id,
+          resource,
+          agent,
+          driver,
+          registration,
+          vaultIds: input.vault_ids ?? [],
           metadata: input.metadata ?? {},
-          usage: null,
-          vault_ids: input.vault_ids ?? [],
           environment:
             input.environment.type === "none"
               ? { type: "none" }
@@ -355,23 +299,9 @@ export function createAgentService<Env extends AgentBindings>(
                   skills: installedSkills,
                   files: publicEnvironmentFiles(configured, inputFiles),
                 },
-        };
-        const record: SessionRecord = {
-          schemaVersion: 2,
-          tenant,
-          session,
-          agent,
-          driver: driver.name,
-          revision: driver.revision,
-          model: registration.model,
-          generation: 0,
           checkpoint: null,
-          execution: null,
-          cursor: 0,
-          phase: "idle",
-          deleted: false,
           ...(environmentSpec ? { environmentSpec } : {}),
-        };
+        });
         return yield* decodeRpc(ReserveResult)(
           yield* io("api.createSession", () =>
             catalog.reserve(idempotencyKey, fingerprint, record),
@@ -417,8 +347,14 @@ export function createAgentService<Env extends AgentBindings>(
         );
         const hosted = source.session.environment.type !== "none";
         const agent = yield* parseEffect(agentConfigSchema, { ...source.agent, ...input.agent });
-        const { registration, driver } = yield* this.validateModel(agent.model, agent, hosted);
-        yield* this.validateMcp(agent, hosted);
+        const { registration, driver } = yield* validateModel(
+          options,
+          this.env,
+          agent.model,
+          agent,
+          hosted,
+        );
+        yield* validateMcp(agent, hosted);
         if (hasImageInput(input.input) && !driver.capabilities.images)
           return yield* new CapabilityUnsupported({
             capability: "image_input",
@@ -429,56 +365,32 @@ export function createAgentService<Env extends AgentBindings>(
         if (hosted && source.environmentSpec && !(options.environments && options.objects))
           return yield* new CapabilityUnsupported({ capability: "environment_fork" });
         const checkpoint = forkedCheckpoint(source, agent, registration, driver, options.agents);
-        const now = Math.floor(Date.now() / 1_000);
         const sessionId = identifier("sess");
         const environmentId = identifier("env");
         const environmentSpec = forkedEnvironment(source, sessionId, environmentId);
         const resource = agentResource({ ...agent, name: source.session.agent.name });
-        const session: AgentSession = {
-          ...source.session,
-          id: sessionId,
-          agent: {
-            id: input.agent ? resource.id : source.session.agent.id,
-            instructions: resource.instructions,
-            model: resource.model,
-            name: resource.name,
-            multi_agent: resource.multi_agent,
-            reasoning: resource.reasoning,
-            service_tier: resource.service_tier,
-            text: resource.text,
-            tools: sessionTools(agent.tools ?? []),
-          },
-          created_at: now,
-          last_active_at: now,
-          status: "idle",
-          error: null,
-          required_actions: [],
+        const record = newSessionRecord({
+          tenant,
+          sessionId,
+          agentId: input.agent ? resource.id : source.session.agent.id,
+          resource,
+          agent,
+          driver,
+          registration,
+          vaultIds,
           metadata: input.metadata ?? {},
-          usage: null,
-          vault_ids: vaultIds,
           environment:
             source.session.environment.type === "none"
               ? { type: "none" }
               : { ...source.session.environment, id: environmentId },
-        };
-        const record: SessionRecord = {
-          schemaVersion: 2,
-          tenant,
-          session,
-          agent,
-          driver: driver.name,
-          revision: driver.revision,
-          model: registration.model,
-          generation: 0,
           checkpoint,
-          execution: null,
-          cursor: 0,
-          phase: "idle",
-          deleted: false,
           ...(environmentSpec ? { environmentSpec } : {}),
-          ...(!checkpoint && source.transcript ? { inheritedTranscript: source.transcript } : {}),
-          forkedFrom: { sessionId: source.session.id, turnId: source.lastTurnId },
-        };
+          fork: {
+            sessionId: source.session.id,
+            lastTurnId: source.lastTurnId,
+            transcript: source.transcript,
+          },
+        });
         return yield* decodeRpc(ReserveResult)(
           yield* io("api.forkSession", () => catalog.reserve(idempotencyKey, fingerprint, record)),
         );
@@ -540,12 +452,16 @@ export function createAgentService<Env extends AgentBindings>(
           const parsed = yield* parseEffect(sessionPageSchema, query);
           const catalog = yield* attempt("api.catalog", () => this.catalog(tenant));
           const page = yield* io("api.listSessions", () => catalog.sessions(parsed));
+          // The catalog page already proves ownership: every row is this tenant's, and the
+          // object is addressed under the tenant, so one RPC per row reads the record.
           // A session deleted but not yet removed from discovery must not fail the page. The
           // object answers over RPC, so its `SessionNotFound` may arrive by wire name.
           const sessions = yield* Effect.forEach(
             page.data,
             ({ id }) =>
-              io("api.retrieveSession", () => this.retrieveSession(tenant, id)).pipe(
+              io("api.retrieveSession", () =>
+                this.env.SESSIONS.getByName(JSON.stringify([tenant, id])).retrieve(),
+              ).pipe(
                 Effect.catchTag("SessionNotFound", () => Effect.void),
                 Effect.catchIf(
                   (error) => error._tag === "ApiError" && error.status === 404,
@@ -612,13 +528,20 @@ export function createAgentService<Env extends AgentBindings>(
     override async fetch(request: Request): Promise<Response> {
       return application().fetch(request, this.access());
     }
+    async fetchAs(tenant: string, request: Request): Promise<Response> {
+      if (!tenant || tenant.length > 256) throw new InvalidTenant();
+      return await application().fetch(request, this.access(tenant));
+    }
     /** Route handlers reach the entrypoint through this per-request view, not through RPC. */
-    private access(): WorkerAccess<Env> {
+    private access(resolved?: string): WorkerAccess<Env> {
       return {
         env: this.env,
+        ...(resolved === undefined ? {} : { tenant: resolved }),
+        fetchAs: (tenant, request) => this.fetchAs(tenant, request),
         catalog: (tenant) => this.catalog(tenant),
         session: (tenant, id) => this.session(tenant, id),
-        validateModel: (model, agent, sandbox) => this.validateModel(model, agent, sandbox),
+        validateModel: (model, agent, sandbox) =>
+          validateModel(options, this.env, model, agent, sandbox),
         createSession: (tenant, input, key) => this.createSession(tenant, input, key),
         forkSession: (tenant, id, input, key) => this.forkSession(tenant, id, input, key),
         retrieveSession: (tenant, id) => this.retrieveSession(tenant, id),
@@ -633,339 +556,47 @@ export function createAgentService<Env extends AgentBindings>(
   }
   let cached: Hono<RouteEnv<Env>> | undefined;
   const application = () => {
-    cached ??= buildApplication();
+    cached ??= buildApplication(options);
     return cached;
   };
-  /** The router is built once per isolate; every handler reads its entrypoint from `c.env`. */
-  function buildApplication() {
-    const app = new Hono<RouteEnv<Env>>();
-    // Every response, including errors and streams, carries a request ID the SDK surfaces.
-    app.use("*", async (c, next) => {
-      await next();
-      const id = identifier("req");
-      try {
-        c.res.headers.set("x-request-id", id);
-      } catch {
-        c.res = new Response(c.res.body, c.res);
-        c.res.headers.set("x-request-id", id);
-      }
-    });
-    app.use("*", async (c, next) => {
-      const tenant = await options.authenticate(c.req.raw, c.env.env);
-      if (!tenant) throw new Unauthorized();
-      c.set("tenant", tenant);
-      await next();
-    });
-    // Authenticated callers only: an anonymous request never buffers an upload.
-    app.use("*", async (c: Context<RouteEnv<Env>, "*", {}>, next) =>
-      bodyLimit({
-        maxSize: requestBodyLimit(c.req.path),
-        onError: () => {
-          throw new BodyTooLarge();
-        },
-      })(c, next),
-    );
-    app.onError((error) => {
-      const failure = error instanceof SyntaxError ? new InvalidJson() : caughtFailure(error);
-      const known = failure && toApiError(failure);
-      if (!known || known.status === 500)
-        console.error("Agent API request failed", { message: error.message });
-      const status = known ? known.status : 500;
-      const response = Response.json(
-        {
-          error: {
-            message: known ? known.message : "Internal server error",
-            type: errorType(status),
-            code: known ? known.code : "internal_error",
-            param: null,
-          },
-        },
-        { status },
-      );
-      // The SDK retries 409 by default; these conflicts never resolve by retrying.
-      if (failure && isPermanent(failure)) response.headers.set("x-should-retry", "false");
-      return response;
-    });
-    registerCapabilityRoutes(app, options);
-    registerSkillRoutes(app, options);
-    registerFileRoutes(app, options);
-    registerSessionRoutes(app, options);
-    registerAgentRoutes(app);
-    registerEnvironmentRoutes(app, options);
-    registerVaultRoutes(app);
-    app.notFound(() =>
-      Response.json(
-        {
-          error: {
-            code: "unsupported_endpoint",
-            type: "invalid_request_error",
-            message: "Endpoint is not part of this deployment's compatibility profile",
-            param: null,
-          },
-        },
-        { status: 404 },
-      ),
-    );
-    return app;
-  }
   return { AgentWorker, SessionDO };
 }
 
-type Catalog = DurableObjectStub<CatalogObject>;
-/** The agent configuration a saved agent contributes beneath the request's inline fields. */
-function savedAgentConfig(saved: Agent | undefined) {
-  if (!saved) return {};
-  return {
-    model: saved.model,
-    instructions: saved.instructions,
-    tools: saved.tools,
-    multi_agent: {
-      enabled: saved.multi_agent.enabled,
-      ...(saved.multi_agent.max_concurrent_subagents != null
-        ? { max_concurrent_subagents: saved.multi_agent.max_concurrent_subagents }
-        : {}),
-    },
-    reasoning: saved.reasoning,
-    text: saved.text,
-    service_tier: saved.service_tier,
-  };
-}
-/** The raw hosted configuration: a template's fields beneath the request's inline ones. */
-function hostedConfiguration(catalog: Catalog, environment: CreateSession["environment"]) {
-  return Effect.gen(function* () {
-    if (environment.type !== "openai_hosted") return {};
-    const { type: _type, environment_template_id: templateId, ...inline } = environment;
-    const base: TemplateConfiguration = templateId
-      ? yield* io("api.template", () => catalog.templateConfiguration(templateId))
-      : {};
-    const { name: _name, ...template } = base;
-    return yield* attempt("api.environment.merge", () => mergeEnvironment(template, inline));
-  });
-}
-/** Skills, plugins and capability directories need a driver that mounts them. */
-const configuresCapabilities = (configured: HostedConfiguration) =>
-  !!(
-    configured.skills?.length ||
-    configured.plugins?.length ||
-    configured.capability_directories?.length
-  );
-/** Referenced input files must exist before the environment is reserved. */
-function resolveInputFiles(catalog: Catalog, configured: HostedConfiguration) {
-  return Effect.gen(function* () {
-    const inputFiles: Record<string, ResolvedInputFile> = {};
-    for (const file of configured.files ?? []) {
-      if (file.type !== "file_id") continue;
-      const stored = yield* io("api.file", () => catalog.file(file.file_id));
-      inputFiles[file.file_id] = { key: stored.key, size: stored.resource.bytes };
-    }
-    return inputFiles;
-  });
-}
 /**
- * Resolve skill references to stored versions, pinning each reference's version in the
- * configuration that is written to R2, and list every skill as the session presents it.
+ * A `fetch` for the official client that sends every request over the `AGENTS` binding as
+ * `tenant` through `fetchAs`, so no bearer token is needed. A Request travels over RPC by
+ * structured clone, which excludes its `AbortSignal`; the signal is honored on the caller's
+ * side instead: while the response is pending, an abort rejects the promise with an
+ * `AbortError` and the in-flight request completes on its own. Once the response has been
+ * returned, a streamed body it carries is not cancelled by the signal.
  */
-function resolveSkills(catalog: Catalog, configured: HostedConfiguration) {
-  return Effect.gen(function* () {
-    const resolvedSkills: ResolvedSkill[] = [];
-    const installedSkills: HostedSkill[] = [];
-    for (const skill of configured.skills ?? []) {
-      if (skill.type !== "skill_reference") {
-        installedSkills.push({
-          type: skill.type,
-          name: skill.name,
-          description: skill.description,
-        });
-        continue;
-      }
-      const stored = yield* io("api.skill.resolve", () =>
-        catalog.skillVersion(skill.skill_id, skill.version),
-      );
-      resolvedSkills.push({
-        skillId: skill.skill_id,
-        version: stored.resource.version,
-        name: stored.resource.name,
-        description: stored.resource.description,
-        key: stored.key,
-      });
-      skill.version = stored.resource.version;
-      installedSkills.push({
-        type: skill.type,
-        skill_id: skill.skill_id,
-        version: stored.resource.version,
-        name: stored.resource.name,
-        description: stored.resource.description,
-      });
+export function tenantFetch(agents: Pick<AgentRPC, "fetchAs">, tenant: string): typeof fetch {
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const { signal } = request;
+    if (signal.aborted) throw abortReason(signal);
+    const response = agents.fetchAs(
+      tenant,
+      new Request(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        ...(request.body ? { duplex: "half" } : {}),
+      }),
+    );
+    const aborted = Promise.withResolvers<never>();
+    const onAbort = () => aborted.reject(abortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      return await Promise.race([response, aborted.promise]);
+    } finally {
+      // The response won, or the abort did: either way the listener must not outlive the call.
+      signal.removeEventListener("abort", onAbort);
     }
-    return { resolvedSkills, installedSkills };
-  });
-}
-/** The public file list of a hosted environment; sizes come from the stored input files. */
-function publicEnvironmentFiles(
-  configured: HostedConfiguration,
-  inputFiles: Record<string, ResolvedInputFile>,
-) {
-  return (configured.files ?? []).map((file) =>
-    file.type === "inline"
-      ? {
-          type: file.type,
-          id: identifier("envfile"),
-          path: file.path,
-          size_bytes: atob(file.data).length,
-        }
-      : {
-          type: file.type,
-          id: identifier("envfile"),
-          path: file.path,
-          size_bytes: inputFiles[file.file_id]?.size ?? 0,
-          file_id: file.file_id,
-        },
-  );
-}
-/**
- * The checkpoint a fork continues from: native history transfers only between identical
- * harness revisions, and a runtime that fixes tools at thread start cannot resume with a
- * different tool surface.
- */
-function forkedCheckpoint(
-  source: ForkSource,
-  agent: AgentConfig,
-  registration: AgentRegistration,
-  driver: RuntimeDriver,
-  agents: Record<string, AgentRegistration>,
-): SessionRecord["checkpoint"] {
-  const sameHarness = registration.harness === source.driver && driver.revision === source.revision;
-  const surface = (config: AgentConfig, delegates: readonly string[] | undefined) =>
-    canonicalJSON({
-      tools: config.tools ?? [],
-      subagents: !!config.multi_agent?.enabled,
-      delegates: config.multi_agent?.enabled ? (delegates ?? []) : [],
-    });
-  const retooled =
-    surface(source.agent, agents[source.session.agent.model]?.delegates) !==
-    surface(agent, registration.delegates);
-  if (!sameHarness || !source.checkpoint || (driver.capabilities.toolsFixedAtStart && retooled))
-    return null;
-  return {
-    version: 1 as const,
-    driver: source.checkpoint.driver,
-    revision: source.checkpoint.revision,
-    native: source.checkpoint.native,
-    ...(source.checkpoint.workspace ? { workspace: source.checkpoint.workspace } : {}),
-    ...(source.checkpoint.environmentFileVersion !== undefined
-      ? { environmentFileVersion: source.checkpoint.environmentFileVersion }
-      : {}),
   };
 }
-/** A forked hosted environment inherits the source's spec under the new identity. */
-function forkedEnvironment(
-  source: ForkSource,
-  sessionId: string,
-  environmentId: string,
-): EnvironmentSpec | undefined {
-  if (!source.environmentSpec) return;
-  return {
-    ...source.environmentSpec,
-    id: environmentId,
-    sessionId,
-    inherited: {
-      sessionId: source.session.id,
-      environmentId: source.environmentSpec.id,
-      ...(source.checkpoint?.workspace ? { workspace: source.checkpoint.workspace } : {}),
-    },
-  };
-}
-/** Uploads get their own budget; every other body stays under 16 MiB. */
-function requestBodyLimit(path: string): number {
-  if (path === "/v1/files") return INPUT_FILE_LIMIT + 64 * 1024;
-  if (path.startsWith("/v1/skills")) return SKILL_UPLOAD_LIMIT + 128 * 1024;
-  return 16 * 1024 * 1024;
-}
-/** The subset of an agent configuration the driver checks accept, saved or inline. */
-interface ModelAgent {
-  tools?: readonly { type: string; defer_loading?: boolean; enabled?: boolean }[] | null;
-  multi_agent?: { enabled: boolean } | null;
-}
-/** The capability a driver lacks for this configuration's shape, checked before the tool surface. */
-function configurationGap(
-  tools: NonNullable<ModelAgent["tools"]>,
-  agent: ModelAgent,
-  sandbox: boolean,
-  registration: AgentRegistration,
-  driver: RuntimeDriver,
-): Capability | undefined {
-  if (
-    (tools.length > 0 && !driver.capabilities.functions) ||
-    (sandbox && !driver.capabilities.sandbox)
-  )
-    return "configuration";
-  if (
-    agent.multi_agent?.enabled &&
-    !driver.capabilities.subagents &&
-    !registration.delegates?.length
-  )
-    return "subagents";
-  return;
-}
-/** The first delegate alias the deployment cannot run, when delegation is enabled. */
-function unavailableDelegate(
-  registration: AgentRegistration,
-  agents: Record<string, AgentRegistration>,
-  harnesses: () => Record<string, RuntimeDriver>,
-): string | undefined {
-  for (const alias of registration.delegates ?? []) {
-    const target = agents[alias];
-    if (!target || !harnesses()[target.harness]) return alias;
-  }
-  return;
-}
-/** The capability a driver lacks for one of the configured tools, in the order the API reports them. */
-function toolCapabilityGap(
-  tools: NonNullable<ModelAgent["tools"]>,
-  registration: AgentRegistration,
-  driver: RuntimeDriver,
-): Capability | undefined {
-  if (tools.some((tool) => tool.type === "mcp") && !driver.capabilities.mcp) return "mcp";
-  // Hosted search needs both a runtime that drives it and a model connection that provides it.
-  if (
-    tools.some((tool) => tool.type === "web_search") &&
-    !(driver.capabilities.webSearch && registration.webSearch === true)
-  )
-    return "web_search";
-  if (
-    tools.some(
-      (tool) => tool.type === "tool_search" || (tool.type === "function" && tool.defer_loading),
-    ) &&
-    !driver.capabilities.toolSearch
-  )
-    return "tool_search";
-  if (
-    tools.some((tool) => tool.type === "programmatic_tool_calling" && tool.enabled !== false) &&
-    !driver.capabilities.programmaticToolCalling
-  )
-    return "programmatic_tool_calling";
-  return;
-}
-const hasImageInput = (input: CreateSession["input"]): boolean =>
-  Array.isArray(input) &&
-  input.some((message) => message.content.some((part) => part.type === "input_image"));
-/** Remote images are bounded per request before any state exists. */
-const checkInputImages = (input: CreateSession["input"]) =>
-  Effect.suspend(() =>
-    Array.isArray(input) &&
-    remoteImageURLs(input.flatMap((message) => message.content)).size > IMAGE_LIMIT
-      ? new ImageLimitExceeded({ limit: IMAGE_LIMIT, scope: "request" })
-      : Effect.void,
-  );
-
-/** OpenAI's error envelope categorizes by status; the SDK selects error classes by status too. */
-function errorType(status: number): string {
-  if (status === 401) return "authentication_error";
-  if (status === 403) return "permission_error";
-  if (status === 429) return "rate_limit_error";
-  if (status >= 500) return "server_error";
-  return "invalid_request_error";
-}
+const abortReason = (signal: AbortSignal): Error =>
+  signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError");
 
 let warnedAboutToken = false;
 /** Static single-tenant example auth. Production can inject Access/JWT verification. */
