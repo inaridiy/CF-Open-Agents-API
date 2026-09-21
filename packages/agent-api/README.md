@@ -52,5 +52,5 @@ Running any harness needs the Docker images in the repository's `docker/` direct
 
 Apache-2.0. [Deployment](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md) ·
 [Security](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/SECURITY.md) ·
-[Changelog](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/CHANGELOG.md) ·
+[Changelog](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/packages/agent-api/CHANGELOG.md) ·
 [Releases](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/releasing.md)

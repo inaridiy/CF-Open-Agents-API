@@ -1,39 +1,42 @@
 name: Publish npm alpha
+# Runs after every successful CI run on main. With pending changesets it opens or updates
+# the "Version Packages" pull request; once that is merged and CI passes again, it tags
+# the release and publishes both packages with npm trusted publishing (OIDC). Nothing is
+# published from a pull request, a tag push or a failed CI run. `workflow_dispatch` reruns
+# the same job for the current main, for a publish that failed halfway.
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing version tag whose commit passed CI (for example v0.1.0)
-        required: true
-        type: string
 permissions:
   contents: read
-  actions: read
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
 jobs:
-  publish:
+  release:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: npm
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
-      contents: read
-      actions: read
+      contents: write
+      pull-requests: write
       id-token: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
-      - name: Verify release tag and CI
+      - name: Verify the commit is on main, the repository is public and reports are private
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
-          test "$RELEASE_TAG" = "v$(node -p "require('./packages/agent-api/package.json').version")"
-          test "$RELEASE_TAG" = "v$(node -p "require('./packages/create-cf-open-agents-api/package.json').version")"
-          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD origin/main
           test "$(gh api "repos/$REPOSITORY" --jq .private)" = false
-          gh api "repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$(git rev-parse HEAD)&status=success" --jq '.workflow_runs | any(.event == "push")' | grep -qx true
           test "$(gh api "repos/$REPOSITORY/private-vulnerability-reporting" --jq .enabled)" = true
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
@@ -41,25 +44,18 @@ jobs:
           package-manager-cache: false
       - run: npm install --global pnpm@11.1.2 npm@11.12.1
       - run: pnpm install --frozen-lockfile
-      - run: pnpm check
+      - run: pnpm build
       - run: pnpm test:package
-      - run: |
-          mkdir -p "$RUNNER_TEMP/release"
-          pnpm --filter cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
-          pnpm --filter create-cf-open-agents-api pack --pack-destination "$RUNNER_TEMP/release"
-      # The library first: the CLI's generated projects depend on it, and its `vendor`
-      # step downloads this tag's archive, which exists once the tag is pushed.
-      # A version already on npm is skipped so a run that failed after the library
-      # published (for example the CLI's trusted publisher missing the publish action)
-      # can be re-run and only publishes what is missing.
-      - name: Publish alpha with npm trusted publishing
-        run: |
-          for tarball in "$RUNNER_TEMP"/release/cf-open-agents-api-*.tgz "$RUNNER_TEMP"/release/create-cf-open-agents-api-*.tgz; do
-            name=$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).name")
-            version=$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
-            if npm view "$name@$version" version >/dev/null 2>&1; then
-              echo "$name@$version is already on npm; skipping"
-              continue
-            fi
-            npm publish "$tarball" --access public --tag alpha --provenance
-          done
+      - name: Version or publish
+        uses: changesets/action@66d7d1ddafddf1ef45f98ee51a7496f9cdadb2f4 # v2.1.2
+        with:
+          version-script: pnpm changeset version
+          publish-script: pnpm release
+          commit-message: "Version packages"
+          pr-title: "Version packages"
+          # The release script pushes the tags itself, before publishing (see scripts/release.mjs).
+          push-git-tags: false
+          create-github-releases: false
+        env:
+          # The changelog generator reads pull request titles and authors.
+          GITHUB_TOKEN: ${{ github.token }}

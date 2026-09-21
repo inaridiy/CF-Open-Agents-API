@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@4.0.1/schema.json",
+  "changelog": ["@changesets/changelog-github", { "repo": "inaridiy/CF-Open-Agents-API" }],
+  "commit": false,
+  "fixed": [["cf-open-agents-api", "create-cf-open-agents-api", "cf-open-agents-api-supervisor"]],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [
+    "cf-open-agents-api-example-caller",
+    "cf-open-agents-api-example-demo",
+    "cf-open-agents-api-example-worker"
+  ],
+  "privatePackages": { "version": true, "tag": false }
+}

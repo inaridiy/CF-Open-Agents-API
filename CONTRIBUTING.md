@@ -97,7 +97,7 @@ Add a behavioral regression test for a correctness fix. Use the smallest useful 
 
 Update the compatibility profile and README when an endpoint, field, script or setup step changes; a change to the composition in `examples/worker` is a change to the CLI's template and vice versa. Generated `dist/` and binding types are not checked in. New persistent schemas need an explicit version migration and restart evidence.
 
-Pull requests state what failed before, the resulting behavior and the checks run. Keep commits focused.
+Pull requests state what failed before, the resulting behavior and the checks run. Keep commits focused. A change that alters what a release ships adds a changeset (`pnpm changeset`: pick any of the three packages, since they share one version, and write the summary for the changelog); documentation and test changes need none. `pnpm release` is what the publish workflow runs after a "Version packages" pull request merges; see [releasing](docs/releasing.md).
 
 ## Dependencies
 
