@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 // pnpm runs prepack, and the setup CLI's build, with the package directory as the working
 // directory.
 const root = new URL("../", import.meta.url);
-for (const name of ["LICENSE", "NOTICE", "CHANGELOG.md"])
+for (const name of ["LICENSE", "NOTICE"])
   await copyFile(new URL(name, root), join(process.cwd(), name));
 
 /**

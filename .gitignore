@@ -16,10 +16,8 @@ examples/demo/env.d.ts
 # Canonical release documents are copied into the tarball by prepack.
 packages/agent-api/LICENSE
 packages/agent-api/NOTICE
-packages/agent-api/CHANGELOG.md
 packages/create-cf-open-agents-api/LICENSE
 packages/create-cf-open-agents-api/NOTICE
-packages/create-cf-open-agents-api/CHANGELOG.md
 
 # Compositions the setup CLI tests render and typecheck.
 packages/create-cf-open-agents-api/test/.tmp-*/

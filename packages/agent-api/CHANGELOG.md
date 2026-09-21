@@ -1,0 +1,157 @@
+# cf-open-agents-api
+
+Entries from 0.4.1 on are written by `changeset version` from the pull requests' changesets. Earlier entries cover the library and the setup CLI together.
+
+## 0.4.0 (2026-09-21)
+
+### Added
+
+- `deleted(id, object)` and `DeletedResource`, `TURN_ERROR_CODES` and `TurnErrorCode`, `programmaticResultSchema` and `ProgrammaticResult` from the root import. `GET /cf/v1/sessions/{id}/events` takes `limit` (100 rows by default, 1,000 at most).
+- Generated projects: `.cf-open-agents-api/composition.json` records the provider, the runtimes, whether Workers AI was added and a compatible endpoint's base URL and model; a re-run of `init` and `setup` reads it. The harness container accepts `CODEX_CONFIG`, deployment-owned additions to the generated Codex `config.toml`, as JSON.
+
+### Changed
+
+- Turn error codes derived from a provider HTTP status are one table shared by Codex, Claude Code and OpenCode (`statusToTurnCode`), replacing three drifted copies: 401/403 `authentication_error`, 404 `resource_not_found`, 408 `request_timeout`, 429 `rate_limit_exceeded`, 503/529 `server_overloaded`, another 5xx `server_error`, another 4xx `invalid_request`.
+- The demo's settled job page is built by replaying the event log through the same fold the live page uses; the subagents checkbox starts unchecked; the zip download bundles artifacts only up to 32 MiB, and above that cap the job page links each file for a streamed download.
+- `examples/caller`'s `/sdk` route reaches the API through `tenantFetch` instead of the bearer-token path; the bearer-token client remains, exercised directly by the binding tests.
+- `docker/Harness.Dockerfile` installs and builds only `packages/supervisor` and its one workspace dependency, `packages/agent-api`; the CLI's `.cf-open-agents-api/` snapshot follows, holding the library, the supervisor and `docker/` instead of the whole `packages/` tree and `examples/worker/package.json`.
+- The setup CLI: `--dir` is gone in favor of a positional directory argument; `--library`, `--cli-package`, `--ref` and `--source` on `init` are maintainer flags, still accepted but left out of `--help`; the package's `exports["."]` is gone, since nothing imports it; generated projects pin TypeScript `7.0.2`.
+- `SqlStore`'s redundant `transactionSync` method is gone; `transaction` is the one method `Transactional` declares.
+- The supervisor's `/health` and `/stop` routes are gone; nothing called them.
+- `CONNECTION_FAILURE` also matches `socket hang up` and the Anthropic SDK's `network error`.
+
+### Fixed
+
+- Delegated hosted search is resolved once, per delegate, from the target's runtime and model connection, instead of a harness-name rule that both kept it where the connection could not answer and dropped it where the connection could.
+- `create-cf-open-agents-api init` writes nothing when a step refuses: it computes the whole plan against the overlay first and writes once at the end, so a conflict leaves the project exactly as it was, snapshot included. A second `init` in a project with a kept composition follows `composition.json` for the bindings, dependencies and secrets instead of the answers a fresh run would default to, and reports a flag the kept module does not implement instead of half-applying it; `setup` uploads the recorded provider's key together with any provider key already in `.dev.vars`. A kept module that neither a record nor its own markers can attribute decides alone: no record, dependency or secret is added for it.
+- `doctor` and `init` agree on a class introduced through a `renamed_classes` migration onto one that already had SQLite storage; before, a configuration `init` accepted could be reported broken by `doctor`.
+- The artifact content and delete routes answer `503 storage_unavailable` when the deployment has no R2 bucket configured, instead of throwing past the missing binding.
+
+### Internal
+
+- Most of `errors.ts`'s definite failures are now rows of a `DEFINITE` table (tag, status, code, message) instead of hand-written classes; `packages/agent-api/src/bytes.ts` (`sha256Hex`, `readBounded`) and `persistence/record-store.ts`'s page helpers (`eachPage`, `eachRecord`, `mapPage`, `resourcePage`) are shared across call sites that duplicated them; the supervisor's event and id helpers move to `events.ts`.
+
+## 0.3.0 (2026-09-20)
+
+### Added
+
+- `create-cf-open-agents-api init` in an empty directory asks for a template (`--template demo|minimal`). `demo`, the default, is a Hono + `hono/jsx` app: a prompt form creates a session with `environment: { type: "openai_hosted" }`, a progress page polls items, subagents and artifacts every two seconds, and the files under `/workspace/outputs` download as a zip. It reads the presets from `GET /cf/v1/capabilities` and reaches the API through the `AGENTS` self Service Binding with `tenantFetch`. `minimal` is the API alone, `examples/worker` generated; `examples/demo` is the demo template generated.
+- Rootless Docker: `init` runs `docker info` on Linux and, when the engine is rootless, offers a `dev:rootless` script (`--rootless`, `--no-rootless`) with `scripts/dev-rootless.sh` and `scripts/netns-bridge.mjs`. It runs `wrangler dev` inside rootlesskit's network namespace with `nsenter` and bridges `127.0.0.1:$PORT` back to the host over a Unix socket. `doctor` gains a `docker rootless` check that fails when the engine is rootless and the script is missing, and notes that one `wrangler dev` per Dockerfile may run at a time.
+- `AgentRPC.fetchAs(tenant, request)` serves one HTTP request of the Agents API as the given tenant without the HTTP authenticator, and `tenantFetch(agents, tenant)` from `cf-open-agents-api/cloudflare` wraps it as a `fetch` for the official client that keeps the SDK's `AbortSignal` on the caller's side (a `Request` crossing RPC cannot carry it). The binding is the credential; no `API_TOKEN` is needed over a Service Binding.
+- `AgentRegistration.tiers` (`{ haiku?, sonnet?, opus? }`) names the gateway entries Claude Code's subagent tiers resolve to; a missing tier falls back to the preset's `model`. `GET /cf/v1/capabilities` reports it.
+- The generated registry holds several models per provider: OpenAI `codex` (native Responses, GPT-6 Astra), `primary` and `fast` (GPT-6 Astra and GPT-5.6 Luna through the AI SDK); Workers AI `workers` (`@cf/zai-org/glm-5.3-flash`) and `workersQwen` (`@cf/qwen/qwen3.8-27b`); the Anthropic variant renders `opus`, `sonnet` and `haiku` native entries and gives the `claude` preset `tiers: { haiku: "haiku", sonnet: "sonnet" }`. The composition carries explanatory comments on bindings and secrets, presets, the registry and `authenticate`.
+- Generated `wrangler.jsonc`: `compatibility_date` is the pinned `2026-09-12` instead of today's date (the workerd bundled with the pinned Wrangler lags behind the calendar), the `ai` binding is `{ "binding": "AI", "remote": true }`, and the `types` script is `wrangler types env.d.ts`, the file `tsconfig.json` and `.gitignore` name.
+- [docs/quickstart.md](docs/quickstart.md), the first document for a new user; `pnpm bootstrap` writes the `.dev.vars` of `examples/worker`, `examples/demo` and `examples/caller`.
+- The demo's job page streams the running turn as server-rendered HTML: it opens the session's live SSE, replays the durable log (`GET /cf/v1/sessions/<id>/events?after=`) into the committed transcript, and appends items and text deltas as they arrive, with no client script. A reload rebuilds the page from the log and reattaches at its cursor. `requires_action` is shown as settled, since the demo declares no function tools.
+- `CONNECTION_FAILURE`, exported from `cf-open-agents-api`, is the shared list of transport-failure phrases (reqwest, Node socket codes, `fetch failed`) the Codex classifier and the harness diagnostics hint use.
+- The `dev:rootless` script takes the package manager's wrangler command through `WRANGLER` (`pnpm exec`, `npx`, `yarn`, `bunx`), stops wrangler, both bridges and the nsenter child on exit, and its bridge relays half-closed connections. The package smoke checks the shipped `templates/` and runs a packed demo `init`; the rootless tests run `sh -n` and a real relay through the bridge.
+- README: a walkthrough of `defineAgentWorker` (`agents`, `models`, `authenticate`) and how to enable hosted web search.
+- `listSessions` makes one RPC per session, and sealing a turn closes open subagent turns through a status-filtered query instead of scanning every turn.
+
+### Changed
+
+- The rootless Docker patch is labeled a temporary workaround for Wrangler's local container proxy assuming a rootful bridge (`init` prompt, `doctor`, known issues); it goes away when Wrangler supports rootless engines.
+- `init` and `doctor` run `docker info` once with a 5 second timeout; a stalled engine fails the check instead of hanging the CLI.
+- `init` no longer asks whether to publish on workers.dev and has no `--public` flag: the template decides (`demo` writes `workers_dev: true`, `minimal` writes `workers_dev: false`) and the setting is one line in `wrangler.jsonc` to change at deploy time. The next steps, the CLI README and the QuickStart say that the deployed demo has no login of its own.
+- Library internals: `containers.ts` is split into `containers/` (host, assignment, sandbox, proxies, delegation, checkpoint, diagnostics) and `service.ts` into the Hono app (`http/app.ts`), validation and session reservation modules; public exports are unchanged.
+- Supervisor internals: `codex.ts` is split into `codex-protocol.ts` and `codex-config.ts`; OpenCode's per-turn projection is `OpenCodeTranscript` in its own module with fixture tests.
+- The generated Codex preset and the `examples/worker` preset are named `codex` instead of `coding`. Existing deployments keep whatever preset names they defined; sessions pin their preset at creation, so nothing changes for running sessions.
+
+### Fixed
+
+- The Claude Code driver no longer mixes up content-block ids when extended thinking streams: the answer appeared twice, once `incomplete` with `phase: null`, and the reasoning item was lost. Ids now follow the streamed block index, so an empty text block the CLI drops before a tool call no longer shifts the ids of the blocks after it.
+- Codex connection-level failures reported as `other` (`error sending request for url (http://model.internal/...)`, `Connection reset by peer`) map to `connection_failed` instead of `internal_error`; a failure to reach the exec-server or `sandbox.internal` maps to `sandbox_error`, and a message with an HTTP status outside the table falls back to the transport phrases.
+- OpenCode: a failed `session.status` probe counts as busy and is retried until the deadline, so a steer is not rerun while the loop is still answering it.
+- The supervisor answers `400 invalid_request` to a request body that is not JSON instead of a 500 the HarnessDO retried.
+- Claude Code subagents can use the preset's `tiers`: the HarnessDO persists them with the assignment and its model proxy admits them. Before, a tier that differed from the preset's `model` was answered `403 Model is not assigned to this execution` and the child turn failed.
+- A turn whose runtime `stop` keeps failing is sealed after the turn deadline as `outcome_unknown` instead of re-arming the alarm forever with the session `in_progress`.
+- The HarnessDO model proxy answers a request body that is not JSON with 400 instead of failing internally; `tenantFetch` removes its abort listener once the response arrives.
+- The demo template adds `jsx` and `jsxImportSource` to an existing `tsconfig.json` instead of keeping it silently, which left the Worker throwing `React is not defined`.
+- The `Native harness diagnostics` log carries a `hint` when a line shows a connection failure to `model.internal`, `sandbox.internal`, `mcp.internal` or `delegate.internal`, pointing at rootless Docker.
+- `create-cf-open-agents-api init --no-code-loader` and `--no-rootless` negate their flags.
+
+## 0.2.1 (2026-09-18)
+
+### Fixed
+
+- `create-cf-open-agents-api init` writes `allowBuilds` for `esbuild` and `workerd` to `pnpm-workspace.yaml` in pnpm projects, and treats a run through `pnpm dlx` in an empty directory as a pnpm project. Without the approval pnpm 11 fails every `pnpm exec` in the generated project with `ERR_PNPM_IGNORED_BUILDS`, so `wrangler dev`, `doctor` and `tsc` never ran. The pre-publication note about `--library` is gone now that the library is on npm.
+
+## 0.2.0 (2026-09-18)
+
+The first version on npm, under the `alpha` dist-tag. The `v0.1.0` tag exists as history and was never published.
+
+### Fixed
+
+- Session liveness: the alarm is re-armed before the reconciler permit check so a busy reconciler cannot consume the only wake-up; queued commands no longer block polling (a refused steer becomes the next turn, a refused tool result is dropped, a transient delivery failure is retried after the poll); the reconciler fails fast on runtime protocol violations, unregistered executors, revision mismatches and typed start rejections instead of polling until the deadline.
+- Session lifecycle: a failed turn returns the session to `idle` with `session.error` set; only an indeterminate outcome (`outcome_unknown`, `programmatic_execution_uncertain`, other `*_uncertain` codes) leaves it `failed`. Deleted sessions purge their SQLite storage and catalog reservation and leave a tombstone; listing sessions tolerates a session deleted between the catalog page and retrieval.
+- Streaming: each event is delivered once despite re-entrant `pull`; a creation stream ends after the initial turn settles (or right after `agent.session.created` without input); SSE keepalive comments every 15 seconds; the Hono router is built once per isolate and authenticates before buffering a body.
+- Supervisor: event-log overflow fails the job with `native_output_limit` and stops the runtime instead of escaping a delegated relay as an unhandled rejection; stray rejections and exceptions are logged rather than taking the transport down; a broken stdin pipe or a malformed app-server line no longer fails in-flight requests.
+- Cancel ordering: a requested cancel lets child terminal events through before the log is sealed, and a task or root that settles meanwhile reads as `cancelled`, never `completed`; cancelled Claude Code turns still report usage.
+- Usage races: OpenCode usage and the settlement check read the event feed behind a session-metadata barrier; the Codex child-turn projection waits instead of assuming event order; control results resolve image parts before the memoized operation so a transient media failure stays retryable.
+- Skill installation streams pinned bundles from R2 into the sandbox one at a time; malformed skills or plugins are skipped with a diagnostic instead of failing every turn start; plugin-derived MCP labels are sanitized and never replace configured servers.
+- The portable AI SDK adapter never follows redirects; provider error bodies are sanitized and bounded before they reach the harness.
+- A definite OAuth refresh rejection releases its reservation and marks the credential `credential_refresh_rejected` (rotate to recover); only a lost response stays `outcome_unknown`.
+- A Codex steer the app-server rejects is `command_rejected`, so the Worker re-queues the message instead of retrying until `request_timeout`.
+- OpenCode workspace tools accept streamed command results; a forked sandbox receives its network policy before it starts.
+
+### Added
+
+- `create-cf-open-agents-api`, the setup CLI: `init` adds the API to an existing Workers project (bindings upserted into `wrangler.jsonc` with comments kept, a generated `defineAgentWorker` composition, one re-export in the entry, a `.cf-open-agents-api/` snapshot the Dockerfiles build from, `.dev.vars` with a random token, pinned dependencies) or creates a new Worker that is `examples/worker`, generated; `setup` creates the R2 buckets and puts the production secrets in one `wrangler secret bulk`; `doctor` checks the toolchain and the binding agreement rules; `vendor` refreshes the snapshot from the `postinstall` hook.
+- `defineAgentWorker` in `cf-open-agents-api/cloudflare` composes the API Worker, the `SessionDO` and the `Models` gateway entrypoint in one call and returns every class a deployment exports; the model gateway moved to `models/gateway.ts` so the Cloudflare entrypoint never loads the optional `ai` peer.
+- `bearerTenant` logs once when `API_TOKEN` is missing or shorter than 32 characters instead of rejecting every request silently; `pnpm bootstrap` writes both example `.dev.vars` files with one token; `pnpm dev` builds the library first.
+- Steering on every harness: Codex `turn/steer`, Claude Code's open prompt iterable with priority messages, OpenCode's `noReply` prompt with a rerun before settlement. A steer the runtime refuses is re-queued as the next turn.
+- Native subagents on every harness: Codex threads, Claude Code `Options.agents` with the `Task` tool, OpenCode `task` children, projected as session subagents with scoped items, turns, usage and function calls.
+- Agent settings applied natively: reasoning effort (Claude Code `Options.effort`, OpenCode provider variants), reasoning summary display, `text.format` `json_schema` structured output (Codex `outputSchema`, Claude Code `outputFormat`, OpenCode `StructuredOutput`), hosted web search on Claude Code (Anthropic `WebSearch`, `allowed_domains` enforced). `text.verbosity` and `service_tier` apply to Codex.
+- `AgentRegistration.webSearch` declares that a preset's model connection provides hosted search; `web_search` tools need both a capable harness and such a preset.
+- Portable gateway: `aiSDKModel` and `openAICompatibleModel` forward reasoning effort (`max` rounds to `xhigh`) and `json_schema` structured output on all three protocols; `aiSDKModel(model, { providerOptions: (settings) => ... })` maps decoded settings to provider options; `openAICompatibleModel({ supportsStructuredOutputs })` chooses `json_schema` or `json_object`.
+- Codex turn failures carry the SDK's `SessionTurnError` codes derived from the app-server error, its upstream HTTP status or its message; `item/tool/requestUserInput` requests are projected as commentary and declined; `CodexOptions.codexConfig` adds `[features]` flags and provider keys.
+- Wire: `x-request-id` on every response; `x-should-retry: false` on permanent 409s; tool names and MCP `server_label` use `[A-Za-z0-9_-]{1,64}`; the Files API accepts every `openai@7.15.0` purpose and filters listings by it; at most 256 distinct remote images per request (`413 image_limit`); `vault_ids: null`; empty bodies mean `{}` and a fork needs no body; `last_active_at` moves on accepted input and turn settlement; `agent.session.environment.disconnected` and `connected` are emitted from environment retrieval; `sessions.create({ stream: true })` returns an SSE stream.
+- Sandbox reuse: the sandbox is kept between turns while it holds the last committed workspace; destroy, restore and reconfigure happen only after a cancel, a failure, a container loss or a fork. Assignment, child and checkpoint records moved from KV to SQLite rows so large configurations fit.
+- Supervisor control contract: `409 command_rejected` for a command that can never apply, `404 execution_missing` for an unknown job, idempotent `204` for cancel; native failure detail goes to diagnostics behind stable public codes.
+- Governance: `CODE_OF_CONDUCT.md`, `.github/CODEOWNERS`, `renovate.json` with a 24-hour release age, CI concurrency groups.
+
+### Changed
+
+- Effect architecture, described in [docs/effect.md](docs/effect.md):
+  - Typed errors: failures are tagged classes in four layers (persistence, domain, runtime adapters, wire) in `errors.ts`; `toApiError` is the only table that maps a tag to a status and code, `isPermanent` decides `x-should-retry`, and `ApiError` is only the HTTP projection and its reconstruction from an RPC wire name. `io` always threads the fiber's `AbortSignal`; the writes a durable record depends on (the dispatch marker with `POST /jobs`, R2 checkpoint, artifact, file and upload puts, the catalog commit, the OAuth refresh commit) are `Effect.uninterruptible`.
+  - RPC envelope: Durable Object RPC results travel in a `Schema.Either` envelope (`encodeRpc`, `decodeRpc`), so an expected failure re-enters the caller's fiber as a tagged instance instead of a platform exception.
+  - Repository seam: SQLite sits behind `persistence/` (`Kind<A>`, `RecordStore`, `SessionTx`, `SessionRepo`, `HarnessTx`) with unchanged SQL; a transition after I/O takes a `Fenced<ActiveSession>` that only `tx.fenced` certifies, so a stale write does not compile.
+  - Runtime: each session object runs a `ManagedRuntime` with `Drivers`, `Alarm` and `Repo`, and each HarnessDO one with `HarnessRepo` and `HarnessBindings`; the reconciler is one `Effect.fn` program with a `catchTags` policy and budgeted rounds; `Effect.run*` is confined to entrypoints.
+  - SSE: one Effect `Stream` per listener over SQLite pages, woken by a sliding `PubSub` after each commit, merged with a scheduled keepalive, capped by a 64-permit semaphore, owned by the response's `ReadableStream`.
+  - Long-poll: the reconciler polls the harness for the rest of its alarm interval (`RuntimeDriver.poll(execution, after, { waitMs })`, the `longPoll` flag, supervisor `GET /jobs/:turn?after=&wait=` up to 25 s per wait), so streaming latency follows the runtime; `pollIntervalMs` defaults to 5 seconds instead of one.
+  - Supervisor scopes: each job is owned by an Effect `Scope`; processes are acquired into it (`SIGTERM`, grace period, `SIGKILL`), delegation relays and MCP clients are scoped fibers and resources, the stop sequence is the finalizer registration order, `JobLog.poll` waits for the next event, and `server.ts` maps every tagged failure to a status in one table.
+- Public surface: the root import exports the error classes with `DomainError`, `DomainTag`, `Capability`, `isDomainError`, `toApiError`, `caughtFailure`, `projectApiError`, `isPermanent` and `parseEffect`; `ServiceError` is `DomainError | OperationError | ApiError`; `RuntimeDriver` methods are typed per method and a custom driver must fail with `RuntimeRejected`, `CommandRejected`, `ExecutionMissing` or `TransportFailure`; `PromiseRuntimeDriver` methods receive an `AbortSignal` and `poll` receives `PollOptions`; `createModelGateway` registry entries may be factories (`ModelRegistration`) built only when selected. The example Worker bundle grew from 4,631 KiB (849 KiB gzip) to 5,146 KiB (946 KiB gzip).
+- Lint: the repository plugin `scripts/lint/agent-api-plugin.mjs` adds `agent-api/no-run-in-transaction`, `agent-api/no-run-below-entrypoint` (allow-listed files, `// lint: entrypoint` marker) and `agent-api/no-api-error-construction`; `complexity` and `no-nested-ternary` are errors under `packages/**`; `pnpm test:scripts` runs the plugin's rule tests.
+- Error codes: `app_server_exited` is now `native_harness_exited`; `event_buffer_limit` is now `native_output_limit`.
+- Limits: capability archives are 16 MiB per inline archive and 64 MiB per environment, extracted to at most 32 MiB and 10,000 entries; list pages stop at 4 MiB of serialized records; fork transcripts are 96,000 characters; the supervisor event log is 8 MB.
+- Toolchain: Biome is replaced by ultracite (type-aware oxlint and oxfmt) and `@effect/tsgo`; `pnpm lint`, `pnpm format` and `pnpm effect:diagnostics` are the commands; `prepare` patches TypeScript and oxlint.
+- Documentation rewritten for adopters: README, architecture with a turn sequence, compatibility with a per-harness matrix and the not-implemented list, deployment walkthrough, the Effect architecture page with its house rules and error vocabulary, known issues for OpenCode `1.18.30` message listing and rootless Docker.
+
+### Removed
+
+- `RpcResult`, `rpcFailure` and `unwrap` from the root import; the RPC envelope is internal.
+- `docs/implementation.md`; its validation table lives in CONTRIBUTING.md.
+- Every statement that the repository or its distribution is private.
+
+### Earlier unreleased work folded into 0.2.0
+
+- Claude Code and OpenCode reached the Codex surface: configured MCP servers, deferred functions with tool search, environment skills, plugins and capability directories, image input and results; session creation validates against driver capability flags.
+- The Skills API with immutable versions and pinned session references; programmatic tool calling in isolated Dynamic Workers with an allowlisted tool bridge.
+- Deployment-configured cross-runtime delegation (`delegates` on a preset exposes `cf_delegate`, `cf_wait`, `cf_close`); children run on their own harness in the parent's sandbox.
+- The `/cf/v1` fork extension and `forkSession` RPC.
+- A bounded native diagnostics tail logged from the Worker when an execution stops.
+- Codex application profile: image input, text and image function results, reasoning summaries, token usage, configured web search, command deltas; input items broadcast; usage preserved through restore; partial output closed on cancellation.
+- Service Binding, RPC, HTTP and library guides with runnable caller examples; agent settings and updates; hosted environment configuration, templates and files; artifacts; subagent projection; MCP and Vault integration.
+- Environment, file transfer and credential workflows composed with Effect: typed I/O failures, interruption, serialized OAuth refresh, durable unknown outcomes; upstream redirects rejected without forwarding credentials.
+
+## 0.1.0
+
+- OpenAI SDK-compatible session and agent endpoints, tenant catalogs, Service Bindings, durable turns and items, live SSE and explicit event replay.
+- Native Codex, Claude Code and OpenCode harnesses with a separate Sandbox, a private model gateway, and R2 conversation and workspace checkpoint recovery.
+- Effect-based runtime contracts, typed failures and serialized lifecycle changes. Custom drivers return Effects; `fromPromiseDriver` adapts Promise implementations.
+- Function tools, search provider helpers and immutable skill bundles.
+- Cancellation remains recoverable when tool results arrive concurrently; completed checkpoint recovery tolerates lost responses and missing native processes.
+- Idempotent session creation recovers its original reservation after saved-agent deletion. Serialized row limits reject oversized state with a structured 413.
+- Effect is a shared peer dependency. Stable library dependencies use compatible ranges; the Sandbox preview SDK and image remain exactly paired.
+
+This version implements the [alpha compatibility profile](https://github.com/inaridiy/CF-Open-Agents-API/blob/v0.1.0/docs/compatibility.md). The `v0.1.0` tag was created but never published to npm. It does not implement upstream subagents, artifact APIs or cross-harness forks.

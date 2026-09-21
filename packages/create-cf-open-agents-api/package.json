@@ -20,7 +20,8 @@
     "templates",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md"
   ],
   "type": "module",
   "publishConfig": {

@@ -59,6 +59,7 @@ try {
   for (const file of [
     "LICENSE",
     "NOTICE",
+    "CHANGELOG.md",
     "README.md",
     "dist/cli.js",
     "dist/index.js",
