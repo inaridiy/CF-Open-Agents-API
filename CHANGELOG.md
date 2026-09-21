@@ -2,7 +2,7 @@
 
 `packages/create-cf-open-agents-api/CHANGELOG.md` is a copy of this file that `prepack` makes; edit this one.
 
-## Unreleased
+## 0.4.0 (2026-09-21)
 
 ### Added
 
