@@ -1,0 +1,12 @@
+{
+  // A project that already stored SQLite state under another class name and renamed it
+  // to SessionDO; the rename is what makes SessionDO a SQLite class here.
+  "name": "renamed-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-12",
+  "compatibility_flags": ["nodejs_compat", "enable_ctx_exports"],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["LegacySession"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "LegacySession", "to": "SessionDO" }] }
+  ]
+}

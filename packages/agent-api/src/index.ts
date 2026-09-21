@@ -103,9 +103,15 @@ export {
   UpstreamRedirect,
 } from "./errors.js";
 export { HARNESSES, type HarnessName } from "./harnesses.js";
-export { programmaticInputSchema, programmaticTool } from "./programmatic-contract.js";
+export {
+  programmaticInputSchema,
+  type ProgrammaticResult,
+  programmaticResultSchema,
+  programmaticTool,
+} from "./programmatic-contract.js";
 export * from "./protocol.js";
 export type * from "./runtime.js";
+export { TURN_ERROR_CODES, type TurnErrorCode } from "./session-state.js";
 export { CONNECTION_FAILURE } from "./transport-failure.js";
 export {
   batchSchema,

@@ -16,7 +16,15 @@ import {
 } from "./errors.js";
 import { requestWithoutRedirect } from "./http.js";
 import { kind } from "./persistence/kind.js";
-import { canonicalJSON, identifier, metadataSchema, pageSchema, parse } from "./protocol.js";
+import { eachRecord, emptyPage, resourcePage } from "./persistence/record-store.js";
+import {
+  canonicalJSON,
+  deleted,
+  identifier,
+  metadataSchema,
+  pageSchema,
+  parse,
+} from "./protocol.js";
 import type { SqlStore } from "./storage.js";
 
 const secret = z.string().min(1).max(128_000);
@@ -37,7 +45,7 @@ const refreshSchema = z.strictObject({
   resource: z.string().nullable().optional(),
   scope: z.string().nullable().optional(),
 });
-export const credentialAuthSchema = z.discriminatedUnion("type", [
+const credentialAuthSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("static_bearer"), mcp_server_url: httpsURL, token: secret }),
   z.strictObject({
     type: z.literal("mcp_oauth"),
@@ -106,7 +114,7 @@ class RefreshRejected extends Data.TaggedError("RefreshRejected")<{
   readonly rejected: boolean;
 }> {}
 
-export function publicCredentialAuth(auth: Auth): Credential["auth"] {
+function publicCredentialAuth(auth: Auth): Credential["auth"] {
   if (auth.type === "static_bearer")
     return { type: auth.type, mcp_server_url: auth.mcp_server_url };
   return {
@@ -142,21 +150,12 @@ export class VaultRepository {
     const matches: CredentialRecord[] = [];
     for (const vaultId of new Set(vaultIds)) {
       this.retrieve(vaultId);
-      let after: string | undefined;
-      do {
-        const page = this.db.list(Kinds.credential(vaultId), {
-          order: "asc",
-          limit: 100,
-          after,
-        });
-        for (const credential of page.data)
-          if (
-            (!credentialId || credential.resource.id === credentialId) &&
-            new URL(credential.auth.mcp_server_url).href === new URL(url).href
-          )
-            matches.push(credential);
-        after = page.has_more ? (page.last_id ?? undefined) : undefined;
-      } while (after);
+      for (const credential of eachRecord(this.db, Kinds.credential(vaultId)))
+        if (
+          (!credentialId || credential.resource.id === credentialId) &&
+          new URL(credential.auth.mcp_server_url).href === new URL(url).href
+        )
+          matches.push(credential);
     }
     if (matches.length > 1) throw new CredentialAmbiguous({ reason: "multiple_matches" });
     if (!matches[0] && credentialId) throw new CredentialNotFound();
@@ -362,20 +361,16 @@ export class VaultRepository {
     const input = parse(vaultPageSchema, parameters);
     const statuses = input.status === undefined ? ["active"] : [input.status].flat();
     // Deleted resources and their secrets are removed, so this deployment has no archived rows.
-    const page = this.db.list(Kinds.vault, input);
-    return {
-      ...page,
-      ...(statuses.includes("active")
-        ? { data: page.data.map(({ resource }) => resource) }
-        : { data: [], has_more: false, first_id: null, last_id: null }),
-    };
+    // The list runs whatever the filter, so a cursor from another collection is still refused.
+    const page = resourcePage(this.db.list(Kinds.vault, input));
+    return statuses.includes("active") ? page : emptyPage<Vault>();
   }
   delete(id: string) {
     return this.db.transaction(() => {
       this.retrieve(id);
       this.db.clear(Kinds.credential(id));
       this.db.remove(Kinds.vault, id);
-      return { id, object: "vault.deleted" as const, deleted: true };
+      return deleted(id, "vault.deleted");
     });
   }
   createCredential(vaultId: string, parameters: z.infer<typeof credentialSchema>): Credential {
@@ -405,14 +400,9 @@ export class VaultRepository {
   credentials(vaultId: string, parameters: z.infer<typeof vaultPageSchema>) {
     this.retrieve(vaultId);
     const input = parse(vaultPageSchema, parameters);
-    const page = this.db.list(Kinds.credential(vaultId), input);
     const statuses = input.status === undefined ? ["active"] : [input.status].flat();
-    return {
-      ...page,
-      ...(statuses.includes("active")
-        ? { data: page.data.map(({ resource }) => resource) }
-        : { data: [], has_more: false, first_id: null, last_id: null }),
-    };
+    const page = resourcePage(this.db.list(Kinds.credential(vaultId), input));
+    return statuses.includes("active") ? page : emptyPage<Credential>();
   }
   rotate(
     vaultId: string,
@@ -463,6 +453,6 @@ export class VaultRepository {
     this.db.remove(Kinds.credential(vaultId), id);
     this.db.remove(Kinds.credentialRefresh, id);
     this.db.remove(Kinds.credentialRefreshRejected, id);
-    return { id, object: "vault.credential.deleted" as const, deleted: true };
+    return deleted(id, "vault.credential.deleted");
   }
 }

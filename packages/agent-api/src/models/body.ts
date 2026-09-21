@@ -1,41 +1,15 @@
 import { Effect } from "effect";
 
+import { readBounded } from "../bytes.js";
 import { io } from "../effect.js";
 import { ModelInputMissing, ModelInputTooLarge } from "../errors.js";
 
+const MODEL_INPUT_LIMIT = 4 * 1024 * 1024;
 /** Bound the stream before parsing or cloning it across a Service Binding. */
 export const readModelBodyEffect = (request: Request) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const body = request.body;
-      if (!body) return yield* new ModelInputMissing();
-      const reader = yield* Effect.acquireRelease(
-        Effect.sync(() => body.getReader()),
-        (acquired) =>
-          io("model.body.close", async () => {
-            try {
-              await acquired.cancel();
-            } finally {
-              acquired.releaseLock();
-            }
-          }).pipe(Effect.orDie),
-      );
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      for (;;) {
-        const next = yield* io("model.body.read", () => reader.read());
-        if (next.done) break;
-        const value = next.value as Uint8Array;
-        size += value.byteLength;
-        if (size > 4 * 1024 * 1024) return yield* new ModelInputTooLarge();
-        chunks.push(value);
-      }
-      const bytes = new Uint8Array(size);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return bytes;
-    }),
-  );
+  Effect.gen(function* () {
+    if (!request.body) return yield* new ModelInputMissing();
+    const read = yield* io("model.body.read", () => readBounded(request.body, MODEL_INPUT_LIMIT));
+    if (read.overflow) return yield* new ModelInputTooLarge();
+    return read.bytes;
+  });

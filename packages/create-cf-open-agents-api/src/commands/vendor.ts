@@ -12,7 +12,6 @@ export const vendorCommand = define({
       required: false,
       description: "Project directory (default: current directory)",
     },
-    dir: { type: "string", description: "Project directory, as an option" },
     ref: { type: "string", description: "Git ref to snapshot (default: v<this version>)" },
     source: {
       type: "string",
@@ -27,7 +26,7 @@ export const vendorCommand = define({
   },
   run: async (ctx) => {
     const result = await runVendor({
-      dir: ctx.values.dir ?? ctx.values.directory ?? process.cwd(),
+      dir: ctx.values.directory ?? process.cwd(),
       ref: ctx.values.ref,
       source: ctx.values.source,
       force: Boolean(ctx.values.force),

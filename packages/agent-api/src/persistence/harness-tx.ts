@@ -13,7 +13,7 @@ import { makeRepo, type Repo } from "./repo.js";
 /**
  * Typed, synchronous view of one HarnessDO's rows. Every method is plain and total: it
  * either returns or throws a tagged domain error, and a throw inside a transaction is the
- * rollback. Nothing here suspends, so a callback over it can run in `transactionSync`.
+ * rollback. Nothing here suspends, so a callback over it can run in one transaction.
  */
 export interface HarnessTx {
   /** Escape hatch for kinds without a dedicated accessor. */
@@ -56,12 +56,10 @@ export const makeHarnessTx = (store: RecordStore): HarnessTx => ({
 });
 
 /** Everything a harness transaction may throw on purpose; the rest is a `StorageFailure`. */
-export type HarnessTxError = RecordTooLarge | ContainerUnassigned;
-export const isHarnessTxError = (value: unknown): value is HarnessTxError =>
+type HarnessTxError = RecordTooLarge | ContainerUnassigned;
+const isHarnessTxError = (value: unknown): value is HarnessTxError =>
   value instanceof RecordTooLarge || value instanceof ContainerUnassigned;
 /** The outside edge of the seam for a HarnessDO: see `Repo`. */
 export type HarnessRepository = Repo<HarnessTx, HarnessTxError>;
-export const makeHarnessRepo = (
-  store: RecordStore,
-  transactional: Transactional,
-): HarnessRepository => makeRepo(makeHarnessTx(store), transactional, isHarnessTxError, "harness");
+export const makeHarnessRepo = (store: RecordStore & Transactional): HarnessRepository =>
+  makeRepo(makeHarnessTx(store), store, isHarnessTxError, "harness");

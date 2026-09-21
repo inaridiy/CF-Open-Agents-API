@@ -24,13 +24,11 @@ export interface Prompter {
 export interface Reporter {
   intro(title: string): void;
   info(message: string): void;
-  warn(message: string): void;
   /** Runs a slow step with a spinner; the label is replaced by the result. */
   spin<T>(label: string, work: () => Promise<T>, done: (result: T) => string): Promise<T>;
   note(message: string, title: string): void;
   /** The final report: what was created, updated and skipped, under a one-line verdict. */
   plan(plan: Plan, title: string): void;
-  outro(message: string): void;
 }
 
 const cancelled = (): never => {
@@ -85,7 +83,6 @@ export function clackReporter(): Reporter {
   return {
     intro: (title) => clack.intro(title),
     info: (message) => clack.log.info(message),
-    warn: (message) => clack.log.warn(message),
     spin: async (label, work, done) => {
       const spinner = clack.spinner();
       spinner.start(label);
@@ -103,7 +100,6 @@ export function clackReporter(): Reporter {
       clack.note(plan.body(), title);
       clack.outro(title);
     },
-    outro: (message) => clack.outro(message),
   };
 }
 
@@ -114,15 +110,13 @@ export function plainReporter(
   return {
     intro: (title) => write(title),
     info: (message) => write(`ℹ ${message}`),
-    warn: (message) => write(`⚠ ${message}`),
     spin: async (label, work, done) => {
       const result = await work();
       write(done(result));
       return result;
     },
     note: (message, title) => write(`\n${title}\n${message}`),
-    plan: (plan, title) => write(`\n${plan.render(title)}`),
-    outro: (message) => write(`\n${message}`),
+    plan: (plan, title) => write(`\n${title}\n${plan.body()}`),
   };
 }
 

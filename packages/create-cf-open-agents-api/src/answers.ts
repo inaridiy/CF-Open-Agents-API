@@ -1,7 +1,14 @@
 import type { Project } from "./project.js";
 import { workerNameFrom } from "./project.js";
-import { type Harness, HARNESSES, type Provider, PROVIDERS } from "./templates/agents.js";
-import { type Template, TEMPLATES } from "./templates/standalone.js";
+import {
+  type Harness,
+  HARNESS_CHOICES,
+  HARNESSES,
+  type Provider,
+  PROVIDER_CHOICES,
+  PROVIDERS,
+} from "./templates/agents.js";
+import { type Template, TEMPLATE_CHOICES, TEMPLATES } from "./templates/standalone.js";
 import type { Prompter } from "./ui.js";
 
 /** Flags that pre-answer questions; anything missing is asked or defaulted. */
@@ -37,46 +44,6 @@ export interface InitAnswers {
 export interface Detected {
   rootlessDocker: boolean;
 }
-
-const TEMPLATE_CHOICES = [
-  {
-    value: "demo",
-    label: "Demo app",
-    hint: "Hono page: type a prompt, watch the agent build in a sandbox, download the files",
-  },
-  {
-    value: "minimal",
-    label: "Minimal API Worker",
-    hint: "the Agents API alone, reached with the OpenAI client or a Service Binding",
-  },
-] as const satisfies readonly { value: Template; label: string; hint: string }[];
-const PROVIDER_CHOICES = [
-  {
-    value: "openai",
-    label: "OpenAI",
-    hint: "Codex natively, Claude Code and OpenCode through the AI SDK",
-  },
-  {
-    value: "anthropic",
-    label: "Anthropic",
-    hint: "Claude Code natively, Codex and OpenCode through the AI SDK",
-  },
-  {
-    value: "workers-ai",
-    label: "Workers AI",
-    hint: "no provider key; billed to your Cloudflare account",
-  },
-  {
-    value: "openai-compatible",
-    label: "OpenAI-compatible endpoint",
-    hint: "any Chat Completions URL",
-  },
-] as const satisfies readonly { value: Provider; label: string; hint: string }[];
-const HARNESS_CHOICES = [
-  { value: "codex", label: "Codex" },
-  { value: "claude-code", label: "Claude Code" },
-  { value: "opencode", label: "OpenCode" },
-] as const satisfies readonly { value: Harness; label: string }[];
 
 export function parseProvider(value: string): Provider {
   if ((PROVIDERS as readonly string[]).includes(value)) return value as Provider;

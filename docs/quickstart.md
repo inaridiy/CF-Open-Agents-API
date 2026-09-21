@@ -24,7 +24,7 @@ pnpm dev                                            # or pnpm dev:rootless when 
 
 `init` asks for the template (`demo`, the default), the model provider, the runtimes to expose as presets, whether to add a Workers AI preset next to your provider and whether to enable programmatic tool calling. It then writes the project and prints what it created. `pnpm install` also restores the Docker build context under `.cf-open-agents-api/`.
 
-Open <http://localhost:8787>. Type a prompt, for example `Build a tic-tac-toe game as a single HTML file`, pick a preset, optionally tick subagents, and press Build. The job page shows the transcript, the runtime's thinking, commands and subagents while the agent works, then the files it wrote and a zip download.
+Open <http://localhost:8787>. Type a prompt, for example `Build a tic-tac-toe game as a single HTML file`, pick a preset, optionally tick subagents (off by default), and press Build. The job page shows the transcript, the runtime's thinking, commands and subagents while the agent works, then the files it wrote and a zip download.
 
 ![The prompt form](images/demo-home.png)
 
@@ -38,8 +38,8 @@ What happens under the hood:
 - `sessions.create` with `environment: { type: "openai_hosted" }` creates a session and starts a Cloudflare sandbox container for its `/workspace`; the preset decides which native runtime (Codex, Claude Code or OpenCode) runs in the harness container and which gateway model it talks to.
 - The turn runs the runtime's own agent loop. Model calls leave only through the private gateway, which holds the provider key; shell and file tools run in the sandbox. With subagents ticked, `multi_agent` is enabled and the preset may delegate to the presets in its `delegates`.
 - The job page opens the session's live SSE, replays the durable event log (`GET /cf/v1/sessions/<id>/events?after=<seq>`) into the committed transcript, and streams the rest of the page as HTML while the turn runs. There is no client script and nothing polls.
-- Reload at any point: the page rebuilds from the log and reattaches at its cursor. A dropped page loses nothing and never cancels the turn, which is the durable-log property on one screen.
-- When the turn completes, the runtime's state is checkpointed to R2 and every file under `/workspace/outputs` is published as an artifact; the zip download bundles those artifacts.
+- Reload at any point: the page rebuilds from the log and reattaches at its cursor. A dropped page loses nothing and never cancels the turn, which is the durable-log property on one screen. A page opened after the turn has settled takes the same path, replaying the log through the same fold as the live page, so both render the same transcript.
+- When the turn completes, the runtime's state is checkpointed to R2 and every file under `/workspace/outputs` is published as an artifact. The job page offers a zip download while the artifacts total at most 32 MiB; past that cap it links each file for a streamed download instead.
 
 ## Add the API to an existing Worker
 
@@ -54,47 +54,7 @@ pnpm dev
 
 It adds the bindings to `wrangler.jsonc` without losing your comments (SQLite Durable Objects, two containers, two R2 buckets, the `MODEL_GATEWAY` and `AGENTS` self Service Bindings, `CODE_LOADER`, `ai`), writes the composition to `src/agents.ts`, appends one re-export line to your entry so Wrangler finds the classes, snapshots the Docker build context into `.cf-open-agents-api/`, creates `.dev.vars` with a random `API_TOKEN` and pins the dependencies. Your default export is untouched.
 
-Your code reaches the API through the `AGENTS` binding. Hand it to the official client:
-
-```ts
-import { type AgentRPC, tenantFetch } from "cf-open-agents-api/cloudflare";
-import { Hono } from "hono";
-import OpenAI from "openai";
-
-const app = new Hono<{ Bindings: { AGENTS: Fetcher & AgentRPC } }>();
-
-app.post("/tasks", async (c) => {
-  const client = new OpenAI({
-    apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
-    baseURL: "https://agents.internal/v1",
-    fetch: tenantFetch(c.env.AGENTS, "default"),
-  });
-  const session = await client.beta.agents.sessions.create(
-    {
-      agent: { model: "codex" },
-      environment: { type: "openai_hosted" },
-      input: "Write /workspace/outputs/report.txt with a short greeting, then read it back.",
-    },
-    { headers: { "Idempotency-Key": crypto.randomUUID() } },
-  );
-  return c.json({ id: session.id });
-});
-
-app.get("/tasks/:id", async (c) => {
-  const client = new OpenAI({
-    apiKey: "service-binding",
-    baseURL: "https://agents.internal/v1",
-    fetch: tenantFetch(c.env.AGENTS, "default"),
-  });
-  const session = await client.beta.agents.sessions.retrieve(c.req.param("id"));
-  const items = await client.beta.agents.sessions.items.list(session.id, { order: "asc" });
-  return c.json({ status: session.status, error: session.error, items: items.data });
-});
-
-export default app;
-```
-
-`agents.internal` is a routing label; the request never leaves the Worker. `openai_hosted` is the SDK's wire name and selects a Cloudflare sandbox here. `"default"` is the tenant: derive it from your own verified identity in a multi-tenant app, never from a request body. The [Service Binding guide](service-binding.md) covers streaming, function tools and cancellation.
+Your code reaches the API through the `AGENTS` binding. Hand it to the official client the way [Use it from your Worker](../README.md#use-it-from-your-worker) shows, with `tenantFetch` as the credential: the binding names the tenant, so no token crosses it. `openai_hosted` is the SDK's wire name and selects a Cloudflare sandbox here; derive the tenant from your own verified identity in a multi-tenant app, never from a request body. The typed RPC methods and a forwarded route for bearer-token callers are the other ways in; the [Service Binding guide](service-binding.md) covers those, plus streaming, function tools and cancellation.
 
 ## Where things live
 

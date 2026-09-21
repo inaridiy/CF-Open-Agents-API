@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { Effect } from "effect";
 import type { Hono } from "hono";
 
+import { sha256Hex } from "./bytes.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource, ReservationResult, ReserveResult } from "./catalog.js";
 import { attempt, io, runPromise } from "./effect.js";
@@ -143,10 +144,7 @@ export function createAgentService<Env extends AgentBindings>(
       return Effect.gen(function* () {
         const canonical = canonicalJSON(value);
         if (canonical.length < 500_000) return canonical;
-        const digest = yield* io("api.fingerprint", () =>
-          crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical)),
-        );
-        return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+        return `sha256:${yield* io("api.fingerprint", () => sha256Hex(canonical))}`;
       });
     }
     /** Shared tail of creation and forking: initialize, prepare, submit input, commit. */

@@ -228,6 +228,17 @@ export type InputEvent = z.infer<typeof inputEventSchema>;
 export type InputMessage = z.infer<typeof inputMessageSchema>;
 export type FunctionTool = z.infer<typeof functionToolSchema>;
 export type PageQuery = z.infer<typeof pageSchema>;
+/** What every delete route answers with: the id, the object name and the tombstone flag. */
+export interface DeletedResource<O extends string = string> {
+  id: string;
+  object: O;
+  deleted: true;
+}
+export const deleted = <const O extends string>(id: string, object: O): DeletedResource<O> => ({
+  id,
+  object,
+  deleted: true,
+});
 
 /** Validate at a synchronous boundary (an HTTP handler, a plain RPC method, a transaction). */
 export function parse<T>(schema: z.ZodType<T>, input: unknown): T {

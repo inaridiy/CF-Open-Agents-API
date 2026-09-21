@@ -16,8 +16,7 @@ import {
   TurnCheckpointing,
   UnknownToolCall,
 } from "./errors.js";
-import type { Kind } from "./persistence/kind.js";
-import type { ListFilter } from "./persistence/record-store.js";
+import { eachRecord } from "./persistence/record-store.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import {
   type ActiveSession,
@@ -30,7 +29,13 @@ import {
 } from "./persistence/session-record.js";
 import type { SessionTx } from "./persistence/session-tx.js";
 import type { InputEvent, InputMessage, Turn } from "./protocol.js";
-import { assertImageLimit, canonicalJSON, identifier, remoteImageURLs } from "./protocol.js";
+import {
+  assertImageLimit,
+  canonicalJSON,
+  deleted,
+  identifier,
+  remoteImageURLs,
+} from "./protocol.js";
 import type {
   AgentRegistration,
   Checkpoint,
@@ -39,6 +44,7 @@ import type {
   RuntimeCommand,
   RuntimeDriver,
 } from "./runtime.js";
+import { hostedWebSearch } from "./service-validation.js";
 import { acceptRuntimeEvent, finishOutputItems, recordToolResult } from "./session-events.js";
 
 /**
@@ -54,8 +60,12 @@ import { acceptRuntimeEvent, finishOutputItems, recordToolResult } from "./sessi
  * the next record from that value, and a stale execution never reaches them.
  */
 
-/** Failure categories the SDK's turn error type can carry verbatim. */
-const TURN_ERROR_CODES = new Set<SessionTurnError["code"]>([
+/**
+ * Failure categories the SDK's turn error type can carry verbatim. This is also the
+ * vocabulary a supervisor may fail a turn with, so the list is exported and the
+ * supervisor's `lifecycle.ts` re-exports it rather than keeping a second copy.
+ */
+export const TURN_ERROR_CODES = [
   "context_length_exceeded",
   "session_budget_exceeded",
   "usage_limit_exceeded",
@@ -72,7 +82,9 @@ const TURN_ERROR_CODES = new Set<SessionTurnError["code"]>([
   "active_turn_not_steerable",
   "request_timeout",
   "internal_error",
-]);
+] as const satisfies readonly SessionTurnError["code"][];
+export type TurnErrorCode = (typeof TURN_ERROR_CODES)[number];
+const KNOWN_TURN_ERRORS: ReadonlySet<string> = new Set(TURN_ERROR_CODES);
 /** Only an outcome nobody can confirm leaves the session failed; other turns return to idle. */
 export function isIndeterminate(error: string | undefined): boolean {
   return error === "outcome_unknown" || (error?.endsWith("_uncertain") ?? false);
@@ -81,6 +93,8 @@ export function isIndeterminate(error: string | undefined): boolean {
 export interface TurnConfig {
   readonly maxTurnMs: number;
   readonly agents: Record<string, AgentRegistration>;
+  /** Registered harnesses, so a delegate's hosted search is resolved from its own driver. */
+  readonly harness?: (name: string) => RuntimeDriver | undefined;
 }
 export function transcriptMessage(transcript: string): InputMessage {
   return {
@@ -93,12 +107,14 @@ export function transcriptMessage(transcript: string): InputMessage {
     ],
   };
 }
-/** Presets the deployment allows this session's preset to delegate to. */
-function delegates(
-  agents: Record<string, AgentRegistration>,
-  record: SessionRecord,
-): Execution["delegates"] {
+/**
+ * Presets the deployment allows this session's preset to delegate to. Each entry carries
+ * the capabilities the child cannot re-derive: its tiers, and whether hosted search is
+ * available on that target, decided here by the rule the session's own tools passed.
+ */
+function delegates(config: TurnConfig, record: SessionRecord): Execution["delegates"] {
   if (!record.agent.multi_agent?.enabled) return undefined;
+  const agents = config.agents;
   const targets = (agents[record.session.agent.model]?.delegates ?? []).flatMap((alias) => {
     const target = agents[alias];
     return target
@@ -108,6 +124,7 @@ function delegates(
             harness: target.harness,
             model: target.model,
             ...(target.tiers ? { tiers: target.tiers } : {}),
+            webSearch: hostedWebSearch(target, config.harness?.(target.harness)),
           },
         ]
       : [];
@@ -122,7 +139,7 @@ export function begin(
 ): ActiveSession {
   const now = Math.floor(Date.now() / 1_000);
   const id = identifier("turn");
-  const targets = delegates(config.agents, record);
+  const targets = delegates(config, record);
   const next: ActiveSession = {
     ...record,
     generation: record.generation + 1,
@@ -309,20 +326,6 @@ export function commitCheckpoint(
     } satisfies ArtifactRecord);
   complete(tx, config, { ...record, checkpoint }, "completed");
 }
-/** Every page of `kind` under `filter`, folded through `f`. */
-function eachRecord<A>(
-  tx: SessionTx,
-  kind: Parameters<SessionTx["store"]["list"]>[0] & Kind<A>,
-  filter: ListFilter | undefined,
-  f: (record: A) => void,
-): void {
-  let after: string | undefined;
-  do {
-    const page = tx.store.list(kind, { order: "asc", limit: 100, after }, filter);
-    for (const record of page.data) f(record);
-    after = page.has_more ? (page.last_id ?? undefined) : undefined;
-  } while (after);
-}
 /**
  * The child turns a sealing root turn closes. A completed root publishes the children the
  * pending index holds (finished, awaiting this checkpoint). A failed or cancelled root
@@ -332,13 +335,12 @@ function eachRecord<A>(
 function openChildTurns(tx: SessionTx, status: "completed" | "cancelled" | "failed"): Turn[] {
   const open: Turn[] = [];
   if (status === "completed") {
-    eachRecord(tx, SessionKinds.pendingSubagentTurn, undefined, (turn) => open.push(turn));
+    open.push(...eachRecord(tx.store, SessionKinds.pendingSubagentTurn));
     return open;
   }
   for (const value of ["in_progress", "waiting"] as const)
-    eachRecord(tx, SessionKinds.turn, { field: "status", value }, (turn) => {
+    for (const turn of eachRecord(tx.store, SessionKinds.turn, { field: "status", value }))
       if (turn.subagent_id) open.push(turn);
-    });
   return open;
 }
 function closeChildTurns(
@@ -380,9 +382,7 @@ export function complete(
 ): void {
   const turnError: SessionTurnError | null = error
     ? {
-        code: TURN_ERROR_CODES.has(error as SessionTurnError["code"])
-          ? (error as SessionTurnError["code"])
-          : "internal_error",
+        code: KNOWN_TURN_ERRORS.has(error) ? (error as TurnErrorCode) : "internal_error",
         message: error,
       }
     : null;
@@ -626,12 +626,12 @@ export function markDeleted(tx: SessionTx): Deleted {
   if (!stored) {
     const tombstone = tx.store.get(SessionKinds.tombstone, "tombstone");
     if (!tombstone) throw new SessionNotFound();
-    return { id: tombstone.id, object: "agent.session.deleted", deleted: true };
+    return deleted(tombstone.id, "agent.session.deleted");
   }
   const record = migrate(stored);
   if (record.execution) throw new TurnActive({ action: "delete" });
   tx.save({ ...record, deleted: true });
-  return { id: record.session.id, object: "agent.session.deleted", deleted: true };
+  return deleted(record.session.id, "agent.session.deleted");
 }
 /** Drop every record once the catalog no longer discovers the session. Idempotent. */
 export function purgeRecords(tx: SessionTx): boolean {

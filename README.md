@@ -45,18 +45,7 @@ pnpm exec wrangler login
 pnpm dev
 ```
 
-Then hand the `AGENTS` binding to the official client:
-
-```ts
-import { tenantFetch } from "cf-open-agents-api/cloudflare";
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
-  baseURL: "https://agents.internal/v1",
-  fetch: tenantFetch(env.AGENTS, "default"),
-});
-```
+Then hand the `AGENTS` binding to the official client; see [Use it from your Worker](#use-it-from-your-worker) below.
 
 ## Architecture
 
@@ -106,7 +95,7 @@ What you pay for in production: Container run time (a harness container on the `
 
 The setup CLI, [`create-cf-open-agents-api`](packages/create-cf-open-agents-api/README.md), adds the API to a Workers project you already have (a Vite + `@cloudflare/vite-plugin` app, a Hono Worker, anything Wrangler deploys) or creates a new Worker for it, with the demo app or the API alone. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition from your provider and runtime choices (presets, the gateway registry, `tiers` for Claude Code subagents, `authenticate`), snapshots the Docker build context into `.cf-open-agents-api/`, and creates `.dev.vars` with a random token. On a rootless Docker engine it offers a `dev:rootless` script. The commands are in the [Quick start](#quick-start); `--yes` takes the defaults.
 
-Your Worker reaches the API through its own `AGENTS` binding: the official client with `tenantFetch` (below), the typed RPC methods, or a forwarded route (`app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw))`) for callers that hold the bearer token. `create-cf-open-agents-api setup` creates the R2 buckets and puts the production secrets, `doctor` checks the toolchain and the configuration.
+Your Worker reaches the API through its own `AGENTS` binding: the official client with `tenantFetch` (below) is the default, the typed RPC methods are the typed path for a trusted Worker, and a forwarded route (`app.all("/v1/*", (c) => c.env.AGENTS.fetch(c.req.raw))`) is for callers that hold the bearer token. `create-cf-open-agents-api setup` creates the R2 buckets and puts the production secrets, `doctor` checks the toolchain and the configuration.
 
 ## First run from this repository
 

@@ -25,7 +25,15 @@ import { Deferred, Effect, Option } from "effect";
 
 import { Buffer } from "./buffer.js";
 import { type NativeOptions, ToolJob } from "./job.js";
-import { CommandRejected, describeFailure, type TurnErrorCode, Wake, within } from "./lifecycle.js";
+import {
+  CommandRejected,
+  describeFailure,
+  statusToTurnCode,
+  terminal,
+  type TurnErrorCode,
+  Wake,
+  within,
+} from "./lifecycle.js";
 import { imageContent } from "./media.js";
 import { type ChildState, type EventScope, OpenCodeTranscript } from "./opencode-transcript.js";
 import { awaitReady, NativeExited, NativeStartupFailed, NativeTurnFailed } from "./process.js";
@@ -63,17 +71,6 @@ interface RunningTool {
   readonly input: string;
 }
 
-/** The public code for a provider HTTP status OpenCode gave up on; no status means the connection failed. */
-function statusCode(status: number | undefined): TurnErrorCode {
-  if (status === undefined) return "connection_failed";
-  if (status === 429) return "rate_limit_exceeded";
-  if (status === 401 || status === 403) return "authentication_error";
-  if (status === 404) return "resource_not_found";
-  if (status === 408) return "request_timeout";
-  if (status === 503 || status === 529) return "server_overloaded";
-  if (status >= 500) return "server_error";
-  return status >= 400 ? "invalid_request" : "server_error";
-}
 /** Maps a native OpenCode failure to the public turn error code; detail stays in diagnostics. */
 export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>): {
   code: TurnErrorCode;
@@ -101,8 +98,12 @@ export function opencodeTurnError(error: NonNullable<AssistantMessage["error"]>)
     case "APIError": {
       // OpenCode retries retryable statuses (429, 5xx, connection failures) up to five
       // times, honoring retry-after headers, before this error reaches the message.
+      // An `APIError` without a status is OpenCode reporting that it never reached
+      // the provider; a status the table does not recognise is still a server error.
       const status = typeof data.statusCode === "number" ? data.statusCode : undefined;
-      return { code: statusCode(status), detail: `${status ?? "network"}: ${message}` };
+      const code =
+        status === undefined ? "connection_failed" : (statusToTurnCode(status) ?? "server_error");
+      return { code, detail: `${status ?? "network"}: ${message}` };
     }
     default:
       return { code: "internal_error", detail: message };
@@ -284,7 +285,7 @@ export class OpenCodeJob extends ToolJob {
     await this.own(child, "5 seconds");
     child.stderr?.on("data", (data) => this.options.diagnostics(String(data)));
     child.once("exit", (code, signal) => {
-      if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
+      if (!this.closing && !terminal(this.status))
         this.failStart(new NativeExited({ runtime: RUNTIME, code, signal }));
     });
     await this.perform(

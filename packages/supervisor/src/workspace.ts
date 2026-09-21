@@ -29,6 +29,14 @@ const streamEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("error"), message: z.string() }),
 ]);
 type WorkspaceResult = z.infer<typeof workspaceResultSchema>;
+/**
+ * A workspace tool's output as a tool result. The sandbox reports an exit code, so a
+ * command that ran and failed is the tool's error; a tool with no exit code is not.
+ */
+export const asToolResult = (result: WorkspaceResult) => ({
+  content: [{ type: "text" as const, text: result.text }],
+  isError: result.exitCode !== null && result.exitCode !== 0,
+});
 /** Reads the ndjson command stream: deltas are forwarded, the result returned, an error event fails the call. */
 async function readStream(
   body: ReadableStream<unknown>,

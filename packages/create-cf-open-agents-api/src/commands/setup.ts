@@ -11,7 +11,6 @@ export const setupCommand = define({
       required: false,
       description: "Project directory (default: current directory)",
     },
-    dir: { type: "string", description: "Project directory, as an option" },
     "dry-run": { type: "boolean", description: "Print the wrangler commands without running them" },
     "from-env": {
       type: "boolean",
@@ -22,7 +21,7 @@ export const setupCommand = define({
   },
   run: async (ctx) => {
     await runSetup({
-      dir: ctx.values.dir ?? ctx.values.directory ?? process.cwd(),
+      dir: ctx.values.directory ?? process.cwd(),
       dryRun: Boolean(ctx.values["dry-run"]),
       fromEnv: Boolean(ctx.values["from-env"]),
       skipSecrets: Boolean(ctx.values["skip-secrets"]),

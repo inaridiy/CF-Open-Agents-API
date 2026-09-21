@@ -260,6 +260,27 @@ it("resolves deployment-owned delegation targets when subagents are enabled", as
   expect(capabilities.agents["test-lead"]?.delegates).toEqual(["test-tools"]);
 });
 
+it("resolves each delegation target's hosted search once, on the turn's delegate list", async () => {
+  const api = client();
+  const lead = await api.beta.agents.sessions.create({
+    ...params,
+    agent: { model: "test-search-lead", multi_agent: { enabled: true } },
+    input: "hello",
+  });
+  await runDurableObjectAlarm(stub(lead.id));
+  const turn = (await api.beta.agents.sessions.turns.list(lead.id)).data[0];
+  const started = JSON.parse(await env.SCRIPTED.getByName(turn?.id ?? "").started()) as {
+    delegates: { alias: string; webSearch: boolean }[];
+  };
+  // Both flags decide it, for a delegate exactly as for the session's own tools: the
+  // target's harness must drive hosted search and its alias must carry the connection.
+  expect(started.delegates.map((delegate) => [delegate.alias, delegate.webSearch])).toEqual([
+    ["test-search", true],
+    ["test-search-unflagged", false],
+    ["test-tools", false],
+  ]);
+});
+
 it("pins a preset's model tiers with the session and reports them in capabilities", async () => {
   const api = client();
   const session = await api.beta.agents.sessions.create({

@@ -1,11 +1,13 @@
 import { join, resolve } from "node:path";
 
-import { packageManagerExec, run, type Runner } from "./exec.js";
+import { readCompositionRecord } from "./composition-record.js";
+import { run, type Runner } from "./exec.js";
 import { readIfExists } from "./fs.js";
 import { parseJsonc } from "./jsonc.js";
 import { CliError, Plan } from "./plan.js";
-import { locateProject, type Project, type WranglerConfig } from "./project.js";
+import { locateProject, type WranglerConfig } from "./project.js";
 import { parseDevVars } from "./steps/dev-vars.js";
+import { providerSecret } from "./templates/agents.js";
 import { MINIMUM_TOKEN_LENGTH, randomToken } from "./token.js";
 import {
   clackPrompter,
@@ -16,6 +18,7 @@ import {
   type Prompter,
   type Reporter,
 } from "./ui.js";
+import { type Wrangler, wranglerFor } from "./wrangler-cli.js";
 
 export interface SetupOptions {
   dir: string;
@@ -35,23 +38,6 @@ const R2_SECRETS = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"] as const;
 const ACCOUNT_SECRET = "CLOUDFLARE_R2_ACCOUNT_ID";
 const R2_TOKEN_HELP =
   "R2 → Manage R2 API Tokens in the Cloudflare dashboard: create a token with Object Read & Write on the workspaces bucket.";
-
-interface Wrangler {
-  (args: readonly string[], input?: string): ReturnType<Runner>;
-  describe(args: readonly string[]): string;
-}
-function wranglerFor(project: Project, runner: Runner): Wrangler {
-  const exec = packageManagerExec(project.packageManager);
-  // wrangler runs with the project as cwd, so the configuration is named relative to it.
-  const configArgs = ["--config", project.configPath.slice(project.root.length + 1)];
-  const call = ((args, input) =>
-    runner(exec[0] ?? "npx", [...exec.slice(1), "wrangler", ...args, ...configArgs], {
-      cwd: project.root,
-      input,
-    })) as Wrangler;
-  call.describe = (args) => [...exec, "wrangler", ...args, ...configArgs].join(" ");
-  return call;
-}
 
 /** Creates the R2 buckets the configuration names; an existing bucket is a skip. */
 export function ensureBuckets(
@@ -104,21 +90,28 @@ async function resolveAccountId(
   return prompter.text("Cloudflare account id (dashboard → Workers & Pages → Account details)", "");
 }
 
-function secretNames(root: string): string[] {
-  const devVars = parseDevVars(readIfExists(join(root, ".dev.vars")) ?? "");
-  const provider = PROVIDER_SECRETS.filter((name) => devVars.has(name));
+/**
+ * Every provider key the project uses: the one the recorded composition needs, so a
+ * generated project is asked for it even before it reaches `.dev.vars`, and every provider
+ * key the local file already names, because a composition extended by hand reads keys no
+ * record mentions and losing one in production only shows up as a failing turn. Without a
+ * record (a checkout without the git-ignored snapshot) `.dev.vars` is the only evidence.
+ */
+function secretNames(root: string, devVars: ReadonlyMap<string, string>): string[] {
+  const recorded = readCompositionRecord(root);
+  const recordedSecret = recorded && providerSecret(recorded.provider);
+  const provider = PROVIDER_SECRETS.filter((name) => name === recordedSecret || devVars.has(name));
   return ["API_TOKEN", ...provider, ...R2_SECRETS, ACCOUNT_SECRET];
 }
 
 async function collectSecrets(
   names: readonly string[],
-  root: string,
+  devVars: ReadonlyMap<string, string>,
   wrangler: Wrangler,
   prompter: Prompter,
   options: SetupOptions,
 ): Promise<Record<string, string>> {
   const env = options.env ?? process.env;
-  const devVars = parseDevVars(readIfExists(join(root, ".dev.vars")) ?? "");
   const values: Record<string, string> = {};
   for (const name of names) {
     if (options.fromEnv) {
@@ -174,7 +167,8 @@ export async function runSetup(options: SetupOptions): Promise<Plan> {
   );
   if (!options.skipBuckets) ensureBuckets(config, wrangler, plan, options.dryRun);
   if (!options.skipSecrets) {
-    const names = secretNames(root);
+    const devVars = parseDevVars(readIfExists(join(root, ".dev.vars")) ?? "");
+    const names = secretNames(root, devVars);
     if (options.dryRun)
       plan.add({
         status: "updated",
@@ -182,7 +176,7 @@ export async function runSetup(options: SetupOptions): Promise<Plan> {
         note: `Would run ${wrangler.describe(["secret", "bulk"])} with the values on stdin`,
       });
     else {
-      const values = await collectSecrets(names, root, wrangler, prompter, options);
+      const values = await collectSecrets(names, devVars, wrangler, prompter, options);
       const result = wrangler(["secret", "bulk"], JSON.stringify(values));
       if (!result.ok)
         throw new CliError(

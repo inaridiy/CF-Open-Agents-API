@@ -1,14 +1,44 @@
+import type { Choice } from "../ui.js";
 import { PROVIDER_VERSIONS } from "../versions.js";
 
 export type Provider = "openai" | "anthropic" | "workers-ai" | "openai-compatible";
-export const PROVIDERS: readonly Provider[] = [
-  "openai",
-  "anthropic",
-  "workers-ai",
-  "openai-compatible",
-];
 export type Harness = "codex" | "claude-code" | "opencode";
-export const HARNESSES: readonly Harness[] = ["codex", "claude-code", "opencode"];
+
+/**
+ * The choices, with the labels the prompts show, are the list: `PROVIDERS` and `HARNESSES`
+ * are derived from them so a new provider or runtime is added in one place and cannot be
+ * offered interactively but rejected by `--provider`, or the reverse.
+ */
+export const PROVIDER_CHOICES = [
+  {
+    value: "openai",
+    label: "OpenAI",
+    hint: "Codex natively, Claude Code and OpenCode through the AI SDK",
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic",
+    hint: "Claude Code natively, Codex and OpenCode through the AI SDK",
+  },
+  {
+    value: "workers-ai",
+    label: "Workers AI",
+    hint: "no provider key; billed to your Cloudflare account",
+  },
+  {
+    value: "openai-compatible",
+    label: "OpenAI-compatible endpoint",
+    hint: "any Chat Completions URL",
+  },
+] as const satisfies readonly Choice<Provider>[];
+export const PROVIDERS: readonly Provider[] = PROVIDER_CHOICES.map((choice) => choice.value);
+
+export const HARNESS_CHOICES = [
+  { value: "codex", label: "Codex" },
+  { value: "claude-code", label: "Claude Code" },
+  { value: "opencode", label: "OpenCode" },
+] as const satisfies readonly Choice<Harness>[];
+export const HARNESSES: readonly Harness[] = HARNESS_CHOICES.map((choice) => choice.value);
 
 export interface CompositionInput {
   provider: Provider;
@@ -23,6 +53,13 @@ export interface CompositionInput {
 }
 
 const WIDTH = 100;
+/**
+ * The rendered file is compared with oxfmt's output, so every construct is written the way
+ * the formatter would: on one line while it fits in `WIDTH`, wrapped otherwise. `indent` is
+ * the indentation the caller adds afterwards.
+ */
+const fitted = (inline: string, wrapped: () => string[], indent = 0): string[] =>
+  indent + inline.length <= WIDTH ? [inline] : wrapped();
 /** The public preset name each runtime gets; clients send it as `agent.model`. */
 export const PRESET_NAMES: Record<Harness, string> = {
   codex: "codex",
@@ -114,8 +151,11 @@ function nativeEntry(
   };
 }
 function arrowEntry(name: string, expression: string, indent: number): ModelEntry {
-  const inline = `${name}: () => ${expression},`;
-  const lines = indent + inline.length <= WIDTH ? [inline] : [`${name}: () =>`, `  ${expression},`];
+  const lines = fitted(
+    `${name}: () => ${expression},`,
+    () => [`${name}: () =>`, `  ${expression},`],
+    indent,
+  );
   return { name, lines };
 }
 
@@ -325,9 +365,11 @@ function presetLines(preset: Preset, presets: readonly Preset[]): string[] {
   if (preset.name !== "workers" && delegates.length > 0)
     fields.push(`delegates: [${quoted(delegates)}]`);
   if (preset.webSearch) fields.push("webSearch: true");
-  const inline = `      ${preset.name}: { ${fields.join(", ")} },`;
-  if (inline.length <= WIDTH) return [inline];
-  return [`      ${preset.name}: {`, ...fields.map((field) => `        ${field},`), "      },"];
+  return fitted(`      ${preset.name}: { ${fields.join(", ")} },`, () => [
+    `      ${preset.name}: {`,
+    ...fields.map((field) => `        ${field},`),
+    "      },",
+  ]);
 }
 
 const sortedNames = (names: Iterable<string>) =>
@@ -346,9 +388,11 @@ function importLines(pieces: Pieces): string[] {
     .sort((a, b) => a.localeCompare(b, "en"))
     .flatMap((module) => {
       const names = sortedNames(modules.get(module) ?? []);
-      const inline = `import { ${names.join(", ")} } from "${module}";`;
-      if (inline.length <= WIDTH) return [inline];
-      return ["import {", ...names.map((name) => `  ${name},`), `} from "${module}";`];
+      return fitted(`import { ${names.join(", ")} } from "${module}";`, () => [
+        "import {",
+        ...names.map((name) => `  ${name},`),
+        `} from "${module}";`,
+      ]);
     });
 }
 

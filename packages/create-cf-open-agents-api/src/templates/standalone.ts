@@ -1,6 +1,22 @@
+import type { Choice } from "../ui.js";
+
 /** What a new project starts from: the bare API Worker, or the Hono demo app around it. */
 export type Template = "minimal" | "demo";
-export const TEMPLATES: readonly Template[] = ["minimal", "demo"];
+
+/** The choices are the list; `TEMPLATES` (what `--template` accepts) is derived from them. */
+export const TEMPLATE_CHOICES = [
+  {
+    value: "demo",
+    label: "Demo app",
+    hint: "Hono page: type a prompt, watch the agent build in a sandbox, download the files",
+  },
+  {
+    value: "minimal",
+    label: "Minimal API Worker",
+    hint: "the Agents API alone, reached with the OpenAI client or a Service Binding",
+  },
+] as const satisfies readonly Choice<Template>[];
+export const TEMPLATES: readonly Template[] = TEMPLATE_CHOICES.map((choice) => choice.value);
 
 export interface SkeletonInput {
   name: string;
@@ -15,6 +31,12 @@ export interface SkeletonInput {
  * so it is always written. Change it in wrangler.jsonc when deploying.
  */
 export const WORKERS_DEV: Record<Template, boolean> = { minimal: false, demo: true };
+
+/** The compiler options `hono/jsx` needs; without them the Worker throws `React is not defined`. */
+export const JSX_OPTIONS: Readonly<Record<string, string>> = {
+  jsx: "react-jsx",
+  jsxImportSource: "hono/jsx",
+};
 
 /** The Wrangler entry each template starts from. */
 export const ENTRY_FILES: Record<Template, string> = {
@@ -66,7 +88,7 @@ export function tsconfigSkeleton(template: Template): string {
         target: "ES2024",
         module: "ESNext",
         moduleResolution: "Bundler",
-        ...(template === "demo" ? { jsx: "react-jsx", jsxImportSource: "hono/jsx" } : {}),
+        ...(template === "demo" ? JSX_OPTIONS : {}),
         strict: true,
         noEmit: true,
         skipLibCheck: true,

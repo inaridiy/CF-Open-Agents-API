@@ -1,3 +1,4 @@
+import { sha256Hex } from "../bytes.js";
 import { SkillInvalid, StoredObjectMissing } from "../errors.js";
 import { identifier, pageSchema, parse } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
@@ -20,9 +21,7 @@ export function registerSkillRoutes<Env>(app: RouteApp<Env>, options: ServiceOpt
       throw new SkillInvalid({ reason: "Provide multipart skill files or a ZIP archive" });
     }
     const { bundle, makeDefault, ...metadata } = await readSkillUpload(form);
-    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bundle)), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
+    const hash = await sha256Hex(bundle);
     const operation = {
       hash,
       skillId,

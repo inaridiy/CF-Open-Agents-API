@@ -13,6 +13,14 @@ import {
 import { Data, Deferred, Duration, Effect, type Scope } from "effect";
 import { z } from "zod";
 
+import {
+  closeSubagent,
+  closeSubagentTurn,
+  nowSeconds,
+  openSubagent,
+  openSubagentTurn,
+  randomId,
+} from "./events.js";
 import { CommandRejected, within } from "./lifecycle.js";
 
 type ChildStatus = "in_progress" | "completed" | "cancelled" | "failed";
@@ -43,11 +51,12 @@ export interface DelegationOptions {
   /** Invoked whenever a child reaches a terminal status. */
   settled?: () => void;
   diagnostics: (line: string) => void;
-  pollIntervalMs?: number;
   /** Bounds for HarnessDO round trips; a stalled route must not hold the parent's lifecycle. */
   timeouts?: { requestMs?: number; cancelMs?: number; settleMs?: number };
 }
 const DEFAULT_TIMEOUTS = { requestMs: 30_000, cancelMs: 10_000, settleMs: 5_000 };
+/** Pause between rounds of a child relay that is still running. */
+const CHILD_POLL_INTERVAL = Duration.millis(500);
 /** A HarnessDO delegate route answered with an error status. */
 export class DelegateRouteError extends Data.TaggedError("DelegateRouteError")<{
   readonly status: number;
@@ -223,7 +232,7 @@ export class Delegations {
   ) {
     this.options.emit({
       type: "collaboration",
-      id: `collab_${crypto.randomUUID().replaceAll("-", "")}`,
+      id: randomId("collab"),
       operation,
       recipients,
       prompt,
@@ -269,7 +278,7 @@ export class Delegations {
         alias: input.model,
         name: input.name ?? null,
         prompt: input.prompt,
-        openedAt: Math.floor(Date.now() / 1000),
+        openedAt: nowSeconds(),
         cursor: 0,
         status: "in_progress",
         error: null,
@@ -279,23 +288,21 @@ export class Delegations {
         settled: yield* Deferred.make<void>(),
       };
       this.children.set(child.subagentId, child);
-      this.options.emit({
-        type: "subagent",
-        id: child.subagentId,
-        parentId: null,
-        name: child.name,
-        instructions: child.prompt,
-        openedAt: child.openedAt,
-        status: "active",
-      });
-      this.options.emit({
-        type: "subagent_turn",
-        id: child.turnId,
-        subagentId: child.subagentId,
-        status: "in_progress",
-        startedAt: child.openedAt,
-        completedAt: null,
-      });
+      this.options.emit(
+        openSubagent({
+          id: child.subagentId,
+          name: child.name,
+          instructions: child.prompt,
+          openedAt: child.openedAt,
+        }),
+      );
+      this.options.emit(
+        openSubagentTurn({
+          id: child.turnId,
+          subagentId: child.subagentId,
+          startedAt: child.openedAt,
+        }),
+      );
       this.collaboration("spawnAgent", [child.subagentId], input.prompt, input.model, true);
       // The relay owns its own failures and is a fiber of the caller's Scope.
       yield* this.follow(child).pipe(Effect.forkScoped);
@@ -318,7 +325,7 @@ export class Delegations {
           this.relay(child, event);
         }
         if (batch.status === "running" || batch.status === "waiting") {
-          yield* Effect.sleep(Duration.millis(this.options.pollIntervalMs ?? 500));
+          yield* Effect.sleep(CHILD_POLL_INTERVAL);
           continue;
         }
         this.terminate(
@@ -358,14 +365,14 @@ export class Delegations {
     child.status = status;
     child.error = error;
     child.pending.clear();
-    this.options.emit({
-      type: "subagent_turn",
-      id: child.turnId,
-      subagentId: child.subagentId,
-      status,
-      startedAt: child.openedAt,
-      completedAt: Math.floor(Date.now() / 1000),
-    });
+    this.options.emit(
+      closeSubagentTurn({
+        id: child.turnId,
+        subagentId: child.subagentId,
+        status,
+        startedAt: child.openedAt,
+      }),
+    );
     // Delegated children are single-turn: any terminal outcome closes the subagent,
     // and the record is published before anyone can seal the parent's outcome.
     this.closeRecord(child);
@@ -377,15 +384,14 @@ export class Delegations {
   private closeRecord(child: Child): void {
     if (child.closed) return;
     child.closed = true;
-    this.options.emit({
-      type: "subagent",
-      id: child.subagentId,
-      parentId: null,
-      name: child.name,
-      instructions: child.prompt,
-      openedAt: child.openedAt,
-      status: "closed",
-    });
+    this.options.emit(
+      closeSubagent({
+        id: child.subagentId,
+        name: child.name,
+        instructions: child.prompt,
+        openedAt: child.openedAt,
+      }),
+    );
   }
   private result(child: Child) {
     return {

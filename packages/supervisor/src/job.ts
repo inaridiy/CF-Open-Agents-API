@@ -39,6 +39,7 @@ import { z } from "zod";
 
 import { capture, type NativeBundle, restore } from "./checkpoint.js";
 import { DELEGATION_TOOLS, type DelegationOptions, Delegations } from "./delegation.js";
+import { functionCall, randomId } from "./events.js";
 import {
   asFailure,
   CheckpointUnavailable,
@@ -57,13 +58,14 @@ import { ownProcess } from "./process.js";
 import {
   CodeCallsOutstanding,
   codeEnabled,
+  codeLeftCallsOpen,
   codeToolNames,
   executeCode,
   functionArguments,
   UnknownFunctionTool,
 } from "./programmatic.js";
 import { RemoteTools } from "./remote-tools.js";
-import { executeWorkspace, NoSandboxAssignment } from "./workspace.js";
+import { asToolResult, executeWorkspace, NoSandboxAssignment } from "./workspace.js";
 
 export type ToolResult = {
   content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
@@ -484,18 +486,11 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     scope?: ToolScope,
   ): Promise<ToolResult> {
     if (this.closing || this.abort.signal.aborted) return Promise.reject(new ExecutionStopped());
-    const callId = `call_${crypto.randomUUID().replaceAll("-", "")}`;
+    const callId = randomId("call");
     const result = Deferred.unsafeMake<ToolResult, ExecutionStopped>(FiberId.none);
     this.pending.set(callId, result);
     if (invocation) this.codeCalls.get(invocation)?.add(callId);
-    this.emit({
-      type: "function_call",
-      id: callId,
-      callId,
-      name,
-      arguments: z.json().parse(args),
-      ...scope,
-    });
+    this.emit(functionCall(callId, name, z.json().parse(args), scope));
     this.lifecycle.setStatus("waiting");
     return this.perform(Deferred.await(result));
   }
@@ -513,7 +508,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
         this.options.programmaticUrl,
         invocation,
       );
-      if (result.terminal || (result.isError && raised.size)) throw new CodeCallsOutstanding();
+      if (codeLeftCallsOpen(result, raised.size)) throw new CodeCallsOutstanding();
       return result;
     } catch (error) {
       this.lifecycle.fail("programmatic_execution_uncertain");
@@ -547,11 +542,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
       if (!codeEnabled(this.execution))
         return yield* new ToolUnavailable({ message: "Programmatic tool calling is disabled" });
       if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
-        const result = yield* this.workspace(name as WorkspaceToolName, args);
-        return {
-          content: [{ type: "text", text: result.text }],
-          isError: result.exitCode !== null && result.exitCode !== 0,
-        };
+        return asToolResult(yield* this.workspace(name as WorkspaceToolName, args));
       }
       if (this.remoteTools.tools.some((tool) => tool.codeName === name))
         return yield* this.remoteTools.call(name, args);
@@ -639,11 +630,7 @@ export abstract class ToolJob extends Job<ToolResult["content"]> {
     if (name === "cf_tool_search") return this.searchTools(args);
     if (name === "cf_call_tool") return this.callDiscovered(args, scope);
     if (Object.hasOwn(workspaceTools, name)) {
-      const result = await this.runWorkspace(name as WorkspaceToolName, args, scope);
-      return {
-        content: [{ type: "text" as const, text: result.text }],
-        isError: result.exitCode !== null && result.exitCode !== 0,
-      };
+      return asToolResult(await this.runWorkspace(name as WorkspaceToolName, args, scope));
     }
     if (this.remoteTools.tools.some((tool) => tool.definition.name === name))
       return CallToolResultSchema.parse(

@@ -1,20 +1,27 @@
-import { Data, Effect, Either, Schema } from "effect";
+import { type Cause, Data, Effect, Either, Schema, type Types } from "effect";
 
 import { ApiError, isStatus, remoteApiError, type Status } from "./api-error.js";
 
 /**
  * The failure vocabulary, one section per layer. Each class names the rule that failed
  * in that layer's own terms and carries the data a caller needs to react; none of them
- * knows an HTTP status. The projection at the end of this file is the only place that
- * maps a tag to `(status, code)`; it is a total table over the closed union, so a tag
- * without a mapping is a type error.
+ * knows an HTTP status. `toApiError` at the end of this file is the only place that maps
+ * a tag to `(status, code)`; it is total over the closed union, so a tag without a
+ * mapping is a type error.
+ *
+ * Most failures have no behavior beyond that projection: they are rows of the `DEFINITE`
+ * table below, which holds the status, the code and the message the row's props render,
+ * and each one is declared as a class of the same name so callers keep naming the rule.
+ * A failure is hand-written when something reads it as more than a projection: the
+ * `Enveloped` ones (`Schema.TaggedError`) whose values cross Durable Object RPC as data
+ * and decode back into instances, the two retryable ones, and the runtime answers that
+ * carry their own status, code or message.
  *
  * A definite failure reports `ApiError`'s wire name through `name`, so a caller behind
  * an un-enveloped RPC hop still recovers its status and code (the platform reads `name`
  * and `message` as ordinary properties). `TransportFailure` and `StorageFailure` are
  * deliberately not named that way: a caller must never mistake them for a definite
- * answer. Classes whose values cross Durable Object RPC inside an envelope are
- * `Schema.TaggedError`, so they decode back into instances on the caller.
+ * answer.
  */
 const wired = <T>(cls: T): T => {
   Object.defineProperty((cls as { prototype: object }).prototype, "name", {
@@ -25,7 +32,7 @@ const wired = <T>(cls: T): T => {
   });
   return cls;
 };
-/** A definite failure that stays inside one object. */
+/** A definite failure whose class is written by hand: it answers with its own props. */
 const Definite = <Tag extends string>(tag: Tag) => wired(Data.TaggedError(tag));
 /** A definite failure that may cross DO RPC as envelope data. */
 const Enveloped =
@@ -33,7 +40,466 @@ const Enveloped =
   <Tag extends string, Fields extends Schema.Struct.Fields>(tag: Tag, fields: Fields) =>
     wired(Schema.TaggedError<Self>()(tag, fields));
 
-// --- Persistence ---------------------------------------------------------------------
+// --- The definite table ---------------------------------------------------------------
+
+type Wire = readonly [Status, string];
+/** What one definite failure is: its wire answer and the message its props render. */
+type DefiniteRow = readonly [Status, string, string | ((props: never) => string)];
+/** A message that does not read the props the failure carries; the props are still typed. */
+const fixed =
+  <Props>(message: string): ((props: Props) => string) =>
+  () =>
+    message;
+
+const CAPABILITIES = [
+  "configuration",
+  "subagents",
+  "mcp",
+  "web_search",
+  "tool_search",
+  "programmatic_tool_calling",
+  "environment_mcp_credentials",
+  "image_input",
+  "image_function_results",
+  "environment_capabilities",
+  "configured_environment",
+  "environment_fork",
+  "workspace_inheritance",
+] as const;
+export type Capability = (typeof CAPABILITIES)[number];
+const CAPABILITY_MESSAGES: Record<Capability, string> = {
+  configuration: "The selected harness does not support this configuration",
+  subagents: "The selected harness does not support subagents",
+  mcp: "The selected harness does not support MCP servers",
+  web_search: "The selected harness or model alias does not support web search",
+  tool_search: "The selected harness does not support deferred tool loading",
+  programmatic_tool_calling: "Programmatic tool calling requires a configured isolated code runner",
+  environment_mcp_credentials:
+    "Environment-origin MCP cannot use vault credentials or request metadata",
+  image_input: "The selected harness does not support image input",
+  image_function_results: "The selected harness does not support image function results",
+  environment_capabilities: "The selected harness does not support environment skills or plugins",
+  configured_environment:
+    "Configured environments require an environment driver and object storage",
+  environment_fork: "Forking a configured environment requires an environment driver",
+  workspace_inheritance: "This environment driver cannot inherit a workspace",
+};
+const SKILL_LIMITS = {
+  upload: "Skill upload exceeds 16 MiB",
+  expanded: "Expanded skill exceeds 32 MiB",
+  bundle: "Skill bundles are limited to 4 MB",
+  stored: "Invalid skill size",
+} as const;
+const REFRESH_FAILURES = {
+  endpoint: "The token endpoint failed; retry later",
+  response: "Invalid OAuth refresh response",
+  timeout: "OAuth refresh timed out",
+  unknown: "OAuth refresh outcome is unknown; rotate the credential before retrying",
+} as const;
+const ENVIRONMENT_WRITES = {
+  file: "Environment file write failed",
+  upload_missing: "Environment upload missing",
+  upload: "Environment upload write failed",
+} as const;
+const STORED_OBJECTS = {
+  environment_configuration: "Environment configuration not found",
+  skill_bundle: "Pinned skill bundle not found",
+  input_file: "Input file not found",
+  file_content: "File content not found",
+  skill_content: "Skill content not found",
+  artifact_content: "Artifact content not found",
+} as const;
+
+/**
+ * Every failure whose whole behavior is its projection, in layer order. A row is the
+ * one place a rule is added: the class below it, the `WIRE` table and the permanent-code
+ * set all read this row.
+ */
+const DEFINITE = {
+  // Persistence.
+  /** The durable execution identity moved on; the caller's work is void and stops silently. */
+  Superseded: [
+    409,
+    "stale_generation",
+    fixed<{ turnId: string; generation: number }>("Execution was superseded"),
+  ],
+  /** A HarnessDO row read before any session was assigned to the container. */
+  ContainerUnassigned: [409, "unassigned_container", "Container has no session assignment"],
+
+  // Domain: session lifecycle.
+  SessionNotDeleted: [409, "not_deleted", "Delete the session before purging its storage"],
+  StreamLimitExceeded: [
+    429,
+    "stream_limit",
+    fixed<{ limit: number }>("Too many live streams for this session"),
+  ],
+  /** The turn exists but belongs to another subagent, or to none. */
+  SubagentTurnMismatch: [
+    404,
+    "not_found",
+    fixed<{ subagentId: string; turnId: string }>("Subagent turn not found"),
+  ],
+
+  // Domain: agent configuration.
+  ModelNotRegistered: [
+    422,
+    "unsupported_model",
+    fixed<{ alias: string }>("Model is not registered in this deployment"),
+  ],
+  DelegateUnavailable: [
+    503,
+    "delegate_unavailable",
+    (p: { alias: string }) => `Delegate preset ${p.alias} is not registered in this deployment`,
+  ],
+  /** A function tool claims a name the delegation protocol reserves. */
+  ReservedToolName: [
+    400,
+    "invalid_request",
+    "Subagent delegation reserves cf_delegate, cf_wait and cf_close",
+  ],
+  McpPlacementInvalid: [
+    400,
+    "invalid_request",
+    (p: { rule: "environment_required" | "stdio_in_service" }) =>
+      p.rule === "environment_required"
+        ? "Environment-origin MCP requires an execution environment"
+        : "Stdio MCP runs in the execution environment",
+  ],
+  McpTransportUnsupported: [
+    400,
+    "invalid_request",
+    fixed<{ transport: string }>("Expected HTTP MCP"),
+  ],
+  NetworkPolicyBroadened: [
+    400,
+    "network_policy_broadened",
+    (p: { rule: "access" | "domains" }) =>
+      p.rule === "access"
+        ? "Session cannot broaden its template network policy"
+        : "Session domains must be allowed by its template",
+  ],
+
+  // Domain: files.
+  InputFileInvalid: [400, "invalid_file", "Expected a multipart file"],
+  FileTooLarge: [
+    413,
+    "file_too_large",
+    (p: { kind: "input" | "inline" }) =>
+      p.kind === "input" ? "Environment input files exceed 50 MiB" : "Inline file exceeds 5 MiB",
+  ],
+  FileExpired: [404, "not_found", fixed<{ id: string }>("File not found")],
+
+  // Domain: skills.
+  SkillInvalid: [400, "invalid_skill", (p: { reason: string }) => p.reason],
+  SkillTooLarge: [
+    413,
+    "skill_too_large",
+    (p: { limit: keyof typeof SKILL_LIMITS }) => SKILL_LIMITS[p.limit],
+  ],
+  SkillVersionIsDefault: [
+    409,
+    "default_skill_version",
+    fixed<{ version: string }>("Select another default version or delete the entire skill"),
+  ],
+  SkillPathInvalid: [
+    400,
+    "invalid_skill_path",
+    (p: { path: string }) => `Invalid skill path: ${p.path}`,
+  ],
+  SkillManifestMissing: [400, "missing_skill", "A bundle must contain SKILL.md"],
+  SkillMissing: [
+    404,
+    "skill_missing",
+    (p: { reason: "bundle" | "not_installed" }) =>
+      p.reason === "bundle" ? "Skill bundle not found" : "Skill is not installed",
+  ],
+  SkillFileMissing: [404, "skill_file_missing", fixed<{ path: string }>("Skill file not found")],
+  SkillIntegrityMismatch: [409, "skill_integrity", "Skill content does not match its reference"],
+
+  // Domain: vaults and credentials.
+  CredentialAmbiguous: [
+    400,
+    "ambiguous_credential",
+    (p: { reason: "multiple_matches" | "inline_and_vault" }) =>
+      p.reason === "multiple_matches"
+        ? "Select one matching MCP credential"
+        : "Use either inline or vault authorization",
+  ],
+  CredentialNotFound: [404, "not_found", "Matching attached credential not found"],
+  CredentialExpired: [
+    422,
+    "credential_expired",
+    (p: { reason: "expired" | "refresh_missing" }) =>
+      p.reason === "expired"
+        ? "MCP credential expired; rotate the credential"
+        : "Missing OAuth refresh configuration",
+  ],
+  /** The token endpoint refused the grant itself; only rotation clears it. */
+  CredentialRefreshRejected: [
+    422,
+    "credential_refresh_rejected",
+    "The token endpoint rejected the OAuth refresh; rotate the credential",
+  ],
+  CredentialRefreshFailed: [
+    422,
+    "credential_refresh_failed",
+    (p: { reason: keyof typeof REFRESH_FAILURES }) => REFRESH_FAILURES[p.reason],
+  ],
+  /** A refresh whose answer was lost is still reserved; the token may have been consumed. */
+  CredentialRefreshIndeterminate: [
+    409,
+    "outcome_unknown",
+    "OAuth refresh outcome is unknown; rotate the credential",
+  ],
+  CredentialChanged: [409, "credential_changed", "Credential was rotated during refresh"],
+  CredentialRotationInvalid: [
+    400,
+    "invalid_request",
+    (p: { rule: "auth_type" | "refresh_missing" | "auth_method" }) => {
+      if (p.rule === "auth_type") return "Credential authentication type cannot change";
+      if (p.rule === "refresh_missing") return "Credential has no refresh configuration";
+      return "OAuth authentication method cannot change";
+    },
+  ],
+
+  // Runtime: HarnessDO and Containers.
+  HarnessUnknown: [
+    400,
+    "unsupported_harness",
+    fixed<{ harness: string }>("Unknown Container harness"),
+  ],
+  /** The execution's checkpoint was written by another harness or revision. */
+  CheckpointHarnessMismatch: [
+    409,
+    "checkpoint_incompatible",
+    fixed<{ harness: string; revision: string }>("Checkpoint belongs to another harness version"),
+  ],
+  CheckpointMissing: [
+    409,
+    "checkpoint_missing",
+    fixed<{ key: string }>("Native checkpoint is missing"),
+  ],
+  AssignmentConflict: [
+    409,
+    "assignment_conflict",
+    fixed<{ sessionId: string }>("Container already belongs to another session"),
+  ],
+  NetworkPolicyConflict: [
+    409,
+    "network_policy_conflict",
+    "Network access must be configured before the environment starts",
+  ],
+  ArtifactListFailed: [503, "artifact_list_failed", "Artifact listing failed"],
+  ArtifactLimitExceeded: [
+    413,
+    "artifact_limit",
+    "Artifacts exceed 200 MiB per file or 500 MiB per turn",
+  ],
+
+  // Runtime: environment workspace.
+  EnvironmentNotFound: [
+    404,
+    "not_found",
+    fixed<{ environmentId: string }>("Environment not found"),
+  ],
+  EnvironmentNotReady: [
+    409,
+    "environment_not_ready",
+    (p: { reason: "source" | "upload" }) =>
+      p.reason === "source"
+        ? "Source environment is not connected"
+        : "Wait for the environment to connect",
+  ],
+  EnvironmentConflict: [
+    409,
+    "environment_conflict",
+    fixed<{ environmentId: string }>("Harness already owns another environment"),
+  ],
+  /** Setup started and never committed; its commands may have run, so it is never replayed. */
+  EnvironmentSetupIndeterminate: [
+    409,
+    "outcome_unknown",
+    "Environment setup did not complete; create a new session",
+  ],
+  EnvironmentSetupFailed: [
+    422,
+    "environment_setup_failed",
+    (p: { reason: "command" | "capability_result" }) =>
+      p.reason === "command"
+        ? "Environment command failed"
+        : "Invalid capability installation result",
+  ],
+  EnvironmentWriteFailed: [
+    503,
+    "environment_write_failed",
+    (p: { reason: keyof typeof ENVIRONMENT_WRITES }) => ENVIRONMENT_WRITES[p.reason],
+  ],
+  EnvironmentListFailed: [503, "environment_list_failed", "Environment listing failed"],
+  EnvironmentDriverUnavailable: [
+    503,
+    "environment_unavailable",
+    "Environment driver is unavailable",
+  ],
+  CapabilityBudgetExceeded: [
+    413,
+    "capability_limit",
+    "Skills and plugins exceed 64 MiB per environment",
+  ],
+  /** An object a durable record names is gone from object storage. */
+  StoredObjectMissing: [
+    404,
+    "not_found",
+    (p: { object: keyof typeof STORED_OBJECTS }) => STORED_OBJECTS[p.object],
+  ],
+  ObjectStorageUnavailable: [503, "storage_unavailable", "Object storage is not configured"],
+  /** A configured upstream answered with a redirect; credentials never follow one. */
+  UpstreamRedirect: [
+    503,
+    "upstream_redirect",
+    fixed<{ operation: string }>("Configured upstream returned a redirect"),
+  ],
+
+  // Runtime: model gateway.
+  ModelNotFound: [
+    404,
+    "model_not_found",
+    fixed<{ model: string }>("No model is registered with this name"),
+  ],
+  ModelProtocolMismatch: [
+    400,
+    "model_protocol_mismatch",
+    fixed<{ protocol: string }>("Model preset does not support this harness protocol"),
+  ],
+  ModelInputMissing: [400, "missing_model_input", "Model input is required"],
+  ModelInputTooLarge: [413, "model_input_too_large", "Model input exceeds 4 MiB"],
+  ModelInputUnsupported: [
+    400,
+    "unsupported_model_input",
+    "Unsupported translated model input; use a native model preset for provider-specific content",
+  ],
+  ModelOutputFailed: [503, "model_output_failed", "Upstream model output failed or was incomplete"],
+
+  // Runtime: programmatic tool calling.
+  ProgrammaticExecutionFailed: [
+    422,
+    "programmatic_execution_failed",
+    (p: { reason: string }) => p.reason,
+  ],
+  /** A tool call ended without a confirmed result: the code may have had effects. */
+  ProgrammaticOutcomeUncertain: [
+    422,
+    "programmatic_execution_uncertain",
+    (p: { reason: string }) => p.reason,
+  ],
+  ProgrammaticInputTooLarge: [
+    413,
+    "programmatic_input_too_large",
+    "Code and arguments exceed 256 KB",
+  ],
+
+  // Wire validation.
+  /** A request body, query or RPC argument failed schema validation. */
+  InvalidRequest: [400, "invalid_request", (p: { issues: string }) => p.issues],
+  InvalidJson: [400, "invalid_json", "Request body must be valid JSON"],
+  InvalidTenant: [400, "invalid_tenant", "Tenant must be nonempty and at most 256 characters"],
+  Unauthorized: [401, "unauthorized", "Authentication required"],
+  BodyTooLarge: [413, "body_too_large", "Request exceeds its upload limit"],
+} as const satisfies Record<string, DefiniteRow>;
+
+type DefiniteTag = keyof typeof DEFINITE;
+/** The props a row declares, through the parameter of the message it renders. */
+type PropsOf<Tag extends DefiniteTag> = (typeof DEFINITE)[Tag][2] extends (props: infer P) => string
+  ? P
+  : {};
+/**
+ * The class a row yields: the tag as a literal, the props the row declared and the
+ * yieldable error every failure is. The base is built dynamically, so the shape a caller
+ * sees is stated here rather than inferred through the table's generics.
+ */
+type DefiniteClass<Tag extends string, Props> = new (
+  props: Types.VoidIfEmpty<Readonly<Props>>,
+) => Cause.YieldableError & { readonly _tag: Tag } & Readonly<Props>;
+/** Every class the table produced, so the closed union needs no second list of them. */
+const DEFINITE_CLASSES: (new (...args: never[]) => unknown)[] = [];
+const definite = <Tag extends DefiniteTag>(tag: Tag) => {
+  const render = DEFINITE[tag][2];
+  class Failure extends Data.TaggedError<string>(tag)<Record<string, unknown>> {
+    override get message(): string {
+      return typeof render === "function" ? render(this as never) : render;
+    }
+  }
+  const cls = wired(Failure) as unknown as DefiniteClass<Tag, PropsOf<Tag>>;
+  DEFINITE_CLASSES.push(cls);
+  return cls;
+};
+
+// --- The definite classes, one line per row -------------------------------------------
+
+export class Superseded extends definite("Superseded") {}
+export class ContainerUnassigned extends definite("ContainerUnassigned") {}
+export class SessionNotDeleted extends definite("SessionNotDeleted") {}
+export class StreamLimitExceeded extends definite("StreamLimitExceeded") {}
+export class SubagentTurnMismatch extends definite("SubagentTurnMismatch") {}
+export class ModelNotRegistered extends definite("ModelNotRegistered") {}
+export class DelegateUnavailable extends definite("DelegateUnavailable") {}
+export class ReservedToolName extends definite("ReservedToolName") {}
+export class McpPlacementInvalid extends definite("McpPlacementInvalid") {}
+export class McpTransportUnsupported extends definite("McpTransportUnsupported") {}
+export class NetworkPolicyBroadened extends definite("NetworkPolicyBroadened") {}
+export class InputFileInvalid extends definite("InputFileInvalid") {}
+export class FileTooLarge extends definite("FileTooLarge") {}
+export class FileExpired extends definite("FileExpired") {}
+export class SkillInvalid extends definite("SkillInvalid") {}
+export class SkillTooLarge extends definite("SkillTooLarge") {}
+export class SkillVersionIsDefault extends definite("SkillVersionIsDefault") {}
+export class SkillPathInvalid extends definite("SkillPathInvalid") {}
+export class SkillManifestMissing extends definite("SkillManifestMissing") {}
+export class SkillMissing extends definite("SkillMissing") {}
+export class SkillFileMissing extends definite("SkillFileMissing") {}
+export class SkillIntegrityMismatch extends definite("SkillIntegrityMismatch") {}
+export class CredentialAmbiguous extends definite("CredentialAmbiguous") {}
+export class CredentialNotFound extends definite("CredentialNotFound") {}
+export class CredentialExpired extends definite("CredentialExpired") {}
+export class CredentialRefreshRejected extends definite("CredentialRefreshRejected") {}
+export class CredentialRefreshFailed extends definite("CredentialRefreshFailed") {}
+export class CredentialRefreshIndeterminate extends definite("CredentialRefreshIndeterminate") {}
+export class CredentialChanged extends definite("CredentialChanged") {}
+export class CredentialRotationInvalid extends definite("CredentialRotationInvalid") {}
+export class HarnessUnknown extends definite("HarnessUnknown") {}
+export class CheckpointHarnessMismatch extends definite("CheckpointHarnessMismatch") {}
+export class CheckpointMissing extends definite("CheckpointMissing") {}
+export class AssignmentConflict extends definite("AssignmentConflict") {}
+export class NetworkPolicyConflict extends definite("NetworkPolicyConflict") {}
+export class ArtifactListFailed extends definite("ArtifactListFailed") {}
+export class ArtifactLimitExceeded extends definite("ArtifactLimitExceeded") {}
+export class EnvironmentNotFound extends definite("EnvironmentNotFound") {}
+export class EnvironmentNotReady extends definite("EnvironmentNotReady") {}
+export class EnvironmentConflict extends definite("EnvironmentConflict") {}
+export class EnvironmentSetupIndeterminate extends definite("EnvironmentSetupIndeterminate") {}
+export class EnvironmentSetupFailed extends definite("EnvironmentSetupFailed") {}
+export class EnvironmentWriteFailed extends definite("EnvironmentWriteFailed") {}
+export class EnvironmentListFailed extends definite("EnvironmentListFailed") {}
+export class EnvironmentDriverUnavailable extends definite("EnvironmentDriverUnavailable") {}
+export class CapabilityBudgetExceeded extends definite("CapabilityBudgetExceeded") {}
+export class StoredObjectMissing extends definite("StoredObjectMissing") {}
+export class ObjectStorageUnavailable extends definite("ObjectStorageUnavailable") {}
+export class UpstreamRedirect extends definite("UpstreamRedirect") {}
+export class ModelNotFound extends definite("ModelNotFound") {}
+export class ModelProtocolMismatch extends definite("ModelProtocolMismatch") {}
+export class ModelInputMissing extends definite("ModelInputMissing") {}
+export class ModelInputTooLarge extends definite("ModelInputTooLarge") {}
+export class ModelInputUnsupported extends definite("ModelInputUnsupported") {}
+export class ModelOutputFailed extends definite("ModelOutputFailed") {}
+export class ProgrammaticExecutionFailed extends definite("ProgrammaticExecutionFailed") {}
+export class ProgrammaticOutcomeUncertain extends definite("ProgrammaticOutcomeUncertain") {}
+export class ProgrammaticInputTooLarge extends definite("ProgrammaticInputTooLarge") {}
+export class InvalidRequest extends definite("InvalidRequest") {}
+export class InvalidJson extends definite("InvalidJson") {}
+export class InvalidTenant extends definite("InvalidTenant") {}
+export class Unauthorized extends definite("Unauthorized") {}
+export class BodyTooLarge extends definite("BodyTooLarge") {}
+
+// --- Persistence: the failures that cross RPC or stay retryable -----------------------
 
 export class RecordTooLarge extends Enveloped<RecordTooLarge>()("RecordTooLarge", {
   bytes: Schema.Number,
@@ -79,23 +545,8 @@ export class InvalidSessionState extends Enveloped<InvalidSessionState>()("Inval
     return this.reason;
   }
 }
-/** The durable execution identity moved on; the caller's work is void and stops silently. */
-export class Superseded extends Definite("Superseded")<{
-  readonly turnId: string;
-  readonly generation: number;
-}> {
-  override get message(): string {
-    return "Execution was superseded";
-  }
-}
-/** A HarnessDO row read before any session was assigned to the container. */
-export class ContainerUnassigned extends Definite("ContainerUnassigned")<{}> {
-  override get message(): string {
-    return "Container has no session assignment";
-  }
-}
 
-// --- Domain: session lifecycle -------------------------------------------------------
+// --- Domain: the failures that cross RPC ----------------------------------------------
 
 export class IdempotencyConflict extends Enveloped<IdempotencyConflict>()("IdempotencyConflict", {
   subject: Schema.String,
@@ -126,11 +577,6 @@ export class TurnActive extends Enveloped<TurnActive>()("TurnActive", {
       : "Wait for the current turn to stop before forking";
   }
 }
-export class SessionNotDeleted extends Definite("SessionNotDeleted")<{}> {
-  override get message(): string {
-    return "Delete the session before purging its storage";
-  }
-}
 /** Input arrived during a turn on a harness that cannot steer one. */
 export class SteeringUnsupported extends Enveloped<SteeringUnsupported>()("SteeringUnsupported", {
   harness: Schema.String,
@@ -158,58 +604,6 @@ export class ExecutorVersionIncompatible extends Enveloped<ExecutorVersionIncomp
     return "Session requires its original harness revision";
   }
 }
-export class StreamLimitExceeded extends Definite("StreamLimitExceeded")<{
-  readonly limit: number;
-}> {
-  override get message(): string {
-    return "Too many live streams for this session";
-  }
-}
-/** The turn exists but belongs to another subagent, or to none. */
-export class SubagentTurnMismatch extends Definite("SubagentTurnMismatch")<{
-  readonly subagentId: string;
-  readonly turnId: string;
-}> {
-  override get message(): string {
-    return "Subagent turn not found";
-  }
-}
-
-// --- Domain: agent configuration ----------------------------------------------------
-
-export const CAPABILITIES = [
-  "configuration",
-  "subagents",
-  "mcp",
-  "web_search",
-  "tool_search",
-  "programmatic_tool_calling",
-  "environment_mcp_credentials",
-  "image_input",
-  "image_function_results",
-  "environment_capabilities",
-  "configured_environment",
-  "environment_fork",
-  "workspace_inheritance",
-] as const;
-export type Capability = (typeof CAPABILITIES)[number];
-const CAPABILITY_MESSAGES: Record<Capability, string> = {
-  configuration: "The selected harness does not support this configuration",
-  subagents: "The selected harness does not support subagents",
-  mcp: "The selected harness does not support MCP servers",
-  web_search: "The selected harness or model alias does not support web search",
-  tool_search: "The selected harness does not support deferred tool loading",
-  programmatic_tool_calling: "Programmatic tool calling requires a configured isolated code runner",
-  environment_mcp_credentials:
-    "Environment-origin MCP cannot use vault credentials or request metadata",
-  image_input: "The selected harness does not support image input",
-  image_function_results: "The selected harness does not support image function results",
-  environment_capabilities: "The selected harness does not support environment skills or plugins",
-  configured_environment:
-    "Configured environments require an environment driver and object storage",
-  environment_fork: "Forking a configured environment requires an environment driver",
-  workspace_inheritance: "This environment driver cannot inherit a workspace",
-};
 /** The selected harness, model alias or deployment cannot serve this configuration. */
 export class CapabilityUnsupported extends Enveloped<CapabilityUnsupported>()(
   "CapabilityUnsupported",
@@ -217,51 +611,6 @@ export class CapabilityUnsupported extends Enveloped<CapabilityUnsupported>()(
 ) {
   override get message(): string {
     return CAPABILITY_MESSAGES[this.capability];
-  }
-}
-export class ModelNotRegistered extends Definite("ModelNotRegistered")<{
-  readonly alias: string;
-}> {
-  override get message(): string {
-    return "Model is not registered in this deployment";
-  }
-}
-export class DelegateUnavailable extends Definite("DelegateUnavailable")<{
-  readonly alias: string;
-}> {
-  override get message(): string {
-    return `Delegate preset ${this.alias} is not registered in this deployment`;
-  }
-}
-/** A function tool claims a name the delegation protocol reserves. */
-export class ReservedToolName extends Definite("ReservedToolName")<{}> {
-  override get message(): string {
-    return "Subagent delegation reserves cf_delegate, cf_wait and cf_close";
-  }
-}
-export class McpPlacementInvalid extends Definite("McpPlacementInvalid")<{
-  readonly rule: "environment_required" | "stdio_in_service";
-}> {
-  override get message(): string {
-    return this.rule === "environment_required"
-      ? "Environment-origin MCP requires an execution environment"
-      : "Stdio MCP runs in the execution environment";
-  }
-}
-export class McpTransportUnsupported extends Definite("McpTransportUnsupported")<{
-  readonly transport: string;
-}> {
-  override get message(): string {
-    return "Expected HTTP MCP";
-  }
-}
-export class NetworkPolicyBroadened extends Definite("NetworkPolicyBroadened")<{
-  readonly rule: "access" | "domains";
-}> {
-  override get message(): string {
-    return this.rule === "access"
-      ? "Session cannot broaden its template network policy"
-      : "Session domains must be allowed by its template";
   }
 }
 export class ImageLimitExceeded extends Enveloped<ImageLimitExceeded>()("ImageLimitExceeded", {
@@ -275,149 +624,7 @@ export class ImageLimitExceeded extends Enveloped<ImageLimitExceeded>()("ImageLi
   }
 }
 
-// --- Domain: files ------------------------------------------------------------------
-
-export class InputFileInvalid extends Definite("InputFileInvalid")<{}> {
-  override get message(): string {
-    return "Expected a multipart file";
-  }
-}
-export class FileTooLarge extends Definite("FileTooLarge")<{
-  readonly kind: "input" | "inline";
-}> {
-  override get message(): string {
-    return this.kind === "input"
-      ? "Environment input files exceed 50 MiB"
-      : "Inline file exceeds 5 MiB";
-  }
-}
-export class FileExpired extends Definite("FileExpired")<{ readonly id: string }> {
-  override get message(): string {
-    return "File not found";
-  }
-}
-
-// --- Domain: skills -----------------------------------------------------------------
-
-export class SkillInvalid extends Definite("SkillInvalid")<{ readonly reason: string }> {
-  override get message(): string {
-    return this.reason;
-  }
-}
-const SKILL_LIMITS = {
-  upload: "Skill upload exceeds 16 MiB",
-  expanded: "Expanded skill exceeds 32 MiB",
-  bundle: "Skill bundles are limited to 4 MB",
-  stored: "Invalid skill size",
-} as const;
-export class SkillTooLarge extends Definite("SkillTooLarge")<{
-  readonly limit: keyof typeof SKILL_LIMITS;
-}> {
-  override get message(): string {
-    return SKILL_LIMITS[this.limit];
-  }
-}
-export class SkillVersionIsDefault extends Definite("SkillVersionIsDefault")<{
-  readonly version: string;
-}> {
-  override get message(): string {
-    return "Select another default version or delete the entire skill";
-  }
-}
-export class SkillPathInvalid extends Definite("SkillPathInvalid")<{ readonly path: string }> {
-  override get message(): string {
-    return `Invalid skill path: ${this.path}`;
-  }
-}
-export class SkillManifestMissing extends Definite("SkillManifestMissing")<{}> {
-  override get message(): string {
-    return "A bundle must contain SKILL.md";
-  }
-}
-export class SkillMissing extends Definite("SkillMissing")<{
-  readonly reason: "bundle" | "not_installed";
-}> {
-  override get message(): string {
-    return this.reason === "bundle" ? "Skill bundle not found" : "Skill is not installed";
-  }
-}
-export class SkillFileMissing extends Definite("SkillFileMissing")<{ readonly path: string }> {
-  override get message(): string {
-    return "Skill file not found";
-  }
-}
-export class SkillIntegrityMismatch extends Definite("SkillIntegrityMismatch")<{}> {
-  override get message(): string {
-    return "Skill content does not match its reference";
-  }
-}
-
-// --- Domain: vaults and credentials --------------------------------------------------
-
-export class CredentialAmbiguous extends Definite("CredentialAmbiguous")<{
-  readonly reason: "multiple_matches" | "inline_and_vault";
-}> {
-  override get message(): string {
-    return this.reason === "multiple_matches"
-      ? "Select one matching MCP credential"
-      : "Use either inline or vault authorization";
-  }
-}
-export class CredentialNotFound extends Definite("CredentialNotFound")<{}> {
-  override get message(): string {
-    return "Matching attached credential not found";
-  }
-}
-export class CredentialExpired extends Definite("CredentialExpired")<{
-  readonly reason: "expired" | "refresh_missing";
-}> {
-  override get message(): string {
-    return this.reason === "expired"
-      ? "MCP credential expired; rotate the credential"
-      : "Missing OAuth refresh configuration";
-  }
-}
-/** The token endpoint refused the grant itself; only rotation clears it. */
-export class CredentialRefreshRejected extends Definite("CredentialRefreshRejected")<{}> {
-  override get message(): string {
-    return "The token endpoint rejected the OAuth refresh; rotate the credential";
-  }
-}
-const REFRESH_FAILURES = {
-  endpoint: "The token endpoint failed; retry later",
-  response: "Invalid OAuth refresh response",
-  timeout: "OAuth refresh timed out",
-  unknown: "OAuth refresh outcome is unknown; rotate the credential before retrying",
-} as const;
-export class CredentialRefreshFailed extends Definite("CredentialRefreshFailed")<{
-  readonly reason: keyof typeof REFRESH_FAILURES;
-}> {
-  override get message(): string {
-    return REFRESH_FAILURES[this.reason];
-  }
-}
-/** A refresh whose answer was lost is still reserved; the token may have been consumed. */
-export class CredentialRefreshIndeterminate extends Definite("CredentialRefreshIndeterminate")<{}> {
-  override get message(): string {
-    return "OAuth refresh outcome is unknown; rotate the credential";
-  }
-}
-export class CredentialChanged extends Definite("CredentialChanged")<{}> {
-  override get message(): string {
-    return "Credential was rotated during refresh";
-  }
-}
-export class CredentialRotationInvalid extends Definite("CredentialRotationInvalid")<{
-  readonly rule: "auth_type" | "refresh_missing" | "auth_method";
-}> {
-  override get message(): string {
-    if (this.rule === "auth_type") return "Credential authentication type cannot change";
-    if (this.rule === "refresh_missing") return "Credential has no refresh configuration";
-    return "OAuth authentication method cannot change";
-  }
-}
-
-// --- Runtime protocol -----------------------------------------------------------------
+// --- Runtime protocol: the answers that carry their own code or message ---------------
 
 /** A runtime batch names state this session never created, or breaks the cursor sequence. */
 export class InvalidRuntimeEvent extends Definite("InvalidRuntimeEvent")<{
@@ -452,415 +659,75 @@ export class TransportFailure extends Data.TaggedError("TransportFailure")<{
   }
 }
 
-// --- Runtime: HarnessDO and Containers -----------------------------------------------
-
-export class HarnessUnknown extends Definite("HarnessUnknown")<{ readonly harness: string }> {
-  override get message(): string {
-    return "Unknown Container harness";
-  }
-}
-/** The execution's checkpoint was written by another harness or revision. */
-export class CheckpointHarnessMismatch extends Definite("CheckpointHarnessMismatch")<{
-  readonly harness: string;
-  readonly revision: string;
-}> {
-  override get message(): string {
-    return "Checkpoint belongs to another harness version";
-  }
-}
-export class CheckpointMissing extends Definite("CheckpointMissing")<{ readonly key: string }> {
-  override get message(): string {
-    return "Native checkpoint is missing";
-  }
-}
-export class AssignmentConflict extends Definite("AssignmentConflict")<{
-  readonly sessionId: string;
-}> {
-  override get message(): string {
-    return "Container already belongs to another session";
-  }
-}
-export class NetworkPolicyConflict extends Definite("NetworkPolicyConflict")<{}> {
-  override get message(): string {
-    return "Network access must be configured before the environment starts";
-  }
-}
-export class ArtifactListFailed extends Definite("ArtifactListFailed")<{}> {
-  override get message(): string {
-    return "Artifact listing failed";
-  }
-}
-export class ArtifactLimitExceeded extends Definite("ArtifactLimitExceeded")<{}> {
-  override get message(): string {
-    return "Artifacts exceed 200 MiB per file or 500 MiB per turn";
-  }
-}
-
-// --- Runtime: environment workspace ---------------------------------------------------
-
-export class EnvironmentNotFound extends Definite("EnvironmentNotFound")<{
-  readonly environmentId: string;
-}> {
-  override get message(): string {
-    return "Environment not found";
-  }
-}
-export class EnvironmentNotReady extends Definite("EnvironmentNotReady")<{
-  readonly reason: "source" | "upload";
-}> {
-  override get message(): string {
-    return this.reason === "source"
-      ? "Source environment is not connected"
-      : "Wait for the environment to connect";
-  }
-}
-export class EnvironmentConflict extends Definite("EnvironmentConflict")<{
-  readonly environmentId: string;
-}> {
-  override get message(): string {
-    return "Harness already owns another environment";
-  }
-}
-/** Setup started and never committed; its commands may have run, so it is never replayed. */
-export class EnvironmentSetupIndeterminate extends Definite("EnvironmentSetupIndeterminate")<{}> {
-  override get message(): string {
-    return "Environment setup did not complete; create a new session";
-  }
-}
-export class EnvironmentSetupFailed extends Definite("EnvironmentSetupFailed")<{
-  readonly reason: "command" | "capability_result";
-}> {
-  override get message(): string {
-    return this.reason === "command"
-      ? "Environment command failed"
-      : "Invalid capability installation result";
-  }
-}
-const ENVIRONMENT_WRITES = {
-  file: "Environment file write failed",
-  upload_missing: "Environment upload missing",
-  upload: "Environment upload write failed",
-} as const;
-export class EnvironmentWriteFailed extends Definite("EnvironmentWriteFailed")<{
-  readonly reason: keyof typeof ENVIRONMENT_WRITES;
-}> {
-  override get message(): string {
-    return ENVIRONMENT_WRITES[this.reason];
-  }
-}
-export class EnvironmentListFailed extends Definite("EnvironmentListFailed")<{}> {
-  override get message(): string {
-    return "Environment listing failed";
-  }
-}
-export class EnvironmentDriverUnavailable extends Definite("EnvironmentDriverUnavailable")<{}> {
-  override get message(): string {
-    return "Environment driver is unavailable";
-  }
-}
-export class CapabilityBudgetExceeded extends Definite("CapabilityBudgetExceeded")<{}> {
-  override get message(): string {
-    return "Skills and plugins exceed 64 MiB per environment";
-  }
-}
-const STORED_OBJECTS = {
-  environment_configuration: "Environment configuration not found",
-  skill_bundle: "Pinned skill bundle not found",
-  input_file: "Input file not found",
-  file_content: "File content not found",
-  skill_content: "Skill content not found",
-  artifact_content: "Artifact content not found",
-} as const;
-/** An object a durable record names is gone from object storage. */
-export class StoredObjectMissing extends Definite("StoredObjectMissing")<{
-  readonly object: keyof typeof STORED_OBJECTS;
-}> {
-  override get message(): string {
-    return STORED_OBJECTS[this.object];
-  }
-}
-export class ObjectStorageUnavailable extends Definite("ObjectStorageUnavailable")<{}> {
-  override get message(): string {
-    return "Object storage is not configured";
-  }
-}
-/** A configured upstream answered with a redirect; credentials never follow one. */
-export class UpstreamRedirect extends Definite("UpstreamRedirect")<{
-  readonly operation: string;
-}> {
-  override get message(): string {
-    return "Configured upstream returned a redirect";
-  }
-}
-
-// --- Runtime: model gateway -----------------------------------------------------------
-
-export class ModelNotFound extends Definite("ModelNotFound")<{ readonly model: string }> {
-  override get message(): string {
-    return "No model is registered with this name";
-  }
-}
-export class ModelProtocolMismatch extends Definite("ModelProtocolMismatch")<{
-  readonly protocol: string;
-}> {
-  override get message(): string {
-    return "Model preset does not support this harness protocol";
-  }
-}
-export class ModelInputMissing extends Definite("ModelInputMissing")<{}> {
-  override get message(): string {
-    return "Model input is required";
-  }
-}
-export class ModelInputTooLarge extends Definite("ModelInputTooLarge")<{}> {
-  override get message(): string {
-    return "Model input exceeds 4 MiB";
-  }
-}
-export class ModelInputUnsupported extends Definite("ModelInputUnsupported")<{}> {
-  override get message(): string {
-    return "Unsupported translated model input; use a native model preset for provider-specific content";
-  }
-}
-export class ModelOutputFailed extends Definite("ModelOutputFailed")<{}> {
-  override get message(): string {
-    return "Upstream model output failed or was incomplete";
-  }
-}
-
-// --- Runtime: programmatic tool calling ----------------------------------------------
-
-export class ProgrammaticExecutionFailed extends Definite("ProgrammaticExecutionFailed")<{
-  readonly reason: string;
-}> {
-  override get message(): string {
-    return this.reason;
-  }
-}
-/** A tool call ended without a confirmed result: the code may have had effects. */
-export class ProgrammaticOutcomeUncertain extends Definite("ProgrammaticOutcomeUncertain")<{
-  readonly reason: string;
-}> {
-  override get message(): string {
-    return this.reason;
-  }
-}
-export class ProgrammaticInputTooLarge extends Definite("ProgrammaticInputTooLarge")<{}> {
-  override get message(): string {
-    return "Code and arguments exceed 256 KB";
-  }
-}
-
-// --- Wire validation ------------------------------------------------------------------
-
-/** A request body, query or RPC argument failed schema validation. */
-export class InvalidRequest extends Definite("InvalidRequest")<{ readonly issues: string }> {
-  override get message(): string {
-    return this.issues;
-  }
-}
-export class InvalidJson extends Definite("InvalidJson")<{}> {
-  override get message(): string {
-    return "Request body must be valid JSON";
-  }
-}
-export class InvalidTenant extends Definite("InvalidTenant")<{}> {
-  override get message(): string {
-    return "Tenant must be nonempty and at most 256 characters";
-  }
-}
-export class Unauthorized extends Definite("Unauthorized")<{}> {
-  override get message(): string {
-    return "Authentication required";
-  }
-}
-export class BodyTooLarge extends Definite("BodyTooLarge")<{}> {
-  override get message(): string {
-    return "Request exceeds its upload limit";
-  }
-}
-
 // --- The closed union -----------------------------------------------------------------
 
-const DOMAIN_CLASSES = [
+/** The failures whose classes are written by hand; the table's own register themselves. */
+const HANDWRITTEN = [
   RecordTooLarge,
   RecordNotFound,
   InvalidCursor,
   StorageFailure,
   SessionNotFound,
   InvalidSessionState,
-  Superseded,
-  ContainerUnassigned,
   IdempotencyConflict,
   SessionFailed,
   TurnCheckpointing,
   TurnActive,
-  SessionNotDeleted,
   SteeringUnsupported,
   UnknownToolCall,
   ExecutorVersionIncompatible,
-  StreamLimitExceeded,
-  SubagentTurnMismatch,
   CapabilityUnsupported,
-  ModelNotRegistered,
-  DelegateUnavailable,
-  ReservedToolName,
-  McpPlacementInvalid,
-  McpTransportUnsupported,
-  NetworkPolicyBroadened,
   ImageLimitExceeded,
-  InputFileInvalid,
-  FileTooLarge,
-  FileExpired,
-  SkillInvalid,
-  SkillTooLarge,
-  SkillVersionIsDefault,
-  SkillPathInvalid,
-  SkillManifestMissing,
-  SkillMissing,
-  SkillFileMissing,
-  SkillIntegrityMismatch,
-  CredentialAmbiguous,
-  CredentialNotFound,
-  CredentialExpired,
-  CredentialRefreshRejected,
-  CredentialRefreshFailed,
-  CredentialRefreshIndeterminate,
-  CredentialChanged,
-  CredentialRotationInvalid,
   InvalidRuntimeEvent,
   CommandRejected,
   ExecutionMissing,
   RuntimeRejected,
   CheckpointIncompatible,
   TransportFailure,
-  HarnessUnknown,
-  CheckpointHarnessMismatch,
-  CheckpointMissing,
-  AssignmentConflict,
-  NetworkPolicyConflict,
-  ArtifactListFailed,
-  ArtifactLimitExceeded,
-  EnvironmentNotFound,
-  EnvironmentNotReady,
-  EnvironmentConflict,
-  EnvironmentSetupIndeterminate,
-  EnvironmentSetupFailed,
-  EnvironmentWriteFailed,
-  EnvironmentListFailed,
-  EnvironmentDriverUnavailable,
-  CapabilityBudgetExceeded,
-  StoredObjectMissing,
-  ObjectStorageUnavailable,
-  UpstreamRedirect,
-  ModelNotFound,
-  ModelProtocolMismatch,
-  ModelInputMissing,
-  ModelInputTooLarge,
-  ModelInputUnsupported,
-  ModelOutputFailed,
-  ProgrammaticExecutionFailed,
-  ProgrammaticOutcomeUncertain,
-  ProgrammaticInputTooLarge,
-  InvalidRequest,
-  InvalidJson,
-  InvalidTenant,
-  Unauthorized,
-  BodyTooLarge,
 ] as const;
-export type DomainError = InstanceType<(typeof DOMAIN_CLASSES)[number]>;
+const DOMAIN_CLASSES: readonly (new (...args: never[]) => unknown)[] = [
+  ...DEFINITE_CLASSES,
+  ...HANDWRITTEN,
+];
+/** One failure per table row, plus every hand-written class: the closed union. */
+type DefiniteError = {
+  [K in DefiniteTag]: Cause.YieldableError & { readonly _tag: K } & Readonly<PropsOf<K>>;
+}[DefiniteTag];
+export type DomainError = DefiniteError | InstanceType<(typeof HANDWRITTEN)[number]>;
 export type DomainTag = DomainError["_tag"];
 export const isDomainError = (value: unknown): value is DomainError =>
   DOMAIN_CLASSES.some((cls) => value instanceof cls);
 
 // --- Projection: the only place that knows HTTP --------------------------------------
 
-type Wire = readonly [Status, string];
 /** Tags whose runtime answer carries its own code; every other tag has a fixed one. */
 type DynamicTag = "RuntimeRejected" | "CommandRejected" | "InvalidRuntimeEvent";
 type StaticTag = Exclude<DomainTag, DynamicTag>;
+const wireOf = <T extends Record<string, DefiniteRow>>(rows: T) =>
+  Object.fromEntries(
+    Object.entries(rows).map(([tag, [status, code]]) => [tag, [status, code] as const]),
+  ) as { readonly [K in keyof T]: readonly [T[K][0], T[K][1]] };
+/** Every static tag's wire answer: the table's own rows, then the hand-written classes. */
 const WIRE = {
+  ...wireOf(DEFINITE),
   RecordTooLarge: [413, "storage_record_too_large"],
   RecordNotFound: [404, "not_found"],
   InvalidCursor: [400, "invalid_cursor"],
   StorageFailure: [500, "internal_error"],
   SessionNotFound: [404, "not_found"],
   InvalidSessionState: [409, "invalid_session_state"],
-  Superseded: [409, "stale_generation"],
-  ContainerUnassigned: [409, "unassigned_container"],
   IdempotencyConflict: [409, "idempotency_conflict"],
   SessionFailed: [409, "session_failed"],
   TurnCheckpointing: [409, "turn_checkpointing"],
   TurnActive: [409, "active_turn"],
-  SessionNotDeleted: [409, "not_deleted"],
   SteeringUnsupported: [409, "active_turn_not_steerable"],
   UnknownToolCall: [400, "invalid_request_error"],
   ExecutorVersionIncompatible: [503, "executor_version_incompatible"],
-  StreamLimitExceeded: [429, "stream_limit"],
-  SubagentTurnMismatch: [404, "not_found"],
   CapabilityUnsupported: [422, "unsupported_capability"],
-  ModelNotRegistered: [422, "unsupported_model"],
-  DelegateUnavailable: [503, "delegate_unavailable"],
-  ReservedToolName: [400, "invalid_request"],
-  McpPlacementInvalid: [400, "invalid_request"],
-  McpTransportUnsupported: [400, "invalid_request"],
-  NetworkPolicyBroadened: [400, "network_policy_broadened"],
   ImageLimitExceeded: [413, "image_limit"],
-  InputFileInvalid: [400, "invalid_file"],
-  FileTooLarge: [413, "file_too_large"],
-  FileExpired: [404, "not_found"],
-  SkillInvalid: [400, "invalid_skill"],
-  SkillTooLarge: [413, "skill_too_large"],
-  SkillVersionIsDefault: [409, "default_skill_version"],
-  SkillPathInvalid: [400, "invalid_skill_path"],
-  SkillManifestMissing: [400, "missing_skill"],
-  SkillMissing: [404, "skill_missing"],
-  SkillFileMissing: [404, "skill_file_missing"],
-  SkillIntegrityMismatch: [409, "skill_integrity"],
-  CredentialAmbiguous: [400, "ambiguous_credential"],
-  CredentialNotFound: [404, "not_found"],
-  CredentialExpired: [422, "credential_expired"],
-  CredentialRefreshRejected: [422, "credential_refresh_rejected"],
-  CredentialRefreshFailed: [422, "credential_refresh_failed"],
-  CredentialRefreshIndeterminate: [409, "outcome_unknown"],
-  CredentialChanged: [409, "credential_changed"],
-  CredentialRotationInvalid: [400, "invalid_request"],
   ExecutionMissing: [404, "execution_missing"],
   CheckpointIncompatible: [409, "invalid_checkpoint"],
   TransportFailure: [500, "internal_error"],
-  HarnessUnknown: [400, "unsupported_harness"],
-  CheckpointHarnessMismatch: [409, "checkpoint_incompatible"],
-  CheckpointMissing: [409, "checkpoint_missing"],
-  AssignmentConflict: [409, "assignment_conflict"],
-  NetworkPolicyConflict: [409, "network_policy_conflict"],
-  ArtifactListFailed: [503, "artifact_list_failed"],
-  ArtifactLimitExceeded: [413, "artifact_limit"],
-  EnvironmentNotFound: [404, "not_found"],
-  EnvironmentNotReady: [409, "environment_not_ready"],
-  EnvironmentConflict: [409, "environment_conflict"],
-  EnvironmentSetupIndeterminate: [409, "outcome_unknown"],
-  EnvironmentSetupFailed: [422, "environment_setup_failed"],
-  EnvironmentWriteFailed: [503, "environment_write_failed"],
-  EnvironmentListFailed: [503, "environment_list_failed"],
-  EnvironmentDriverUnavailable: [503, "environment_unavailable"],
-  CapabilityBudgetExceeded: [413, "capability_limit"],
-  StoredObjectMissing: [404, "not_found"],
-  ObjectStorageUnavailable: [503, "storage_unavailable"],
-  UpstreamRedirect: [503, "upstream_redirect"],
-  ModelNotFound: [404, "model_not_found"],
-  ModelProtocolMismatch: [400, "model_protocol_mismatch"],
-  ModelInputMissing: [400, "missing_model_input"],
-  ModelInputTooLarge: [413, "model_input_too_large"],
-  ModelInputUnsupported: [400, "unsupported_model_input"],
-  ModelOutputFailed: [503, "model_output_failed"],
-  ProgrammaticExecutionFailed: [422, "programmatic_execution_failed"],
-  ProgrammaticOutcomeUncertain: [422, "programmatic_execution_uncertain"],
-  ProgrammaticInputTooLarge: [413, "programmatic_input_too_large"],
-  InvalidRequest: [400, "invalid_request"],
-  InvalidJson: [400, "invalid_json"],
-  InvalidTenant: [400, "invalid_tenant"],
-  Unauthorized: [401, "unauthorized"],
-  BodyTooLarge: [413, "body_too_large"],
 } as const satisfies { readonly [K in StaticTag]: Wire };
 const wire = (error: DomainError): Wire => {
   switch (error._tag) {
@@ -939,8 +806,20 @@ export function rejection(
 
 // --- RPC envelope ---------------------------------------------------------------------
 
+/**
+ * Why two transports exist. A failure thrown out of a Durable Object RPC method reaches
+ * its caller as an ordinary `Error`, and `remoteApiError` recovers its status and code
+ * from the wire name `name` carries; that is how about sixty methods answer, and it is
+ * enough, because no caller reads a failure's fields after such a hop. What it costs is
+ * that the platform records every one of those throws as an uncaught exception of the
+ * callee, visible in a tail. The four calls that use the envelope below expect their
+ * failure as an ordinary outcome of a retried request: the catalog's reservation and
+ * reserve, the fork's source read and a session's submit. They answer with the failure
+ * as data, so the callee returns normally, nothing is logged, and the caller's fiber
+ * still fails with the decoded instance rather than a projection of it.
+ */
 /** A plain `ApiError` inside an envelope: its tag, status and code travel as data. */
-export const ApiErrorSchema = Schema.transform(
+const ApiErrorSchema = Schema.transform(
   Schema.TaggedStruct("ApiError", {
     status: Schema.Literal(400, 401, 404, 409, 413, 422, 429, 500, 503),
     code: Schema.String,
@@ -977,7 +856,7 @@ export const RpcFailure = Schema.Union(
   ApiErrorSchema,
 );
 export type RpcFailure = typeof RpcFailure.Type;
-export const isRpcFailure: (value: unknown) => value is RpcFailure = Schema.is(RpcFailure);
+const isRpcFailure: (value: unknown) => value is RpcFailure = Schema.is(RpcFailure);
 export const rpcEnvelope = <A, I>(success: Schema.Schema<A, I>) =>
   Schema.Either({ left: RpcFailure, right: success });
 /** Callee side: an expected failure becomes data; anything else still throws across RPC. */

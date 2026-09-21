@@ -1,7 +1,7 @@
 import { InvalidCursor, RecordNotFound } from "../errors.js";
 import type { AgentSessionEvent, PageQuery } from "../protocol.js";
 import type { Kind } from "./kind.js";
-import type { ListFilter, Page, RecordStore, Transactional } from "./record-store.js";
+import type { ListFilter, Page, RecordStore, Sync, Transactional } from "./record-store.js";
 import { encodeRow } from "./row.js";
 
 interface Row {
@@ -113,7 +113,7 @@ export class MemoryStore implements RecordStore, Transactional {
     this.log = [];
   }
   /** Snapshot and restore on throw, which is the rollback `DurableObjectStorage` performs. */
-  transactionSync<A>(closure: () => A): A {
+  transaction<A>(closure: () => Sync<A>): A {
     const records = new Map([...this.records].map(([kind, rows]) => [kind, new Map(rows)]));
     const log = [...this.log];
     const sequence = this.sequence;

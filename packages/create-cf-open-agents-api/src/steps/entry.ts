@@ -1,6 +1,6 @@
 import { dirname, relative } from "node:path";
 
-import type { Files } from "../fs.js";
+import { display, type Files } from "../fs.js";
 import { CliError, type StepResult } from "../plan.js";
 
 export const EXPORTED_CLASSES = [
@@ -37,10 +37,7 @@ export function ensureEntryExports(
     throw new CliError(
       `The Wrangler entry ${entryPath} does not exist; point main at your Worker entry first.`,
     );
-  const file = entryPath
-    .slice(files.root.length + 1)
-    .split("\\")
-    .join("/");
+  const file = display(files.root, entryPath);
   if (/export\s*\{[^}]*\bSessionDO\b[^}]*\}\s*from/.test(source))
     return { status: "skipped", file };
   const specifier = agentsSpecifier(entryPath, agentsPath, source);

@@ -1,7 +1,7 @@
 import { CONNECTION_FAILURE, type RuntimeCommand, type RuntimeEvent } from "cf-open-agents-api";
 import { z } from "zod";
 
-import type { TurnErrorCode } from "./lifecycle.js";
+import { statusToTurnCode, type TurnErrorCode } from "./lifecycle.js";
 
 // --- App-server request and response shapes -------------------------------------------
 
@@ -48,6 +48,22 @@ const CONNECTION_VARIANTS = new Set([
   "responseStreamDisconnected",
   "responseTooManyFailedAttempts",
 ]);
+/**
+ * What a connection failure's status adds to the variant. The shared table answers
+ * `invalid_request` for every 4xx it does not recognise (OpenCode's rule), and a
+ * proxy's 407 or a 499 beside "the connection failed" is not a bad request of the
+ * client's: the runtime is reporting that it never completed the exchange, so the
+ * variant's own answer stands. 400 and 422 are the upstream's rejection of the body
+ * and keep their code, as do the statuses the table names for themselves (408, 429,
+ * 401/403, 404, 5xx).
+ */
+function connectionFailureCode(status: number | undefined): TurnErrorCode {
+  const code = statusToTurnCode(status);
+  if (code === undefined) return "connection_failed";
+  return code === "invalid_request" && status !== 400 && status !== 422
+    ? "connection_failed"
+    : code;
+}
 const variantDetail = z.object({ httpStatusCode: z.number().nullish() });
 /** `codexErrorInfo` is a camelCase enum string or a single-key object such as `{ httpConnectionFailed: { httpStatusCode } }`. */
 function errorVariant(info: unknown): { variant?: string; httpStatusCode?: number } {
@@ -70,19 +86,9 @@ function errorVariant(info: unknown): { variant?: string; httpStatusCode?: numbe
 export function turnErrorCode(info: unknown, message = ""): TurnErrorCode {
   const { variant, httpStatusCode: status } = errorVariant(info);
   if (variant !== undefined && CONNECTION_VARIANTS.has(variant))
-    return httpStatusCode(status) ?? "connection_failed";
+    return connectionFailureCode(status);
   const known = variant === undefined ? undefined : CODEX_ERROR_CODES.get(variant);
   return known ?? messageErrorCode(message) ?? "internal_error";
-}
-function httpStatusCode(status: number | undefined): TurnErrorCode | undefined {
-  if (status === undefined) return undefined;
-  if (status === 401 || status === 403) return "authentication_error";
-  if (status === 404) return "resource_not_found";
-  if (status === 429) return "rate_limit_exceeded";
-  if (status === 503 || status === 529) return "server_overloaded";
-  if (status >= 500) return "server_error";
-  if (status === 400 || status === 422) return "invalid_request";
-  return undefined;
 }
 /**
  * The exec-server is the sandbox's transport: Codex reports a WebSocket it could not
@@ -103,7 +109,7 @@ export function messageErrorCode(message: string): TurnErrorCode | undefined {
     return "usage_limit_exceeded";
   if (SANDBOX_TRANSPORT.test(message)) return "sandbox_error";
   const status = /\bstatus:?\s*(\d{3})\b/i.exec(message)?.[1];
-  const byStatus = status ? httpStatusCode(Number(status)) : undefined;
+  const byStatus = status ? statusToTurnCode(Number(status)) : undefined;
   if (byStatus) return byStatus;
   return CONNECTION_FAILURE.test(message) ? "connection_failed" : undefined;
 }

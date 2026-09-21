@@ -11,7 +11,7 @@ import type { ActiveSession, Command, Fenced } from "./persistence/session-recor
 import type { SessionRepo, Sync } from "./persistence/session-repo.js";
 import type { SessionTx } from "./persistence/session-tx.js";
 import type { Execution, RuntimeDriver } from "./runtime.js";
-import { Alarm, Drivers, Repo } from "./session-services.js";
+import { Alarm, Drivers, Repo, turnConfig } from "./session-services.js";
 import {
   acceptBatch,
   commitCheckpoint,
@@ -271,7 +271,7 @@ export const reconcileTick = Effect.fn("session.reconcile")(
     const execution = initial.execution;
     const started = yield* Clock.currentTimeMillis;
     yield* alarm.arm(drivers.pollIntervalMs);
-    const config: TurnConfig = { maxTurnMs: drivers.maxTurnMs, agents: drivers.agents };
+    const config = turnConfig(drivers);
     const driver = Option.getOrUndefined(drivers.get(initial.driver));
     if (!driver) {
       // The deployment no longer registers this executor: nothing can poll or stop it,

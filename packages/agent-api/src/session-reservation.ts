@@ -181,7 +181,7 @@ export function forkedEnvironment(
 }
 
 /** What creation and forking each decide before the shared record is written. */
-export interface NewSession {
+interface NewSession {
   tenant: string;
   sessionId: string;
   /** The public agent resource of the session and the id it is presented under. */

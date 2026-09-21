@@ -1,35 +1,33 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const EXAMPLES = ["worker", "demo", "caller"];
+
 /**
- * Local development variables for the example Workers: one random API token in
- * every file. Existing files are kept unless `--force`.
+ * Local development variables for the example Workers: each one's own
+ * `.dev.vars.example` with one random API token substituted for its `API_TOKEN`
+ * line, so the templates stay the only description of what a Worker needs.
+ * Existing files are kept unless `--force`.
  * @param {string} root
  * @param {{ force?: boolean }} [options]
  * @returns {{ file: string, status: "created" | "skipped" }[]}
  */
 export function bootstrap(root, options = {}) {
   const token = `${randomUUID()}${randomUUID()}`.replaceAll("-", "");
-  const worker = [
-    `API_TOKEN=${token}`,
-    "# Required for the codex, claude and opencode presets; leave empty to use only `workers`.",
-    "OPENAI_API_KEY=",
-    "# Store sandbox backups on the local R2 emulator during `wrangler dev`; unset in production.",
-    "LOCAL_BACKUPS=true",
-    "",
-  ].join("\n");
-  const files = [
-    { file: "examples/worker/.dev.vars", content: worker },
-    { file: "examples/demo/.dev.vars", content: worker },
-    { file: "examples/caller/.dev.vars", content: `API_TOKEN=${token}\n` },
-  ];
-  return files.map(({ file, content }) => {
+  // Every template is read and checked before the first file is written.
+  const templates = EXAMPLES.map((example) => {
+    const file = `examples/${example}/.dev.vars`;
+    const template = readFileSync(resolve(root, `${file}.example`), "utf8");
+    if (!/^API_TOKEN=.*$/m.test(template)) throw new Error(`${file}.example has no API_TOKEN line`);
+    return { file, template };
+  });
+  return templates.map(({ file, template }) => {
     const path = resolve(root, file);
     if (existsSync(path) && !options.force)
       return { file, status: /** @type {const} */ ("skipped") };
-    writeFileSync(path, content);
+    writeFileSync(path, template.replace(/^API_TOKEN=.*$/m, `API_TOKEN=${token}`));
     return { file, status: /** @type {const} */ ("created") };
   });
 }

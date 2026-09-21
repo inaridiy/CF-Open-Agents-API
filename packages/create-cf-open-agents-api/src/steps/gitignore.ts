@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import type { Files } from "../fs.js";
+import { appendBlock, type Files } from "../fs.js";
 import type { StepResult } from "../plan.js";
 import { VENDOR_DIRECTORY } from "../versions.js";
 
@@ -16,8 +16,6 @@ export function ensureGitignore(files: Files): StepResult {
     (entry) => !present.has(entry) && !present.has(entry.replace(/\/$/, "")),
   );
   if (missing.length === 0) return { status: "skipped", file: ".gitignore" };
-  while (lines.length > 0 && lines.at(-1) === "") lines.pop();
-  if (lines.length > 0) lines.push("");
-  lines.push("# CF-Open-Agents-API image snapshot and local secrets", ...missing);
+  appendBlock(lines, ["# CF-Open-Agents-API image snapshot and local secrets", ...missing]);
   return files.write(path, `${lines.join("\n")}\n`);
 }

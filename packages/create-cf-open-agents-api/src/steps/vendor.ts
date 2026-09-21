@@ -3,7 +3,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -38,7 +37,12 @@ export interface VendorManifest {
   createdAt: string;
 }
 
-/** What the two Dockerfiles copy: the same set `docker/Harness.Dockerfile` reads from the repository. */
+/**
+ * The build context the two Dockerfiles need, and nothing else: the workspace root, the
+ * supervisor and its one workspace dependency, which is what the `COPY` lines in
+ * `docker/Harness.Dockerfile` name, plus `.dockerignore` (read by the docker CLI from the
+ * context root) and the licence documents. It must move with those `COPY` lines.
+ */
 const SNAPSHOT_FILES = [
   "package.json",
   "pnpm-lock.yaml",
@@ -47,9 +51,8 @@ const SNAPSHOT_FILES = [
   ".dockerignore",
   "LICENSE",
   "NOTICE",
-  "examples/worker/package.json",
 ] as const;
-const SNAPSHOT_DIRECTORIES = ["docker", "packages"] as const;
+const SNAPSHOT_DIRECTORIES = ["docker", "packages/agent-api", "packages/supervisor"] as const;
 const REQUIRED = [
   "docker/Harness.Dockerfile",
   "docker/Sandbox.Dockerfile",
@@ -78,8 +81,25 @@ function isComplete(root: string): boolean {
   return REQUIRED.every((file) => existsSync(join(vendorDirectory(root), file)));
 }
 
-/** Ensures `.cf-open-agents-api/` holds the snapshot the Dockerfiles build from. */
-export async function ensureVendor(options: VendorOptions): Promise<StepResult> {
+export interface StagedVendor {
+  result: StepResult;
+  /** Puts the staged snapshot in place; absent when there is nothing to write. */
+  commit?: () => void;
+  /** Drops the staging directory, committed or not. */
+  release: () => void;
+}
+
+const nothing = () => {
+  // No staging directory was created.
+};
+
+/**
+ * Prepares `.cf-open-agents-api/` in a temporary directory. This is the one step that
+ * downloads and shells out, so every way it can refuse — a missing archive, no `tar`, a
+ * directory that is not a checkout — happens here, before `init` writes anything. `commit`
+ * then only swaps two directories.
+ */
+export async function stageVendor(options: VendorOptions): Promise<StagedVendor> {
   const env = options.env ?? process.env;
   const target = vendorDirectory(options.root);
   const file = `${display(options.root, target)}/`;
@@ -92,20 +112,27 @@ export async function ensureVendor(options: VendorOptions): Promise<StepResult> 
   // explicit source that differs from the recorded one replaces it.
   const sameSource = !source || current?.source === expectedSource;
   if (!options.force && current?.ref === ref && sameSource && isComplete(options.root))
-    return { status: "skipped", file };
+    return { result: { status: "skipped", file }, release: nothing };
   if (env[SKIP_VENDOR_VARIABLE])
     return {
-      status: "skipped",
-      file,
-      note: `${SKIP_VENDOR_VARIABLE} is set; the image snapshot was not refreshed.`,
+      result: {
+        status: "skipped",
+        file,
+        note: `${SKIP_VENDOR_VARIABLE} is set; the image snapshot was not refreshed.`,
+      },
+      release: nothing,
     };
   if (options.dryRun)
     return {
-      status,
-      file,
-      note: `Would snapshot ${source ? resolve(source) : `${GITHUB_REPOSITORY}@${ref}`} into ${file}`,
+      result: {
+        status,
+        file,
+        note: `Would snapshot ${source ? resolve(source) : `${GITHUB_REPOSITORY}@${ref}`} into ${file}`,
+      },
+      release: nothing,
     };
   const staging = mkdtempSync(join(tmpdir(), "cf-open-agents-vendor-"));
+  const release = () => rmSync(staging, { recursive: true, force: true });
   try {
     const checkout = source
       ? validateSource(resolve(source))
@@ -120,11 +147,22 @@ export async function ensureVendor(options: VendorOptions): Promise<StepResult> 
       createdAt: new Date().toISOString(),
     };
     writeFileSync(join(snapshot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-    swap(snapshot, target);
-  } finally {
-    rmSync(staging, { recursive: true, force: true });
+    return { result: { status, file }, commit: () => swapSnapshot(snapshot, target), release };
+  } catch (error) {
+    release();
+    throw error;
   }
-  return { status, file };
+}
+
+/** Ensures `.cf-open-agents-api/` holds the snapshot the Dockerfiles build from. */
+export async function ensureVendor(options: VendorOptions): Promise<StepResult> {
+  const staged = await stageVendor(options);
+  try {
+    staged.commit?.();
+    return staged.result;
+  } finally {
+    staged.release();
+  }
 }
 
 function validateSource(source: string): string {
@@ -166,8 +204,10 @@ function keep(path: string): boolean {
 
 function copySnapshot(checkout: string, snapshot: string): void {
   mkdirSync(snapshot, { recursive: true });
-  for (const directory of SNAPSHOT_DIRECTORIES)
+  for (const directory of SNAPSHOT_DIRECTORIES) {
+    mkdirSync(join(snapshot, directory, ".."), { recursive: true });
     cpSync(join(checkout, directory), join(snapshot, directory), { recursive: true, filter: keep });
+  }
   for (const file of SNAPSHOT_FILES) {
     const from = join(checkout, file);
     if (!existsSync(from)) continue;
@@ -176,22 +216,32 @@ function copySnapshot(checkout: string, snapshot: string): void {
   }
 }
 
-function swap(snapshot: string, target: string): void {
+/** Files `init` keeps in the directory that are not part of the snapshot itself. */
+const PRESERVED = ["composition.json"] as const;
+
+const copyTree = (from: string, to: string) => cpSync(from, to, { recursive: true });
+
+/**
+ * Replaces the directory with the staged snapshot. A copy that fails halfway leaves nothing
+ * half-written: the partial target goes, and what was there before comes back. On a first
+ * snapshot there is nothing to come back, so the directory is removed rather than left
+ * truncated — the Dockerfiles would otherwise build from a build context missing its files.
+ * `copy` is the seam the failure test injects.
+ */
+export function swapSnapshot(snapshot: string, target: string, copy = copyTree): void {
   const previous = `${target}.previous`;
   rmSync(previous, { recursive: true, force: true });
-  if (existsSync(target)) renameSync(target, previous);
+  const restorable = existsSync(target);
+  if (restorable) renameSync(target, previous);
   try {
     mkdirSync(join(target, ".."), { recursive: true });
-    cpSync(snapshot, target, { recursive: true });
+    copy(snapshot, target);
+    for (const file of PRESERVED)
+      if (existsSync(join(previous, file))) cpSync(join(previous, file), join(target, file));
   } catch (error) {
-    if (existsSync(previous)) renameSync(previous, target);
+    rmSync(target, { recursive: true, force: true });
+    if (restorable) renameSync(previous, target);
     throw error;
   }
   rmSync(previous, { recursive: true, force: true });
-}
-
-/** The package directories a snapshot holds, for `doctor`. */
-export function snapshotPackages(root: string): string[] {
-  const packages = join(vendorDirectory(root), "packages");
-  return existsSync(packages) ? readdirSync(packages) : [];
 }

@@ -101,6 +101,15 @@ function unavailableDelegate(
   }
   return;
 }
+/**
+ * Hosted search needs both a runtime that drives it and a model connection that provides
+ * it. The single rule: a session's own `web_search` tool, a delegate's inherited one and
+ * the capability report all answer from here.
+ */
+export const hostedWebSearch = (
+  registration: AgentRegistration | undefined,
+  driver: RuntimeDriver | undefined,
+): boolean => registration?.webSearch === true && driver?.capabilities.webSearch === true;
 /** The capability a driver lacks for one of the configured tools, in the order the API reports them. */
 function toolCapabilityGap(
   tools: NonNullable<ModelAgent["tools"]>,
@@ -108,11 +117,7 @@ function toolCapabilityGap(
   driver: RuntimeDriver,
 ): Capability | undefined {
   if (tools.some((tool) => tool.type === "mcp") && !driver.capabilities.mcp) return "mcp";
-  // Hosted search needs both a runtime that drives it and a model connection that provides it.
-  if (
-    tools.some((tool) => tool.type === "web_search") &&
-    !(driver.capabilities.webSearch && registration.webSearch === true)
-  )
+  if (tools.some((tool) => tool.type === "web_search") && !hostedWebSearch(registration, driver))
     return "web_search";
   if (
     tools.some(

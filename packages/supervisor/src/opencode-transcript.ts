@@ -1,6 +1,14 @@
 import type { AssistantMessage, Event, Part, Session, ToolPart } from "@opencode-ai/sdk/v2/types";
 import type { RuntimeEvent } from "cf-open-agents-api";
 
+import {
+  closeSubagent,
+  closeSubagentTurn,
+  openSubagent,
+  openSubagentTurn,
+  usageEvent,
+} from "./events.js";
+
 export type EventScope = { subagentId: string; turnId: string };
 export interface ChildState {
   readonly sessionId: string;
@@ -67,22 +75,18 @@ export class OpenCodeTranscript {
       (sum, message) => sum + message.tokens.output + message.tokens.reasoning,
       0,
     );
-    this.host.emit({
-      type: "usage",
-      id: `usage:${scope?.turnId ?? this.host.turnId}`,
-      usage: {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: input + output,
-        input_tokens_details: {
-          cached_tokens: list.reduce((sum, message) => sum + message.tokens.cache.read, 0),
+    this.host.emit(
+      usageEvent(
+        `usage:${scope?.turnId ?? this.host.turnId}`,
+        {
+          input,
+          output,
+          cached: list.reduce((sum, message) => sum + message.tokens.cache.read, 0),
+          reasoning: list.reduce((sum, message) => sum + message.tokens.reasoning, 0),
         },
-        output_tokens_details: {
-          reasoning_tokens: list.reduce((sum, message) => sum + message.tokens.reasoning, 0),
-        },
-      },
-      ...scope,
-    });
+        scope,
+      ),
+    );
   }
   /** Marks a text part as announced; false when it already was. */
   claim(partId: string): boolean {
@@ -130,23 +134,16 @@ export class OpenCodeTranscript {
       closed: false,
     };
     this.host.children.set(info.id, child);
-    this.host.emit({
-      type: "subagent",
-      id: child.subagentId,
-      parentId: null,
-      name: child.name,
-      instructions: null,
-      openedAt: child.openedAt,
-      status: "active",
-    });
-    this.host.emit({
-      type: "subagent_turn",
-      id: child.turnId,
-      subagentId: child.subagentId,
-      status: "in_progress",
-      startedAt: child.openedAt,
-      completedAt: null,
-    });
+    this.host.emit(
+      openSubagent({ id: child.subagentId, name: child.name, openedAt: child.openedAt }),
+    );
+    this.host.emit(
+      openSubagentTurn({
+        id: child.turnId,
+        subagentId: child.subagentId,
+        startedAt: child.openedAt,
+      }),
+    );
   }
   private closeChild(child: ChildState, status: "completed" | "failed"): void {
     if (child.closed) return;
@@ -154,23 +151,17 @@ export class OpenCodeTranscript {
     for (const messageId of Array.from(this.pendingText.keys()))
       if (this.pendingText.get(messageId)?.some((entry) => entry.scope?.turnId === child.turnId))
         this.flushText(messageId, "final_answer");
-    this.host.emit({
-      type: "subagent_turn",
-      id: child.turnId,
-      subagentId: child.subagentId,
-      status,
-      startedAt: child.openedAt,
-      completedAt: Math.floor(Date.now() / 1000),
-    });
-    this.host.emit({
-      type: "subagent",
-      id: child.subagentId,
-      parentId: null,
-      name: child.name,
-      instructions: null,
-      openedAt: child.openedAt,
-      status: "closed",
-    });
+    this.host.emit(
+      closeSubagentTurn({
+        id: child.turnId,
+        subagentId: child.subagentId,
+        status,
+        startedAt: child.openedAt,
+      }),
+    );
+    this.host.emit(
+      closeSubagent({ id: child.subagentId, name: child.name, openedAt: child.openedAt }),
+    );
   }
   private collectPart(part: Part): void {
     const scope = this.scopeOf(part.sessionID);

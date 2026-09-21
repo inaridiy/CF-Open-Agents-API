@@ -1,4 +1,3 @@
-import type { Effect } from "effect";
 import {
   type Compilable,
   DummyDriver,
@@ -12,7 +11,13 @@ import {
 
 import { InvalidCursor, RecordNotFound } from "./errors.js";
 import type { Kind } from "./persistence/kind.js";
-import type { ListFilter, Page, RecordStore, Transactional } from "./persistence/record-store.js";
+import type {
+  ListFilter,
+  Page,
+  RecordStore,
+  Sync,
+  Transactional,
+} from "./persistence/record-store.js";
 import { encodeRow } from "./persistence/row.js";
 import type { AgentSessionEvent, PageQuery } from "./protocol.js";
 
@@ -241,13 +246,7 @@ export class SqlStore implements RecordStore, Transactional {
       )[0]?.seq ?? 0
     );
   }
-  transaction<T>(
-    callback: () => T &
-      (T extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown),
-  ): T {
-    return this.storage.transactionSync(callback);
-  }
-  transactionSync<T>(closure: () => T): T {
+  transaction<A>(closure: () => Sync<A>): A {
     return this.storage.transactionSync(closure);
   }
 }

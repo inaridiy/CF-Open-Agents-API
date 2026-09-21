@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 
+import { sha256Hex } from "../bytes.js";
 import { io } from "../effect.js";
 import {
   AssignmentConflict,
@@ -15,10 +16,6 @@ import { workspaceTools } from "../workspace.js";
 
 const IMAGE_DIGEST_LIMIT = 256;
 const IMAGE_DATA_PREFIX = "data:";
-export async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 export function remoteImageURLs(parts: readonly { type: string; image_url?: string }[]): string[] {
   return parts.flatMap((part) =>
     part.type === "input_image" && part.image_url && !part.image_url.startsWith(IMAGE_DATA_PREFIX)

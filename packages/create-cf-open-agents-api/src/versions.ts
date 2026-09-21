@@ -2,8 +2,8 @@ import { createRequire } from "node:module";
 
 /**
  * Pins the generated project receives. They must agree with the workspace manifests;
- * `test/versions.test.mjs` compares them with packages/agent-api, examples/worker and
- * the root package.json.
+ * `test/versions.test.ts` compares every entry here with packages/agent-api,
+ * examples/worker, examples/demo and the root package.json.
  */
 export const LIBRARY_NAME = "cf-open-agents-api";
 export const CLI_NAME = "create-cf-open-agents-api";
@@ -44,7 +44,7 @@ export const DEMO_VERSIONS = {
 export const TOOLCHAIN_VERSIONS = {
   wrangler: "4.131.1",
   "@cloudflare/workers-types": "5.20260911.1",
-  typescript: "5.9.3",
+  typescript: "7.0.2",
 } as const;
 
 const manifest = createRequire(import.meta.url)("../package.json") as { version: string };

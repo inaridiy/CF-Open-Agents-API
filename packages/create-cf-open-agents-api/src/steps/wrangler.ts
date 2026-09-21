@@ -7,7 +7,7 @@ import {
   setValue,
 } from "../jsonc.js";
 import { CliError } from "../plan.js";
-import type { WranglerBinding, WranglerConfig } from "../project.js";
+import type { WranglerBinding, WranglerConfig, WranglerMigration } from "../project.js";
 import { CTX_EXPORTS_DATE, VENDOR_DIRECTORY } from "../versions.js";
 
 export interface WranglerInput {
@@ -20,7 +20,6 @@ export interface WranglerInput {
 }
 export interface WranglerOutcome {
   text: string;
-  changed: boolean;
   notes: string[];
 }
 
@@ -73,7 +72,7 @@ const append = (state: State, path: (string | number)[], value: unknown) => {
   state.document = appendItem(state.document, path, value);
 };
 
-/** Applies every section in order and reports whether the text changed. */
+/** Applies every section in order; `Files.write` decides whether that is a change. */
 export function upsertWranglerConfig(
   text: string,
   input: WranglerInput,
@@ -92,7 +91,7 @@ export function upsertWranglerConfig(
   ensureAi(state);
   noteNamedEnvironments(state);
   if (state.document.text !== text) state.document = collapsePrimitiveArrays(state.document);
-  return { text: state.document.text, changed: state.document.text !== text, notes: state.notes };
+  return { text: state.document.text, notes: state.notes };
 }
 
 function ensureName(state: State): void {
@@ -146,21 +145,63 @@ const nextTag = (tags: readonly (string | undefined)[]): string => {
   return `v${next}`;
 };
 
+/** Where a class got its storage: the migration that declared it, under the name it had then. */
+export interface ClassOrigin {
+  storage: "sqlite" | "kv";
+  /** The declared class; `className` itself unless a `renamed_classes` chain leads to it. */
+  className: string;
+}
+
+/**
+ * Follows `className` back through `renamed_classes` to the migration that created it: a
+ * rename carries the storage of the class it renames, so only `new_sqlite_classes` and
+ * `new_classes` decide. The newest statement about a name wins, the origin of a rename is
+ * looked for in the migrations before it, and a rename cycle ends the walk rather than
+ * looping. `undefined` means no migration mentions the class at all.
+ */
+export function classOrigin(
+  migrations: readonly WranglerMigration[],
+  className: string,
+  seen: ReadonlySet<string> = new Set(),
+): ClassOrigin | undefined {
+  if (seen.has(className)) return;
+  const visited = new Set([...seen, className]);
+  for (let index = migrations.length - 1; index >= 0; index -= 1) {
+    const migration = migrations[index];
+    if (migration?.new_sqlite_classes?.includes(className)) return { storage: "sqlite", className };
+    if (migration?.new_classes?.includes(className)) return { storage: "kv", className };
+    const renamed = migration?.renamed_classes?.find((rename) => rename.to === className);
+    if (renamed?.from) return classOrigin(migrations.slice(0, index), renamed.from, visited);
+  }
+  return;
+}
+
+/**
+ * Whether the migrations give `className` SQLite storage: declared in `new_sqlite_classes`,
+ * or renamed from a class that has it. `init` and `doctor` share this rule; when they
+ * disagreed, a configuration `init` accepted was reported broken by `doctor`. A rename is no
+ * proof on its own — a class renamed from a `new_classes` one still has KV storage.
+ */
+export function isSqliteClass(configuration: WranglerConfig, className: string): boolean {
+  return classOrigin(configuration.migrations ?? [], className)?.storage === "sqlite";
+}
+
 function ensureMigrations(state: State): void {
-  const migrations = config(state).migrations ?? [];
-  const covered = new Set(
-    migrations.flatMap((migration) => [
-      ...(migration.new_sqlite_classes ?? []),
-      ...(migration.renamed_classes ?? []).map((rename) => rename.to ?? ""),
-    ]),
-  );
+  const current = config(state);
+  const migrations = current.migrations ?? [];
   const classes = DURABLE_OBJECTS.map((object) => object.class_name);
-  const kv = classes.find((name) => migrations.some((m) => m.new_classes?.includes(name)));
-  if (kv)
+  for (const name of classes) {
+    const origin = classOrigin(migrations, name);
+    if (origin?.storage !== "kv") continue;
+    const declared =
+      origin.className === name
+        ? "is declared in new_classes"
+        : `was renamed from ${origin.className}, which is declared in new_classes`;
     throw new CliError(
-      `${state.file}: ${kv} is declared in new_classes; the library's Durable Objects need SQLite storage (new_sqlite_classes).`,
+      `${state.file}: ${name} ${declared}; the library's Durable Objects need SQLite storage (new_sqlite_classes).`,
     );
-  const missing = classes.filter((name) => !covered.has(name));
+  }
+  const missing = classes.filter((name) => !isSqliteClass(current, name));
   if (missing.length === 0) return;
   append(state, ["migrations"], {
     tag: nextTag(migrations.map((m) => m.tag)),

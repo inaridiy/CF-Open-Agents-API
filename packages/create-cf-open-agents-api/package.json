@@ -23,19 +23,13 @@
     "NOTICE"
   ],
   "type": "module",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
-  },
   "publishConfig": {
     "access": "public",
     "provenance": true,
     "tag": "alpha"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node ../../scripts/prepare-package.mjs",
     "prepack": "node ../../scripts/prepare-package.mjs"
   },
   "dependencies": {

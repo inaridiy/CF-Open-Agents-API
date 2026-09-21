@@ -35,7 +35,7 @@ export interface WorkerAccess<Env> extends AgentRPC {
 export type RouteEnv<Env> = { Bindings: WorkerAccess<Env>; Variables: { tenant: string } };
 /** The one Hono app of a service; every route module registers on it in order. */
 export type RouteApp<Env> = Hono<RouteEnv<Env>>;
-export type RouteContext = { req: { raw: Request; text(): Promise<string> } };
+type RouteContext = { req: { raw: Request; text(): Promise<string> } };
 
 /**
  * The official SDK sends no body when every parameter of an update or create call is

@@ -75,7 +75,7 @@ export class HarnessContainer<
    */
   private readonly runtime = ManagedRuntime.make(
     Layer.mergeAll(
-      Layer.succeed(HarnessRepo, makeHarnessRepo(this.db, this.ctx.storage)),
+      Layer.succeed(HarnessRepo, makeHarnessRepo(this.db)),
       Layer.succeed(HarnessBindings, this.env),
     ),
   );

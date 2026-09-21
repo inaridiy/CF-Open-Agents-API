@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import type { PackageManager } from "../exec.js";
-import type { Files } from "../fs.js";
+import { appendBlock, type Files } from "../fs.js";
 import type { StepResult } from "../plan.js";
 
 /** Dependencies of the generated project whose install scripts pnpm must be allowed to run. */
@@ -39,11 +39,12 @@ export function ensurePnpmBuilds(files: Files, packageManager: PackageManager): 
   const lines = existing.split(/\r?\n/);
   const missing = PNPM_BUILDS.filter((name) => !approved(lines, name));
   if (missing.length === 0) return { status: "skipped", file: FILE };
-  while (lines.length > 0 && lines.at(-1) === "") lines.pop();
-  const block = lines.findIndex((line) => /^allowBuilds:\s*$/.test(line));
-  if (block === -1) lines.push("allowBuilds:", ...missing.map((name) => `  ${name}: true`));
-  else lines.splice(block + 1, 0, ...missing.map((name) => `  ${name}: true`));
-  return files.write(path, `${lines.join("\n")}\n`);
+  const entries = missing.map((name) => `  ${name}: true`);
+  const kept = appendBlock(lines, []);
+  const block = kept.findIndex((line) => /^allowBuilds:\s*$/.test(line));
+  if (block === -1) appendBlock(kept, ["allowBuilds:", ...entries], false);
+  else kept.splice(block + 1, 0, ...entries);
+  return files.write(path, `${kept.join("\n")}\n`);
 }
 
 /** True when `name` is allowed under `allowBuilds` or listed under `onlyBuiltDependencies`. */

@@ -11,7 +11,8 @@ import {
   SkillVersionIsDefault,
 } from "./errors.js";
 import { kind } from "./persistence/kind.js";
-import { canonicalJSON, identifier, type PageQuery, parse } from "./protocol.js";
+import { resourcePage } from "./persistence/record-store.js";
+import { canonicalJSON, deleted, identifier, type PageQuery, parse } from "./protocol.js";
 import { readSkillZip } from "./skill-zip.js";
 import type { SqlStore } from "./storage.js";
 
@@ -225,7 +226,7 @@ export class SkillRepository {
   versions(skillId: string, query: PageQuery) {
     this.retrieve(skillId);
     const page = this.db.list(Kinds.skillVersion(skillId), query);
-    return { ...page, data: page.data.map(({ resource }) => resource) };
+    return resourcePage(page);
   }
   add(
     input: SkillMetadata &
@@ -300,12 +301,7 @@ export class SkillRepository {
       this.db.remove(Kinds.skillVersionNumber(skillId), version.version);
       const latest = this.versions(skillId, { order: "desc", limit: 1 }).data[0];
       if (latest) this.db.put(Kinds.skill, skillId, { ...skill, latest_version: latest.version });
-      return {
-        id: version.id,
-        object: "skill.version.deleted" as const,
-        deleted: true,
-        version: version.version,
-      };
+      return { ...deleted(version.id, "skill.version.deleted"), version: version.version };
     });
   }
   delete(skillId: string) {
@@ -314,7 +310,7 @@ export class SkillRepository {
       this.db.clear(Kinds.skillVersion(skillId));
       this.db.clear(Kinds.skillVersionNumber(skillId));
       this.db.remove(Kinds.skill, skillId);
-      return { id: skillId, object: "skill.deleted" as const, deleted: true };
+      return deleted(skillId, "skill.deleted");
     });
   }
 }
