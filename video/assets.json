@@ -58,5 +58,11 @@
     "url": "https://assets.mixkit.co/active_storage/sfx/2299/2299-preview.mp3",
     "license": "Mixkit Sound Effects Free License; Short bass hit",
     "sha256": "8bd0c7fd63fbb8a4442ffe1176aa41b260d1fafbcf728e3c63648eb5bcd4e16b"
+  },
+  {
+    "path": "audio/music.mp3",
+    "url": "https://assets.mixkit.co/music/745/745.mp3",
+    "license": "Mixkit Stock Music Free License; House Vibez by Lily J",
+    "sha256": "eff4aceea32ed5f9651673cedfd86f5b2de143dd865f56d7b5c79d43dd9e81f5"
   }
 ]

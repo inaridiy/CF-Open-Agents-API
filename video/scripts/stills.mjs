@@ -22,10 +22,7 @@ try {
   });
   const frames = process.argv.slice(2).length
     ? process.argv.slice(2).map(Number)
-    : [
-        30, 95, 140, 247, 340, 397, 450, 520, 558, 595, 650, 712, 744, 808, 936, 978, 1052, 1165,
-        1230, 1340, 1430,
-      ];
+    : [95, 200, 365, 540, 745, 1015, 1160, 1280, 1380, 1430, 1530, 1650, 1730, 1940, 2085];
   for (const frame of frames) {
     await renderStill({
       composition,
