@@ -98,7 +98,7 @@ it("the memory store hands out fresh values, enforces the row budget and rolls b
     store.put(counter, "big", { n: "x".repeat(2_000_000) as unknown as number }),
   ).toThrow(RecordTooLarge);
   expect(() =>
-    store.transactionSync(() => {
+    store.transaction(() => {
       store.put(counter, "b", { n: 2 });
       store.append({ type: "agent.session.idle", event_id: "evt_x", session });
       throw new Error("abort");
@@ -136,7 +136,7 @@ it("the session view migrates on read, guards the phase invariant and fences on 
 
 it("the repository is lazy, keeps domain tags, classifies the rest and rolls back on failure", async () => {
   const store = seeded(active);
-  const repo = makeSessionRepo(store, store);
+  const repo = makeSessionRepo(store);
   let runs = 0;
   const program = repo.transaction((tx) => {
     runs++;

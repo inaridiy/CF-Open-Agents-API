@@ -8,14 +8,7 @@ import { identifier, parseEffect } from "./protocol.js";
 
 export const INPUT_FILE_LIMIT = 50 * 1024 * 1024;
 /** `FilePurpose` of openai@7.15.0; every value is accepted and stored as opaque metadata. */
-export const FILE_PURPOSES = [
-  "assistants",
-  "batch",
-  "fine-tune",
-  "vision",
-  "user_data",
-  "evals",
-] as const;
+const FILE_PURPOSES = ["assistants", "batch", "fine-tune", "vision", "user_data", "evals"] as const;
 export interface StoredInputFile {
   version: 1;
   key: string;

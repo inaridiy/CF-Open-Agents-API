@@ -3,7 +3,7 @@ import { z } from "zod";
 import { runPromise } from "../effect.js";
 import { StoredObjectMissing } from "../errors.js";
 import { uploadInputFile } from "../files.js";
-import { pageSchema, parse } from "../protocol.js";
+import { deleted, pageSchema, parse } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
 import { objects, type RouteApp } from "./context.js";
 
@@ -43,6 +43,6 @@ export function registerFileRoutes<Env>(app: RouteApp<Env>, options: ServiceOpti
     const record = await catalog.file(c.req.param("id"));
     await objects(options, c.env).delete(record.key);
     await catalog.deleteFile(record.resource.id);
-    return Response.json({ id: record.resource.id, object: "file", deleted: true });
+    return Response.json(deleted(record.resource.id, "file"));
   });
 }

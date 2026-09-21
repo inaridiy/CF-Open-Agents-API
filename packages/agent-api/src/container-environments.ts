@@ -32,6 +32,7 @@ import {
   StoredObjectMissing,
 } from "./errors.js";
 import { kind } from "./persistence/kind.js";
+import { eachRecord } from "./persistence/record-store.js";
 import { parseEffect } from "./protocol.js";
 import type { Checkpoint } from "./runtime.js";
 import { SqlStore } from "./storage.js";
@@ -453,37 +454,33 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const spec = yield* attempt("environment.state", () => this.spec());
       if (!spec) return;
       const sandbox = this.sandbox(spec);
-      let after: string | undefined;
-      do {
-        const page = yield* attempt("environment.upload.list", () =>
-          this.db.list(Kinds.upload, { order: "asc", limit: 100, after }),
-        );
-        yield* Effect.forEach(
-          page.data,
-          (upload) =>
-            Effect.gen(this, function* () {
-              if (upload.version <= afterVersion) return;
-              const object = yield* io("environment.upload.get", () =>
-                this.env.CHECKPOINTS.get(upload.key),
-              );
-              if (!object) return yield* new EnvironmentWriteFailed({ reason: "upload_missing" });
-              yield* io("environment.upload.mkdir", () =>
-                sandbox.mkdir(upload.path.slice(0, upload.path.lastIndexOf("/")), {
-                  recursive: true,
-                }),
-              );
-              const result = yield* io("environment.upload.apply", () =>
-                sandbox.writeFile(upload.path, object.body),
-              );
-              if (!result.success) return yield* new EnvironmentWriteFailed({ reason: "upload" });
-              yield* attempt("environment.upload.applied", () =>
-                this.db.put(Kinds.fileVersion, "applied_file_version", upload.version),
-              );
-            }),
-          { discard: true },
-        );
-        after = page.has_more ? (page.last_id ?? undefined) : undefined;
-      } while (after);
+      const uploads = yield* attempt("environment.upload.list", () => [
+        ...eachRecord(this.db, Kinds.upload),
+      ]);
+      yield* Effect.forEach(
+        uploads,
+        (upload) =>
+          Effect.gen(this, function* () {
+            if (upload.version <= afterVersion) return;
+            const object = yield* io("environment.upload.get", () =>
+              this.env.CHECKPOINTS.get(upload.key),
+            );
+            if (!object) return yield* new EnvironmentWriteFailed({ reason: "upload_missing" });
+            yield* io("environment.upload.mkdir", () =>
+              sandbox.mkdir(upload.path.slice(0, upload.path.lastIndexOf("/")), {
+                recursive: true,
+              }),
+            );
+            const result = yield* io("environment.upload.apply", () =>
+              sandbox.writeFile(upload.path, object.body),
+            );
+            if (!result.success) return yield* new EnvironmentWriteFailed({ reason: "upload" });
+            yield* attempt("environment.upload.applied", () =>
+              this.db.put(Kinds.fileVersion, "applied_file_version", upload.version),
+            );
+          }),
+        { discard: true },
+      );
     });
   }
   files(spec: EnvironmentSpec, query: z.infer<typeof environmentFilePageSchema>) {

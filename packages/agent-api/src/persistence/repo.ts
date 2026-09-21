@@ -1,15 +1,13 @@
 import { Effect } from "effect";
 
 import { StorageFailure } from "../errors.js";
-import type { Transactional } from "./record-store.js";
+import type { Sync, Transactional } from "./record-store.js";
 
-/** A synchronous result: returning a Promise or an Effect from the seam is a type error. */
-export type Sync<A> = A &
-  (A extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown);
+export type { Sync } from "./record-store.js";
 
 /**
  * The outside edge of the persistence seam, for one typed view `Tx` of a store.
- * `transaction` runs `f` in one `transactionSync`: a throw rolls the transaction back and
+ * `transaction` runs `f` in one store transaction: a throw rolls it back and
  * then becomes the failure channel, classified by `expected` into the typed error `E` or a
  * `StorageFailure` (an unknown outcome, never a definite answer). `read` runs `f` against
  * the same view without a transaction. Both are lazy: constructing the effect runs
@@ -38,7 +36,7 @@ export const makeRepo = <Tx, E>(
     });
   return {
     transaction: (f) =>
-      attempt(`${name}.transaction`, () => transactional.transactionSync(() => f(tx))),
+      attempt(`${name}.transaction`, () => transactional.transaction(() => f(tx))),
     read: (f) => attempt(`${name}.read`, () => f(tx)),
   };
 };

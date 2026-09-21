@@ -27,6 +27,7 @@ import {
   SubagentTurnMismatch,
   TurnActive,
 } from "./errors.js";
+import { eachPage, mapPage } from "./persistence/record-store.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import { type ArtifactRecord, migrate, type SessionRecord } from "./persistence/session-record.js";
 import {
@@ -56,6 +57,7 @@ import {
   Repo,
   type SessionDependencies,
   type SessionServices,
+  turnConfig,
 } from "./session-services.js";
 import {
   acceptInput,
@@ -63,7 +65,6 @@ import {
   type Deleted,
   markDeleted,
   purgeRecords,
-  type TurnConfig,
 } from "./session-state.js";
 import { SqlStore } from "./storage.js";
 
@@ -132,7 +133,7 @@ function transcriptEntry(item: AgentSessionItem): string | undefined {
   }
 }
 /** Accumulates items page by page and only ever retains the bounded tail. */
-export class TranscriptBuilder {
+class TranscriptBuilder {
   private readonly entries: string[] = [];
   private total = 0;
   private omitted = 0;
@@ -157,11 +158,6 @@ export class TranscriptBuilder {
     return this.omitted ? `[${this.omitted} earlier entries omitted]\n\n${rendered}` : rendered;
   }
 }
-export function renderTranscript(items: readonly AgentSessionItem[]): string {
-  const builder = new TranscriptBuilder();
-  builder.add(items);
-  return builder.render();
-}
 /** The deployment must still register the session's harness at its original revision. */
 function requireDriver(
   drivers: Context.Tag.Service<Drivers>,
@@ -179,7 +175,7 @@ const submitProgram = (events: InputEvent[], key: string) =>
     const drivers = yield* Drivers;
     const repo = yield* Repo;
     yield* alarm.arm(1);
-    const config: TurnConfig = { maxTurnMs: drivers.maxTurnMs, agents: drivers.agents };
+    const config = turnConfig(drivers);
     yield* repo.transaction((tx) =>
       acceptInput(tx, config, (record) => requireDriver(drivers, record), events, key),
     );
@@ -189,6 +185,9 @@ const submitProgram = (events: InputEvent[], key: string) =>
 const LISTENER_LIMIT = 64;
 /** Events a listener reads from SQLite per pull; the ReadableStream queue bounds the bytes. */
 const EVENT_PAGE = 64;
+/** Default and largest page of `GET /cf/v1/sessions/:id/events`. */
+const REPLAY_PAGE = 100;
+const REPLAY_LIMIT = 1_000;
 const SSE_HEADERS = {
   "content-type": "text/event-stream",
   "cache-control": "no-cache",
@@ -215,10 +214,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
   // lint: entrypoint
   private readonly wake = runSync(PubSub.sliding<void>(1), "session.wake");
   /** Effect edge of the seam: one `transactionSync` per `transaction`, then a wake. */
-  private readonly repo: SessionRepo = wakeAfterCommit(
-    makeSessionRepo(this.db, this.ctx.storage),
-    this.wake,
-  );
+  private readonly repo: SessionRepo = wakeAfterCommit(makeSessionRepo(this.db), this.wake);
   /**
    * One runtime per object with exactly three services; every asynchronous entrypoint
    * runs its program here and nothing below an entrypoint calls `Effect.run*`.
@@ -339,7 +335,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       query,
       environmentId ? { field: "environment_id", value: environmentId } : undefined,
     );
-    return { ...page, data: page.data.map(({ key: _key, ...resource }) => resource) };
+    return mapPage(page, ({ key: _key, ...resource }) => resource);
   }
   artifact(id: string): ArtifactRecord {
     this.record();
@@ -350,9 +346,10 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     this.db.remove(SessionKinds.artifact, id);
     return artifact.key;
   }
-  replay(after: number) {
+  /** A page of the durable log after `after`, at most `limit` rows (1,000 at the most). */
+  replay(after: number, limit = REPLAY_PAGE) {
     this.record();
-    return this.db.events(after);
+    return this.db.events(after, Math.min(limit, REPLAY_LIMIT));
   }
   /** Committed state only: an active turn has no consistent checkpoint yet. */
   forkSource(): string {
@@ -370,12 +367,7 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
     if (record.execution) throw new TurnActive({ action: "fork" });
     // Pages are folded into the bounded transcript as they are read, never held together.
     const transcript = new TranscriptBuilder();
-    let after: string | undefined;
-    do {
-      const page = this.db.list(SessionKinds.item, { order: "asc", limit: 100, after });
-      transcript.add(page.data);
-      after = page.has_more ? (page.last_id ?? undefined) : undefined;
-    } while (after);
+    for (const page of eachPage(this.db, SessionKinds.item)) transcript.add(page);
     const lastTurn = this.db.list(SessionKinds.turn, { order: "desc", limit: 1 }).data[0];
     return {
       session: record.session,

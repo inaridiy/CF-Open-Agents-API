@@ -11,11 +11,13 @@
  * - Node socket error codes as they appear in Claude Code and OpenCode messages
  *   and in the supervisor's diagnostics: `ECONNREFUSED`, `ECONNRESET`, `ENOTFOUND`,
  *   `EAI_AGAIN`, `ETIMEDOUT`, `EHOSTUNREACH`, `ENETUNREACH`;
- * - undici's `fetch failed`, the message of a Node `fetch` whose cause is one of those.
+ * - undici's `fetch failed`, the message of a Node `fetch` whose cause is one of
+ *   those, its `socket hang up` for a connection the peer dropped mid-response, and
+ *   the browser-shaped `network error` the Anthropic SDK reports a failed fetch as.
  *
  * A message that also names an HTTP status is an answer from the upstream, so a
  * caller maps the status first and consults this list only when the status maps
  * to nothing.
  */
 export const CONNECTION_FAILURE =
-  /error sending request|connection (?:reset|refused|aborted|closed before)|failed to connect|stream disconnected|dns error|failed to lookup address|network (?:is )?unreachable|timed out connecting|connection timed out|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|fetch failed/i;
+  /error sending request|connection (?:reset|refused|aborted|closed before)|failed to connect|stream disconnected|dns error|failed to lookup address|network (?:is )?unreachable|timed out connecting|connection timed out|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|fetch failed|socket hang up|network error/i;

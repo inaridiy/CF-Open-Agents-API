@@ -7,7 +7,7 @@ import { expect, it } from "vitest";
 
 import type { Execution, RuntimeBatch, RuntimeEvent } from "../../packages/agent-api/src/index.js";
 import { createModelGateway, nativeModel } from "../../packages/agent-api/src/models.js";
-import { StreamBlocks } from "../../packages/supervisor/src/claude-code.js";
+import { claudeTurnError, StreamBlocks } from "../../packages/supervisor/src/claude-code.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
 
@@ -372,6 +372,73 @@ it("assigns each completed part the stream index of its type, skipping empty tex
   expect(blocks.assign("other", "text", 1)).toBe(1);
   blocks.clear();
   expect(blocks.assign("msg", "text", 0)).toBe(0);
+});
+
+/** The fields of an SDK result `claudeTurnError` reads; the rest of the message is irrelevant. */
+type ResultFields =
+  | { subtype: "success"; is_error: boolean; result: string; api_error_status?: number | null }
+  | { subtype: "error_during_execution"; errors: string[]; terminal_reason?: string };
+const resultMessage = (fields: ResultFields) =>
+  ({ type: "result", ...fields }) as unknown as Parameters<typeof claudeTurnError>[0];
+
+/**
+ * An `api_error_status` is an answer from the upstream, and the transport phrases of
+ * `CONNECTION_FAILURE` say the request never reached one; a body that carries both
+ * wordings must therefore be read status first, or a rate limit whose message names a
+ * reset connection would read as a connection that never happened.
+ */
+it("maps a result by its api_error_status before the transport wording", () => {
+  expect(
+    claudeTurnError(
+      resultMessage({
+        subtype: "success",
+        is_error: true,
+        api_error_status: 429,
+        result: "Too Many Requests: connection reset by peer",
+      }),
+    ),
+  ).toBe("rate_limit_exceeded");
+  expect(
+    claudeTurnError(
+      resultMessage({
+        subtype: "success",
+        is_error: true,
+        api_error_status: 503,
+        result: "Service Unavailable: connection timed out",
+      }),
+    ),
+  ).toBe("server_overloaded");
+  // No status at all: the wording is all there is, so it decides.
+  expect(
+    claudeTurnError(
+      resultMessage({
+        subtype: "success",
+        is_error: true,
+        api_error_status: null,
+        result: "fetch failed: connection reset by peer",
+      }),
+    ),
+  ).toBe("connection_failed");
+  expect(
+    claudeTurnError(
+      resultMessage({ subtype: "error_during_execution", errors: ["connect ECONNREFUSED"] }),
+    ),
+  ).toBe("connection_failed");
+  // A context window the request overran is the model's answer, whatever its status.
+  expect(
+    claudeTurnError(
+      resultMessage({
+        subtype: "success",
+        is_error: true,
+        api_error_status: 400,
+        result: "prompt is too long: 250000 tokens > 200000 maximum",
+      }),
+    ),
+  ).toBe("context_length_exceeded");
+  // A result that is not an error is no turn error.
+  expect(
+    claudeTurnError(resultMessage({ subtype: "success", is_error: false, result: "done" })),
+  ).toBeUndefined();
 });
 
 it("announces commentary before a tool call and the closing message as the answer", async () => {

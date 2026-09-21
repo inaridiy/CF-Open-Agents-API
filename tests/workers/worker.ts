@@ -301,6 +301,13 @@ const service = createAgentService<TestEnv>({
       model: "fixture-model",
       delegates: ["test-tiers"],
     },
+    // Delegation targets whose hosted search differs: the flagged alias on a search-capable
+    // harness has it, the unflagged alias on the same harness does not.
+    "test-search-lead": {
+      harness: "fixture",
+      model: "fixture-model",
+      delegates: ["test-search", "test-search-unflagged", "test-tools"],
+    },
     "test-misconfigured": { harness: "fixture", model: "fixture-model", delegates: ["absent"] },
   },
   harnesses: (env) => ({

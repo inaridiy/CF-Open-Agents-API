@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { Reporter } from "../src/index.js";
+import type { Runner } from "../src/exec.js";
+import type { InitOptions, Reporter } from "../src/index.js";
 
 export const packageRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const repoRoot = resolve(packageRoot, "..", "..");
@@ -21,6 +22,29 @@ export function emptyDirectory(): string {
 }
 export function cleanup(directory: string): void {
   rmSync(directory, { recursive: true, force: true });
+}
+
+/** A fixture project, removed again whether or not the body threw. */
+export async function withFixture<T>(
+  name: string,
+  body: (dir: string) => T | Promise<T>,
+): Promise<T> {
+  const directory = copyFixture(name);
+  try {
+    return await body(directory);
+  } finally {
+    cleanup(directory);
+  }
+}
+
+/** The same, in the empty directory `init` turns into a new project. */
+export async function withEmptyDirectory<T>(body: (dir: string) => T | Promise<T>): Promise<T> {
+  const directory = emptyDirectory();
+  try {
+    return await body(directory);
+  } finally {
+    cleanup(directory);
+  }
 }
 export const read = (directory: string, file: string): string =>
   readFileSync(join(directory, file), "utf8");
@@ -43,14 +67,30 @@ export function snapshot(directory: string): Map<string, string> {
 
 /** No downloads and no snapshot in unit tests; vendor is covered on its own. */
 export const offline = { CF_OPEN_AGENTS_API_SKIP_VENDOR: "1" };
+/** No `docker info` either: an unreachable engine is not a rootless one. */
+const noDocker: Runner = () => ({ ok: false, stdout: "", stderr: "no docker engine" });
+
+/**
+ * What every `init` test passes: no prompts, no downloads, no docker call and a fixed
+ * token, so the only variables are the ones a test names in `extra`.
+ */
+export const initOptions = (dir: string, extra: Partial<InitOptions> = {}): InitOptions => ({
+  dir,
+  yes: true,
+  force: false,
+  dryRun: false,
+  env: offline,
+  reporter: silent(),
+  runner: noDocker,
+  token: () => "t".repeat(40),
+  ...extra,
+});
 export const silent = (): Reporter => ({
   intro() {},
   info() {},
-  warn() {},
   spin: (_label, work) => work(),
   note() {},
   plan() {},
-  outro() {},
 });
 
 export interface Manifest {

@@ -3,6 +3,7 @@ import {
   OperationError,
   type RuntimeBatch,
   type RuntimeEvent,
+  type TurnErrorCode,
 } from "cf-open-agents-api";
 import {
   Cause,
@@ -153,31 +154,41 @@ interface JobState {
   readonly events: Chunk.Chunk<RuntimeBatch["events"][number]>;
   readonly bytes: number;
 }
-const terminal = (outcome: Outcome) => outcome.status !== "running" && outcome.status !== "waiting";
+/** The three statuses a job never transitions out of; `running` and `waiting` are the rest. */
+export const terminal = (status: string): boolean =>
+  status === "completed" || status === "cancelled" || status === "failed";
+const settled = (outcome: Outcome) => terminal(outcome.status);
 /**
  * Public turn error codes of the OpenAI Agents API (`SessionTurnError.code` in
- * openai@7.15.0). Supervisors fail a job with one of these; other strings reach
- * the client as `internal_error` with the string as the message.
+ * openai@7.15.0). A job fails with one of these; other strings reach the client as
+ * `internal_error` with the string as the message. The Worker decides the same way
+ * on its side of the wire, so the list is defined once, there.
  */
-export const TURN_ERROR_CODES = [
-  "context_length_exceeded",
-  "session_budget_exceeded",
-  "usage_limit_exceeded",
-  "rate_limit_exceeded",
-  "server_overloaded",
-  "cyber_policy",
-  "connection_failed",
-  "server_error",
-  "authentication_error",
-  "invalid_request",
-  "resource_not_found",
-  "sandbox_error",
-  "executor_version_incompatible",
-  "active_turn_not_steerable",
-  "request_timeout",
-  "internal_error",
-] as const;
-export type TurnErrorCode = (typeof TURN_ERROR_CODES)[number];
+export { TURN_ERROR_CODES, type TurnErrorCode } from "cf-open-agents-api";
+
+/**
+ * The public code for a provider HTTP status, or undefined when the status itself
+ * says nothing and the caller must decide from the message or the transport.
+ *
+ * One table for the three runtimes, which each had a copy differing in one rule:
+ * Claude Code alone mapped 413 to `invalid_request`; OpenCode alone mapped 408 to
+ * `request_timeout` and the remaining 4xx to `invalid_request`; Codex and Claude
+ * Code recognized only 400 and 422 among the 4xx, and Claude Code read 503 as
+ * `server_error` rather than `server_overloaded`. Reading a missing status as
+ * `connection_failed` was OpenCode's rule too, but stays at its call site: only
+ * OpenCode's `APIError` means "the provider never answered" by it.
+ */
+export function statusToTurnCode(status: number | undefined): TurnErrorCode | undefined {
+  if (status === undefined) return undefined;
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 404) return "resource_not_found";
+  if (status === 408) return "request_timeout";
+  if (status === 429) return "rate_limit_exceeded";
+  if (status === 503 || status === 529) return "server_overloaded";
+  if (status >= 500) return "server_error";
+  if (status >= 400) return "invalid_request";
+  return undefined;
+}
 
 /** Retained native events per execution, including streamed deltas and completed items. */
 export const EVENT_LOG_LIMIT = 8_000_000;
@@ -244,7 +255,7 @@ export class JobLog {
   }
   setStatus(status: "running" | "waiting" | "completed" | "cancelled"): void {
     this.update((state) => {
-      if (terminal(state.outcome) || state.closing) return state;
+      if (settled(state.outcome) || state.closing) return state;
       // Once cancellation is requested, a task that finishes because its children
       // were cancelled reads as cancelled, and progress transitions are ignored.
       if (state.cancelling)
@@ -257,12 +268,12 @@ export class JobLog {
   /** Completion can no longer seal the job; events are recorded until `close()`. */
   requestCancel(): void {
     this.update((state) =>
-      terminal(state.outcome) || state.closing ? state : { ...state, cancelling: true },
+      settled(state.outcome) || state.closing ? state : { ...state, cancelling: true },
     );
   }
   fail(error: string): void {
     this.update((state) =>
-      terminal(state.outcome) || state.closing
+      settled(state.outcome) || state.closing
         ? state
         : { ...state, outcome: { status: "failed" as const, error } },
     );
@@ -274,7 +285,7 @@ export class JobLog {
         : {
             ...state,
             closing: true,
-            outcome: terminal(state.outcome) ? state.outcome : { status: "cancelled" as const },
+            outcome: settled(state.outcome) ? state.outcome : { status: "cancelled" as const },
           },
     );
   }
@@ -286,7 +297,7 @@ export class JobLog {
   emit(event: RuntimeEvent): boolean {
     let retained = false;
     this.update((state) => {
-      if (terminal(state.outcome) || state.closing) return state;
+      if (settled(state.outcome) || state.closing) return state;
       const bytes = state.bytes + new TextEncoder().encode(JSON.stringify(event)).byteLength;
       if (bytes > EVENT_LOG_LIMIT)
         return { ...state, outcome: { status: "failed" as const, error: "native_output_limit" } };
@@ -322,7 +333,7 @@ export class JobLog {
       let state = MutableRef.get(this.state);
       if (!Number.isSafeInteger(after) || after < 0 || after > state.events.length)
         return yield* new InvalidCursor();
-      const news = state.events.length > after || terminal(state.outcome);
+      const news = state.events.length > after || settled(state.outcome);
       if (!news && Duration.toMillis(Duration.decode(wait)) > 0) {
         yield* woken.pipe(Effect.timeoutOption(wait));
         state = MutableRef.get(this.state);

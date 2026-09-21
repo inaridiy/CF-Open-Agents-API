@@ -2,6 +2,35 @@
 
 `packages/create-cf-open-agents-api/CHANGELOG.md` is a copy of this file that `prepack` makes; edit this one.
 
+## 0.4.0 (2026-09-21)
+
+### Added
+
+- `deleted(id, object)` and `DeletedResource`, `TURN_ERROR_CODES` and `TurnErrorCode`, `programmaticResultSchema` and `ProgrammaticResult` from the root import. `GET /cf/v1/sessions/{id}/events` takes `limit` (100 rows by default, 1,000 at most).
+- Generated projects: `.cf-open-agents-api/composition.json` records the provider, the runtimes, whether Workers AI was added and a compatible endpoint's base URL and model; a re-run of `init` and `setup` reads it. The harness container accepts `CODEX_CONFIG`, deployment-owned additions to the generated Codex `config.toml`, as JSON.
+
+### Changed
+
+- Turn error codes derived from a provider HTTP status are one table shared by Codex, Claude Code and OpenCode (`statusToTurnCode`), replacing three drifted copies: 401/403 `authentication_error`, 404 `resource_not_found`, 408 `request_timeout`, 429 `rate_limit_exceeded`, 503/529 `server_overloaded`, another 5xx `server_error`, another 4xx `invalid_request`.
+- The demo's settled job page is built by replaying the event log through the same fold the live page uses; the subagents checkbox starts unchecked; the zip download bundles artifacts only up to 32 MiB, and above that cap the job page links each file for a streamed download.
+- `examples/caller`'s `/sdk` route reaches the API through `tenantFetch` instead of the bearer-token path; the bearer-token client remains, exercised directly by the binding tests.
+- `docker/Harness.Dockerfile` installs and builds only `packages/supervisor` and its one workspace dependency, `packages/agent-api`; the CLI's `.cf-open-agents-api/` snapshot follows, holding the library, the supervisor and `docker/` instead of the whole `packages/` tree and `examples/worker/package.json`.
+- The setup CLI: `--dir` is gone in favor of a positional directory argument; `--library`, `--cli-package`, `--ref` and `--source` on `init` are maintainer flags, still accepted but left out of `--help`; the package's `exports["."]` is gone, since nothing imports it; generated projects pin TypeScript `7.0.2`.
+- `SqlStore`'s redundant `transactionSync` method is gone; `transaction` is the one method `Transactional` declares.
+- The supervisor's `/health` and `/stop` routes are gone; nothing called them.
+- `CONNECTION_FAILURE` also matches `socket hang up` and the Anthropic SDK's `network error`.
+
+### Fixed
+
+- Delegated hosted search is resolved once, per delegate, from the target's runtime and model connection, instead of a harness-name rule that both kept it where the connection could not answer and dropped it where the connection could.
+- `create-cf-open-agents-api init` writes nothing when a step refuses: it computes the whole plan against the overlay first and writes once at the end, so a conflict leaves the project exactly as it was, snapshot included. A second `init` in a project with a kept composition follows `composition.json` for the bindings, dependencies and secrets instead of the answers a fresh run would default to, and reports a flag the kept module does not implement instead of half-applying it; `setup` uploads the recorded provider's key together with any provider key already in `.dev.vars`. A kept module that neither a record nor its own markers can attribute decides alone: no record, dependency or secret is added for it.
+- `doctor` and `init` agree on a class introduced through a `renamed_classes` migration onto one that already had SQLite storage; before, a configuration `init` accepted could be reported broken by `doctor`.
+- The artifact content and delete routes answer `503 storage_unavailable` when the deployment has no R2 bucket configured, instead of throwing past the missing binding.
+
+### Internal
+
+- Most of `errors.ts`'s definite failures are now rows of a `DEFINITE` table (tag, status, code, message) instead of hand-written classes; `packages/agent-api/src/bytes.ts` (`sha256Hex`, `readBounded`) and `persistence/record-store.ts`'s page helpers (`eachPage`, `eachRecord`, `mapPage`, `resourcePage`) are shared across call sites that duplicated them; the supervisor's event and id helpers move to `events.ts`.
+
 ## 0.3.0 (2026-09-20)
 
 ### Added

@@ -1,10 +1,40 @@
 import { serve } from "@hono/node-server";
 import { io, runPromise } from "cf-open-agents-api";
-import { Config, Effect } from "effect";
+import { Config, ConfigError, Effect, Either } from "effect";
+import { z } from "zod";
 
 import { createSupervisor } from "./server.js";
 
+/**
+ * Deployment-owned additions to the generated Codex `config.toml`, as JSON:
+ * `{"features":{"flag":true},"provider":{"request_max_retries":0}}`. The gateway's
+ * own URL and auth are reserved; `codex-config.ts` drops those keys.
+ */
+const codexConfigSchema = z.strictObject({
+  features: z.record(z.string(), z.boolean()).optional(),
+  provider: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+});
+// Strict: a misspelled key would otherwise be dropped in silence, and the operator
+// would look for a setting the generated `config.toml` never received.
+const codexConfig = Config.string("CODEX_CONFIG").pipe(
+  Config.withDefault("{}"),
+  Config.mapOrFail((raw) =>
+    Either.try({
+      try: () => JSON.parse(raw) as unknown,
+      catch: (cause) => `not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    }).pipe(
+      Either.flatMap((value) => {
+        const parsed = codexConfigSchema.safeParse(value);
+        return parsed.success
+          ? Either.right(parsed.data)
+          : Either.left(z.prettifyError(parsed.error));
+      }),
+      Either.mapLeft((message) => ConfigError.InvalidData(["CODEX_CONFIG"], message)),
+    ),
+  ),
+);
 const config = Config.all({
+  codexConfig,
   port: Config.integer("PORT").pipe(
     Config.withDefault(8080),
     Config.validate({
@@ -68,4 +98,19 @@ const program = Effect.scoped(
     yield* shutdown;
   }),
 );
-await runPromise(program);
+/** The variable that was wrong and the validator's own complaint, one per failure. */
+function configMessage(error: ConfigError.ConfigError): string {
+  if (ConfigError.isAnd(error) || ConfigError.isOr(error))
+    return `${configMessage(error.left)}; ${configMessage(error.right)}`;
+  const path = error.path.join(".");
+  // `Config.validate` reports no path; its message names the variable itself.
+  return path ? `${path}: ${error.message}` : error.message;
+}
+// A malformed environment is the operator's to fix, so the supervisor names the
+// variable and what was wrong with it and exits, rather than throwing the config
+// error out of the runner as an unhandled rejection with Effect's own frames.
+await runPromise(program).catch((error: unknown) => {
+  if (!ConfigError.isConfigError(error)) throw error;
+  console.error(`supervisor: invalid configuration: ${configMessage(error)}`);
+  process.exitCode = 1;
+});

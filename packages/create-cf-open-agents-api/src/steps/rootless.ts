@@ -1,9 +1,10 @@
 import { join } from "node:path";
 
 import type { Runner, RunResult } from "../exec.js";
-import type { Files } from "../fs.js";
+import { type Files, keepUnlessForce } from "../fs.js";
 import type { StepResult } from "../plan.js";
-import { ROOTLESS_FILES, rootlessFile } from "../templates/rootless.js";
+import { templateFile } from "../templates/files.js";
+import { ROOTLESS_FILES } from "../templates/rootless.js";
 
 /** `docker info` hangs when the daemon socket exists but nobody answers; never wait longer. */
 export const DOCKER_INFO_TIMEOUT_MS = 5000;
@@ -36,16 +37,9 @@ export function detectRootlessDocker(runner: Runner, platform = process.platform
 
 /** Writes the two scripts behind `dev:rootless`; an edited script is kept unless `--force`. */
 export function ensureRootlessDev(files: Files, force: boolean): StepResult[] {
-  return Object.keys(ROOTLESS_FILES).map((file) => {
+  return Object.entries(ROOTLESS_FILES).map(([file, name]) => {
     const path = join(files.root, file);
-    const content = rootlessFile(file);
-    const existing = files.read(path);
-    if (existing !== undefined && existing !== content && !force)
-      return {
-        status: "skipped",
-        file,
-        note: `${file} exists with different content and was kept; --force rewrites it from the template.`,
-      };
-    return files.write(path, content);
+    const content = templateFile("rootless", name);
+    return keepUnlessForce(files, path, content, force) ?? files.write(path, content);
   });
 }

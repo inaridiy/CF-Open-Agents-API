@@ -14,8 +14,9 @@ import type { EnvironmentSpec } from "./environments.js";
 import { encodeRpc, FileExpired, IdempotencyConflict, rpcEnvelope } from "./errors.js";
 import type { StoredInputFile } from "./files.js";
 import { kind } from "./persistence/kind.js";
+import { resourcePage } from "./persistence/record-store.js";
 import type { Agent, PageQuery } from "./protocol.js";
-import { canonicalJSON, identifier, parse, savedAgentSchema } from "./protocol.js";
+import { canonicalJSON, deleted, identifier, parse, savedAgentSchema } from "./protocol.js";
 import type { SessionRecord } from "./session.js";
 import { SkillRepository } from "./skills.js";
 import { SqlStore } from "./storage.js";
@@ -102,7 +103,7 @@ export class CatalogObject extends DurableObject {
       ...(purpose ? { field: "resource.purpose" as const, value: purpose } : {}),
       expiresAfter: Date.now() / 1000,
     });
-    return { ...page, data: page.data.map(({ resource }) => resource) };
+    return resourcePage(page);
   }
   private readonly vaultStore = new VaultRepository(this.db);
   mcpToken(vaultIds: string[], url: string, credentialId?: string | null) {
@@ -158,7 +159,7 @@ export class CatalogObject extends DurableObject {
   }
   templates(query: PageQuery) {
     const page = this.db.list(CatalogKinds.template, query);
-    return { ...page, data: page.data.map(({ resource }) => resource) };
+    return resourcePage(page);
   }
   updateTemplate(id: string, parameters: TemplateConfiguration): EnvironmentTemplate {
     return this.db.transaction(() => {
@@ -177,7 +178,7 @@ export class CatalogObject extends DurableObject {
   deleteTemplate(id: string) {
     this.template(id);
     this.db.remove(CatalogKinds.template, id);
-    return { id, object: "agent.environment.template.deleted" as const, deleted: true };
+    return deleted(id, "agent.environment.template.deleted");
   }
   registerEnvironment(spec: EnvironmentSpec): void {
     this.db.put(CatalogKinds.environment, spec.id, { version: 1, ...spec });
@@ -289,7 +290,7 @@ export class CatalogObject extends DurableObject {
       this.db.remove(CatalogKinds.agentKey, index.key);
       this.db.remove(CatalogKinds.agentKeyIndex, id);
     });
-    return { id, object: "agent.deleted" as const, deleted: true };
+    return deleted(id, "agent.deleted");
   }
   updateAgent(id: string, input: Partial<z.infer<typeof savedAgentSchema>>): Agent {
     return this.db.transaction(() => {

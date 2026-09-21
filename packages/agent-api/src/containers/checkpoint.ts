@@ -1,6 +1,7 @@
 import { getSandbox } from "@cloudflare/sandbox";
 import { Effect } from "effect";
 
+import { sha256Hex } from "../bytes.js";
 import { io } from "../effect.js";
 import {
   ArtifactLimitExceeded,
@@ -43,14 +44,9 @@ const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Ex
     const created_at = Math.floor(Date.now() / 1000);
     manifest = yield* Effect.forEach(files, (file) =>
       Effect.map(
-        io("artifact.hash", () =>
-          crypto.subtle.digest(
-            "SHA-256",
-            new TextEncoder().encode(`${execution.turnId}\0${file.absolutePath}`),
-          ),
-        ),
+        io("artifact.hash", () => sha256Hex(`${execution.turnId}\0${file.absolutePath}`)),
         (hash) => {
-          const id = `artifact_${Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+          const id = `artifact_${hash}`;
           return {
             id,
             key: `artifacts/${execution.sessionId}/${id}`,

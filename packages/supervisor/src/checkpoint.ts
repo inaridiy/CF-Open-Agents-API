@@ -2,7 +2,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { io, type ServiceError } from "cf-open-agents-api";
-import { Context, Data, Effect, Layer, Ref, Schema } from "effect";
+import { Data, Effect, Schema } from "effect";
 
 import { Buffer } from "./buffer.js";
 
@@ -44,14 +44,6 @@ export type CheckpointError =
   | CheckpointTooLarge
   | InvalidCheckpointPath
   | InvalidCheckpoint;
-class CheckpointFiles extends Context.Tag("supervisor/CheckpointFiles")<
-  CheckpointFiles,
-  {
-    readonly list: (path: string) => ReturnType<typeof list>;
-    readonly read: (path: string) => ReturnType<typeof read>;
-    readonly write: (path: string, data: Uint8Array) => ReturnType<typeof write>;
-  }
->() {}
 const list = (path: string) => io("checkpoint.list", () => readdir(path, { withFileTypes: true }));
 const read = (path: string) => io("checkpoint.read", () => readFile(path));
 const write = (path: string, data: Uint8Array) =>
@@ -59,7 +51,6 @@ const write = (path: string, data: Uint8Array) =>
     yield* io("checkpoint.mkdir", () => mkdir(join(path, ".."), { recursive: true }));
     yield* io("checkpoint.write", () => writeFile(path, data, { mode: 0o600 }));
   });
-const files = Layer.succeed(CheckpointFiles, { list, read, write });
 const excluded = new Set([
   "config.toml",
   "environments.toml",
@@ -78,38 +69,32 @@ export function capture(
   home: string,
   threadId: string,
 ): Effect.Effect<NativeBundle, CheckpointTooLarge | ServiceError> {
-  const program = Effect.gen(function* () {
-    const fs = yield* CheckpointFiles;
-    const state = yield* Ref.make({ bytes: 0, files: {} });
-    const visit = (
-      relative: string,
-    ): Effect.Effect<void, CheckpointTooLarge | ServiceError, CheckpointFiles> =>
+  return Effect.gen(function* () {
+    // The walk owns this accumulator for its whole run: one fiber, no sharing, and
+    // an entry costs one insertion rather than a copy of every entry before it.
+    const captured = new Map<string, string>();
+    let bytes = 0;
+    const visit = (relative: string): Effect.Effect<void, CheckpointTooLarge | ServiceError> =>
       Effect.gen(function* () {
-        for (const entry of yield* fs.list(join(home, relative))) {
+        for (const entry of yield* list(join(home, relative))) {
           if (excluded.has(entry.name)) continue;
           const path = relative ? `${relative}/${entry.name}` : entry.name;
           if (entry.isDirectory()) yield* visit(path);
           else if (entry.isFile()) {
-            const data = yield* fs.read(join(home, path));
-            const current = yield* Ref.get(state);
-            const bytes = current.bytes + data.length;
+            const data = yield* read(join(home, path));
+            bytes += data.length;
             if (bytes > MAX_BYTES) return yield* new CheckpointTooLarge({ path });
-            yield* Ref.set(state, {
-              bytes,
-              files: { ...current.files, [path]: Buffer.from(data).toString("base64") },
-            });
+            captured.set(path, Buffer.from(data).toString("base64"));
           }
         }
       });
     yield* visit("");
-    return { version: 1 as const, threadId, files: (yield* Ref.get(state)).files };
+    return { version: 1 as const, threadId, files: Object.fromEntries(captured) };
   });
-  return program.pipe(Effect.provide(files));
 }
 
 export function restore(home: string, value: unknown): Effect.Effect<string, CheckpointError> {
   return Effect.gen(function* () {
-    const fs = yield* CheckpointFiles;
     const invalid = (error: { readonly message: string }) =>
       new InvalidCheckpoint({ issues: error.message });
     const bundle = yield* Schema.decodeUnknown(bundleSchema, { onExcessProperty: "error" })(
@@ -134,9 +119,9 @@ export function restore(home: string, value: unknown): Effect.Effect<string, Che
         return { path, data };
       }),
     );
-    yield* Effect.forEach(entries, ({ path, data }) => fs.write(join(home, path), data), {
+    yield* Effect.forEach(entries, ({ path, data }) => write(join(home, path), data), {
       discard: true,
     });
     return bundle.threadId;
-  }).pipe(Effect.provide(files));
+  });
 }

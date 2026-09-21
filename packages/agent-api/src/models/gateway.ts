@@ -1,8 +1,9 @@
 import { Context, Effect, Layer } from "effect";
 
+import { readBounded } from "../bytes.js";
 import { attempt, io, runPromise, type ServiceError } from "../effect.js";
 import { ModelNotFound, ModelProtocolMismatch, projectApiError } from "../errors.js";
-import { requestWithoutRedirect } from "../http.js";
+import { isRedirect, requestWithoutRedirect } from "../http.js";
 import { readModelBodyEffect } from "./body.js";
 
 /** A single model request. The native harness owns the agent loop and its tools. */
@@ -25,8 +26,7 @@ export function fetchWithoutRedirect(
 ): typeof globalThis.fetch {
   return async (input, init) => {
     const response = await send(input, { ...init, redirect: "manual" });
-    if (response.status >= 300 && response.status < 400) {
-      await response.body?.cancel().catch(() => {});
+    if (await isRedirect(response)) {
       return Response.json(
         {
           error: { type: "upstream_redirect", message: "Configured upstream returned a redirect" },
@@ -40,28 +40,13 @@ export function fetchWithoutRedirect(
 
 const PROVIDER_ERROR_LIMIT = 64 * 1024;
 const SECRET_PATTERN = /\b[A-Za-z]{1,8}-[A-Za-z0-9_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,}/g;
-async function readBounded(response: Response, limit: number): Promise<string> {
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  try {
-    while (text.length < limit) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      text += decoder.decode(chunk.value as Uint8Array, { stream: true });
-    }
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-  return text.slice(0, limit);
-}
 /**
  * Provider error bodies can echo request headers, including masked keys. Keep the
  * status, the structured error fields and Retry-After; drop everything else.
  */
 export async function sanitizeProviderError(response: Response): Promise<Response> {
-  const text = await readBounded(response, PROVIDER_ERROR_LIMIT);
+  const { bytes } = await readBounded(response.body, PROVIDER_ERROR_LIMIT);
+  const text = new TextDecoder().decode(bytes);
   let error: Record<string, unknown> = {};
   try {
     const parsed: unknown = JSON.parse(text);

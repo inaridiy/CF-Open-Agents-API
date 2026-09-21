@@ -3,9 +3,11 @@ import { join } from "node:path";
 import type { Files } from "../fs.js";
 import { openJsonc, parseJsonc, setValue } from "../jsonc.js";
 import type { StepResult } from "../plan.js";
-import { DEMO_FILES, demoFile } from "../templates/demo.js";
+import { DEMO_FILES } from "../templates/demo.js";
+import { templateFile } from "../templates/files.js";
 import {
   gitignoreSkeleton,
+  JSX_OPTIONS,
   packageSkeleton,
   type SkeletonInput,
   type Template,
@@ -31,15 +33,10 @@ export function ensureStandaloneSkeleton(options: StandaloneOptions): StepResult
     write(".gitignore", gitignoreSkeleton()),
   ];
   if (options.template === "demo")
-    for (const file of Object.keys(DEMO_FILES)) results.push(write(file, demoFile(file)));
+    for (const [file, name] of Object.entries(DEMO_FILES))
+      results.push(write(file, templateFile("demo", name)));
   return results;
 }
-
-/** The compiler options `hono/jsx` needs; without them the Worker throws `React is not defined`. */
-const JSX_OPTIONS: Readonly<Record<string, string>> = {
-  jsx: "react-jsx",
-  jsxImportSource: "hono/jsx",
-};
 
 interface TsConfig {
   compilerOptions?: Record<string, unknown>;

@@ -22,7 +22,7 @@ import { defineAgentWorker } from "../../packages/agent-api/src/worker.js";
 
 /** Compile-time regressions for the synchronous persistence boundary and state machine. */
 export function stateContracts(db: SqlStore, repo: SessionRepo, record: SessionRecord) {
-  // @ts-expect-error A suspended callback cannot participate in transactionSync.
+  // @ts-expect-error A suspended callback cannot participate in a store transaction.
   void db.transaction(async () => 1);
   // @ts-expect-error Constructing an Effect is not executing a synchronous transaction.
   const suspended = db.transaction(() => Effect.succeed(1));

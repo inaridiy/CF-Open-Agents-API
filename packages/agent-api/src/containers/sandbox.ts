@@ -53,7 +53,7 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
   }
 }
 /** The stub `getSandbox` returns: `ISandbox` plus the container lifecycle (destroy, restore). */
-export type LiveSandbox = ReturnType<typeof getSandbox<SandboxContainer>>;
+type LiveSandbox = ReturnType<typeof getSandbox<SandboxContainer>>;
 
 /** Record the workspace the live filesystem holds, inside the container and durably. */
 export function rememberSandbox(sandbox: ISandbox, state: SandboxState) {
@@ -70,7 +70,7 @@ export function rememberSandbox(sandbox: ISandbox, state: SandboxState) {
   });
 }
 /** True when the running sandbox provably holds `workspaceId`; any doubt means restore. */
-export function sandboxHolds(sandbox: ISandbox, sessionId: string, workspaceId: string) {
+function sandboxHolds(sandbox: ISandbox, sessionId: string, workspaceId: string) {
   return Effect.gen(function* () {
     const env = yield* HarnessBindings;
     const state = yield* read((tx) => tx.sandbox());

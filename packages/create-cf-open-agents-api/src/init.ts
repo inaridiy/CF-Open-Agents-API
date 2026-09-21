@@ -1,12 +1,19 @@
 import { dirname, join, resolve } from "node:path";
 
 import { collectAnswers, type InitAnswers, type InitPreferences } from "./answers.js";
+import {
+  type CompositionRecord,
+  ensureCompositionRecord,
+  inferCompositionRecord,
+  parseCompositionRecord,
+  recordPath,
+} from "./composition-record.js";
 import { installCommand, packageManagerExec, run, type Runner } from "./exec.js";
-import { Files } from "./fs.js";
+import { display, Files } from "./fs.js";
 import { parseJsonc } from "./jsonc.js";
-import { CliError, Plan } from "./plan.js";
+import { CliError, Plan, type StepResult } from "./plan.js";
 import { locateProject, type Project, type WranglerConfig } from "./project.js";
-import { ensureAgentsFile } from "./steps/agents-file.js";
+import { type AgentsFile, ensureAgentsFile } from "./steps/agents-file.js";
 import { ensureDevVars, ensureDevVarsExample } from "./steps/dev-vars.js";
 import { ensureEntryExports } from "./steps/entry.js";
 import { ensureGitignore } from "./steps/gitignore.js";
@@ -15,7 +22,7 @@ import { ensurePnpmBuilds } from "./steps/pnpm-builds.js";
 import { detectRootlessDocker, ensureRootlessDev } from "./steps/rootless.js";
 import { ensureStandaloneSkeleton } from "./steps/standalone.js";
 import { ensureTsconfigExclude } from "./steps/tsconfig.js";
-import { ensureVendor } from "./steps/vendor.js";
+import { stageVendor, type StagedVendor } from "./steps/vendor.js";
 import { upsertWranglerConfig } from "./steps/wrangler.js";
 import {
   type CompositionInput,
@@ -96,8 +103,56 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
     project.mode === "retrofit" ? readConfig(files, project).config.name : undefined;
   // The docker call is skipped when a flag already decided.
   const rootlessDocker = options.rootless === undefined && detectRootlessDocker(runner);
-  const answers = await collectAnswers(project, configName, options, prompter, { rootlessDocker });
+  const recorded = existingComposition(files, project, options);
+  const answers = await collectAnswers(project, configName, recall(options, recorded), prompter, {
+    rootlessDocker,
+  });
   const plan = new Plan();
+  if (recorded)
+    plan.note(
+      `The existing composition decided the model provider (${recorded.provider}) and the runtimes (${recorded.harnesses.join(", ")}); --provider and --harnesses change them, --force rewrites the module.`,
+    );
+  const context: Run = { files, project, answers, recorded, options, plan };
+  const staged = await vendor(options, root, reporter);
+  const agentsPath = apply(context, staged);
+  if (answers.install && !options.dryRun) await install(project, reporter, runner);
+  reporter.note(nextSteps(project, answers, agentsPath), "Next steps");
+  reporter.plan(plan, options.dryRun ? "Dry run: nothing was written" : "Done");
+  return { project, answers, plan, agentsPath };
+}
+
+interface Run {
+  files: Files;
+  project: Project;
+  answers: InitAnswers;
+  recorded: CompositionRecord | undefined;
+  options: InitOptions;
+  plan: Plan;
+}
+
+/**
+ * Computes every change against the overlay, then writes once. A conflict any step refuses
+ * therefore leaves the project exactly as it was, snapshot included.
+ */
+function apply(context: Run, staged: StagedVendor): string {
+  try {
+    const agentsPath = planChanges(context, staged.result);
+    context.files.flush();
+    staged.commit?.();
+    return agentsPath;
+  } finally {
+    staged.release();
+  }
+}
+
+/**
+ * Every step, in order, against the overlay; returns the path of the composition module.
+ * The composition module is decided first because everything else follows the composition
+ * the project ends up with, not the answers a fresh run would render: a kept module would
+ * otherwise get bindings, packages and secrets from flags it does not implement.
+ */
+function planChanges(context: Run, snapshot: StepResult): string {
+  const { files, project, answers, recorded, options, plan } = context;
   if (project.mode === "standalone")
     for (const result of ensureStandaloneSkeleton({
       files,
@@ -106,13 +161,21 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
       template: answers.template,
     }))
       plan.add(result);
-  plan.add(await vendor(options, root, reporter));
+  plan.add(snapshot);
   const config = readConfig(files, project).config;
-  const entryPath = resolve(root, config.main ?? ENTRY_FILES.minimal);
+  const entryPath = resolve(files.root, config.main ?? ENTRY_FILES.minimal);
   const inEntry = compositionInEntry(files, project, answers, entryPath);
-  configureWrangler(files, project, answers, options, plan, !inEntry);
-  const { agentsPath, composition } = compose(files, entryPath, inEntry, answers, options, plan);
-  const secret = describeSecret(composition);
+  const agents = compose(files, entryPath, inEntry, answers, recorded, options);
+  const composition = agents.composition;
+  configureWrangler(files, project, answers, composition, options, plan, !inEntry);
+  plan.add(agents.result);
+  // The demo entry already re-exports the classes, so this is a skip there.
+  if (!inEntry) plan.add(ensureEntryExports(files, entryPath, agents.agentsPath));
+  if (agents.kept)
+    for (const note of contradictions(files, agents.agentsPath, answers, composition))
+      plan.note(note);
+  if (composition) plan.add(ensureCompositionRecord(files, composition));
+  const secret = composition && describeSecret(composition);
   plan.add(ensureDevVars({ files, secret, token: options.token }));
   plan.add(ensureDevVarsExample({ files, secret }));
   plan.add(ensureGitignore(files));
@@ -121,10 +184,43 @@ export async function runInit(options: InitOptions): Promise<InitResult> {
   if (answers.rootless)
     for (const result of ensureRootlessDev(files, options.force)) plan.add(result);
   if (project.mode === "retrofit") plan.add(ensureTsconfigExclude(files));
-  if (answers.install && !options.dryRun) await install(project, reporter, runner);
-  reporter.note(nextSteps(project, answers, agentsPath), "Next steps");
-  reporter.plan(plan, options.dryRun ? "Dry run: nothing was written" : "Done");
-  return { project, answers, plan, agentsPath };
+  return agents.agentsPath;
+}
+
+/**
+ * What this run was told to build that the module it kept does not have. The module wins —
+ * half-applying a flag would write a binding, a package or a secret for a composition the
+ * Worker never loads — so the disagreement is reported instead.
+ */
+function contradictions(
+  files: Files,
+  agentsPath: string,
+  answers: InitAnswers,
+  composition: CompositionInput | undefined,
+): string[] {
+  if (!composition) return [];
+  const asked: string[] = [];
+  if (composition.provider !== answers.provider)
+    asked.push(`provider ${answers.provider} (the module uses ${composition.provider})`);
+  const harnesses = answers.harnesses.join(", ");
+  const kept = composition.harnesses.join(", ");
+  if (harnesses !== kept) asked.push(`runtimes ${harnesses} (the module has ${kept})`);
+  if (answers.workersAi !== composition.workersAi)
+    asked.push(
+      answers.workersAi
+        ? "a Workers AI preset (the module has none)"
+        : "no Workers AI preset (the module has one)",
+    );
+  for (const [field, wanted, have] of [
+    ["base URL", answers.baseURL, composition.baseURL],
+    ["model", answers.model, composition.model],
+  ] as const)
+    if (wanted !== undefined && have !== undefined && wanted !== have)
+      asked.push(`${field} ${wanted} (the module uses ${have})`);
+  if (asked.length === 0) return [];
+  return [
+    `${display(files.root, agentsPath)} was kept, so it decides the composition: this run asked for ${asked.join("; ")}. Nothing was applied from those answers; --force regenerates the module instead.`,
+  ];
 }
 
 async function confirmNewProject(project: Project, prompter: Prompter): Promise<void> {
@@ -151,10 +247,16 @@ function compositionInEntry(
   return /defineAgentWorker[<(]/.test(files.read(entryPath) ?? "");
 }
 
+/**
+ * `workersAi` follows the composition in use, not the answers: the `AI` binding exists for
+ * the presets the module declares, and an unattributed module gets none added on its say-so.
+ * `codeLoader` is a binding the composition does not record, so the answer decides it.
+ */
 function configureWrangler(
   files: Files,
   project: Project,
   answers: InitAnswers,
+  composition: CompositionInput | undefined,
   options: InitOptions,
   plan: Plan,
   agentsBinding: boolean,
@@ -165,46 +267,89 @@ function configureWrangler(
     {
       name: answers.name,
       agentsBinding,
-      workersAi: answers.workersAi || answers.provider === "workers-ai",
+      workersAi:
+        composition !== undefined &&
+        (composition.workersAi || composition.provider === "workers-ai"),
       codeLoader: answers.codeLoader,
       force: options.force,
     },
-    project.configPath.slice(project.root.length + 1),
+    display(project.root, project.configPath),
   );
   plan.add(files.write(project.configPath, outcome.text));
   for (const note of outcome.notes) plan.note(note);
 }
 
+/**
+ * The composition a re-run must keep answering with: what an earlier run recorded, or, for a
+ * project generated before the record existed, what the module on disk still says.
+ */
+function existingComposition(
+  files: Files,
+  project: Project,
+  options: InitOptions,
+): CompositionRecord | undefined {
+  const fromRecord = parseCompositionRecord(files.read(recordPath(project.root)));
+  if (fromRecord || project.mode === "standalone") return fromRecord;
+  const entryPath = resolve(
+    project.root,
+    readConfig(files, project).config.main ?? ENTRY_FILES.minimal,
+  );
+  const agentsPath = resolve(
+    project.root,
+    options.agentsFile ?? join(dirname(entryPath), "agents.ts"),
+  );
+  return (
+    inferCompositionRecord(files.read(agentsPath)) ?? inferCompositionRecord(files.read(entryPath))
+  );
+}
+
+/** Flags win; otherwise the questions about the composition are answered by what it already is. */
+function recall(options: InitOptions, recorded: CompositionRecord | undefined): InitPreferences {
+  if (!recorded) return options;
+  return {
+    ...options,
+    provider: options.provider ?? recorded.provider,
+    harnesses: options.harnesses ?? recorded.harnesses,
+    workersAi: options.workersAi ?? recorded.workersAi,
+    baseURL: options.baseURL ?? recorded.baseURL,
+    model: options.model ?? recorded.model,
+  };
+}
+
+/** Writes or keeps the composition module; nothing is added to the plan, the caller orders it. */
 function compose(
   files: Files,
   entryPath: string,
   inEntry: boolean,
   answers: InitAnswers,
+  recorded: CompositionRecord | undefined,
   options: InitOptions,
-  plan: Plan,
-): { agentsPath: string; composition: CompositionInput } {
+): AgentsFile & { agentsPath: string } {
   const agentsPath = inEntry
     ? entryPath
     : resolve(files.root, options.agentsFile ?? join(dirname(entryPath), "agents.ts"));
-  const composition: CompositionInput = {
-    provider: answers.provider,
-    harnesses: answers.harnesses,
-    workersAi: answers.workersAi,
-    baseURL: answers.baseURL,
-    model: answers.model,
-    standalone: inEntry,
-  };
-  plan.add(ensureAgentsFile(files, agentsPath, composition, options.force));
-  // The demo entry already re-exports the classes, so this is a skip there.
-  if (!inEntry) plan.add(ensureEntryExports(files, entryPath, agentsPath));
-  return { agentsPath, composition };
+  const agents = ensureAgentsFile(
+    files,
+    agentsPath,
+    {
+      provider: answers.provider,
+      harnesses: answers.harnesses,
+      workersAi: answers.workersAi,
+      baseURL: answers.baseURL,
+      model: answers.model,
+      standalone: inEntry,
+    },
+    recorded,
+    options.force,
+  );
+  return { ...agents, agentsPath };
 }
 
 function manifestChanges(
   files: Files,
   project: Project,
   answers: InitAnswers,
-  composition: CompositionInput,
+  composition: CompositionInput | undefined,
   options: InitOptions,
 ): PackageJsonOptions {
   const demo = project.mode === "standalone" && answers.template === "demo";
@@ -214,7 +359,7 @@ function manifestChanges(
     dependencies: {
       [LIBRARY_NAME]: fileDependency(options.library, CLI_VERSION),
       ...PEER_VERSIONS,
-      ...providerPackages(composition),
+      ...(composition ? providerPackages(composition) : {}),
       ...(demo ? DEMO_VERSIONS : {}),
     },
     devDependencies: {
@@ -230,11 +375,11 @@ function manifestChanges(
   };
 }
 
-function vendor(options: InitOptions, root: string, reporter: Reporter) {
+function vendor(options: InitOptions, root: string, reporter: Reporter): Promise<StagedVendor> {
   return reporter.spin(
     "Fetching the Docker image snapshot",
     () =>
-      ensureVendor({
+      stageVendor({
         root,
         version: CLI_VERSION,
         ref: options.ref,
@@ -245,7 +390,7 @@ function vendor(options: InitOptions, root: string, reporter: Reporter) {
         runner: options.runner,
         env: options.env,
       }),
-    (result) => `Image snapshot ${result.status}`,
+    (staged) => `Image snapshot ${staged.result.status}`,
   );
 }
 
@@ -259,16 +404,14 @@ export function readConfig(
 }
 
 async function install(project: Project, reporter: Reporter, runner: Runner): Promise<void> {
-  const [command = "npm", ...args] = installCommand(project.packageManager).split(" ");
+  const [command = "npm", ...args] = installCommand(project.packageManager);
+  const described = installCommand(project.packageManager).join(" ");
   const result = await reporter.spin(
-    `Running ${installCommand(project.packageManager)}`,
+    `Running ${described}`,
     () => Promise.resolve(runner(command, args, { cwd: project.root })),
     (outcome) => (outcome.ok ? "Dependencies installed" : "Install failed"),
   );
-  if (!result.ok)
-    throw new CliError(
-      `${installCommand(project.packageManager)} failed:\n${result.stderr.trim()}`,
-    );
+  if (!result.ok) throw new CliError(`${described} failed:\n${result.stderr.trim()}`);
 }
 
 function firstPreset(answers: InitAnswers): string {
@@ -287,7 +430,7 @@ function firstUse(project: Project, answers: InitAnswers): string {
 
 function nextSteps(project: Project, answers: InitAnswers, agentsPath: string): string {
   const exec = packageManagerExec(project.packageManager).join(" ");
-  const composition = agentsPath.slice(project.root.length + 1);
+  const composition = display(project.root, agentsPath);
   const runScript = (name: string) =>
     project.packageManager === "npm" ? `npm run ${name}` : `${project.packageManager} ${name}`;
   const devCommand =
@@ -302,7 +445,7 @@ function nextSteps(project: Project, answers: InitAnswers, agentsPath: string): 
       ? " The deployed demo has no login: anyone with its workers.dev URL can create sessions on your account, so put Cloudflare Access in front of it or replace the page with your own auth (workers_dev: false in wrangler.jsonc keeps it reachable through Service Bindings only)."
       : "";
   return [
-    `1. ${installCommand(project.packageManager)}  (postinstall keeps the image snapshot current)`,
+    `1. ${installCommand(project.packageManager).join(" ")}  (postinstall keeps the image snapshot current)`,
     `2. ${exec} wrangler login  (the AI binding and deployments need your account)`,
     `3. Start Docker, then ${dev}; the first image build takes several minutes.`,
     `4. ${firstUse(project, answers)}`,

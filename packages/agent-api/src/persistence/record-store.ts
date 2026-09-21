@@ -1,3 +1,5 @@
+import type { Effect } from "effect";
+
 import type { AgentSessionEvent, PageQuery } from "../protocol.js";
 import type { Kind } from "./kind.js";
 
@@ -8,7 +10,7 @@ export interface Page<A> {
   first_id: string | null;
   last_id: string | null;
 }
-export type ListField =
+type ListField =
   | "agent_id"
   | "environment_id"
   | "turn_id"
@@ -46,7 +48,58 @@ export interface RecordStore {
   purge(): void;
 }
 
-/** Whatever runs a synchronous closure atomically: DO storage, or a fake with rollback. */
+/** The page size every internal walk reads; a public listing sets its own limit. */
+const WALK_PAGE = 100;
+/**
+ * Every page of `kind` under `filter`, in ascending id order. The cursor walk lives here
+ * once: a caller that folds a page at a time (a transcript, a batch of uploads) takes
+ * `eachPage`, and one that only needs the records takes `eachRecord`.
+ */
+export function* eachPage<A>(
+  store: Pick<RecordStore, "list">,
+  kind: Kind<A>,
+  filter?: ListFilter,
+): Generator<A[]> {
+  let after: string | undefined;
+  do {
+    const page = store.list(kind, { order: "asc", limit: WALK_PAGE, after }, filter);
+    yield page.data;
+    after = page.has_more ? (page.last_id ?? undefined) : undefined;
+  } while (after);
+}
+/** The same walk, record by record. */
+export function* eachRecord<A>(
+  store: Pick<RecordStore, "list">,
+  kind: Kind<A>,
+  filter?: ListFilter,
+): Generator<A> {
+  for (const page of eachPage(store, kind, filter)) yield* page;
+}
+/** A stored page projected through `f`; the cursor fields are the store's, never rebuilt. */
+export const mapPage = <A, B>(page: Page<A>, f: (row: A) => B): Page<B> => ({
+  ...page,
+  data: page.data.map(f),
+});
+/** The common projection: rows stored as `{ resource }` envelopes answer as the resource. */
+export const resourcePage = <A>(page: Page<{ resource: A }>): Page<A> =>
+  mapPage(page, ({ resource }) => resource);
+/** No rows at all, for a filter the store cannot express because nothing is stored. */
+export const emptyPage = <A>(): Page<A> => ({
+  object: "list",
+  data: [],
+  has_more: false,
+  first_id: null,
+  last_id: null,
+});
+
+/** A synchronous result: returning a Promise or an Effect from the seam is a type error. */
+export type Sync<A> = A &
+  (A extends PromiseLike<unknown> | Effect.Effect<unknown, unknown, unknown> ? never : unknown);
+
+/**
+ * Whatever runs a synchronous closure atomically: DO storage, or a fake with rollback.
+ * One name for it, `transaction`, which the lint plugin knows as a transaction callback.
+ */
 export interface Transactional {
-  transactionSync<A>(closure: () => A): A;
+  transaction<A>(closure: () => Sync<A>): A;
 }

@@ -1,16 +1,23 @@
 import { join, resolve } from "node:path";
 
-import { packageManagerExec, run, type Runner, type RunResult } from "./exec.js";
+import { run, type Runner, type RunResult } from "./exec.js";
 import { readIfExists } from "./fs.js";
 import { parseJsonc } from "./jsonc.js";
 import { locateProject, type Project, readManifest, type WranglerConfig } from "./project.js";
 import { parseDevVars } from "./steps/dev-vars.js";
 import { DOCKER_INFO_TIMEOUT_MS, dockerInfo, rootlessEngine } from "./steps/rootless.js";
 import { readVendorManifest, type VendorManifest } from "./steps/vendor.js";
-import { BUCKETS, CONTAINERS, DURABLE_OBJECTS } from "./steps/wrangler.js";
+import {
+  BUCKETS,
+  classOrigin,
+  CONTAINERS,
+  DURABLE_OBJECTS,
+  isSqliteClass,
+} from "./steps/wrangler.js";
 import { ROOTLESS_SCRIPT_NAME } from "./templates/rootless.js";
 import { MINIMUM_TOKEN_LENGTH } from "./token.js";
 import { CLI_NAME, CLI_VERSION, CTX_EXPORTS_DATE, TOOLCHAIN_VERSIONS } from "./versions.js";
+import { wranglerFor } from "./wrangler-cli.js";
 
 export interface Check {
   name: string;
@@ -66,6 +73,17 @@ function storageChecks(config: WranglerConfig): Check[] {
   return checks;
 }
 
+/** Which migration gives the class its SQLite storage, or what it has instead. */
+function sqliteDetail(config: WranglerConfig, className: string): string {
+  const origin = classOrigin(config.migrations ?? [], className);
+  if (!origin) return "not in new_sqlite_classes";
+  if (origin.className === className)
+    return origin.storage === "sqlite" ? "new_sqlite_classes" : "new_classes";
+  return origin.storage === "sqlite"
+    ? "renamed_classes"
+    : `renamed from ${origin.className}, which is in new_classes`;
+}
+
 function objectChecks(config: WranglerConfig): Check[] {
   const checks: Check[] = [];
   for (const object of DURABLE_OBJECTS) {
@@ -78,15 +96,11 @@ function objectChecks(config: WranglerConfig): Check[] {
         binding ? `class ${binding.class_name ?? "?"}` : "missing",
       ),
     );
-    const sqlite =
-      config.migrations?.some((migration) =>
-        migration.new_sqlite_classes?.includes(object.class_name),
-      ) ?? false;
     checks.push(
       check(
         `migrations.${object.class_name}`,
-        sqlite,
-        sqlite ? "new_sqlite_classes" : "not in new_sqlite_classes",
+        isSqliteClass(config, object.class_name),
+        sqliteDetail(config, object.class_name),
       ),
     );
   }
@@ -158,22 +172,19 @@ export function devVarsCheck(text: string | undefined): Check {
 }
 
 function toolChecks(project: Project, runner: Runner): Check[] {
-  const exec = packageManagerExec(project.packageManager);
-  const wrangler = runner(exec[0] ?? "npx", [...exec.slice(1), "wrangler", "--version"], {
-    cwd: project.root,
-  });
-  const version = /(\d+\.\d+\.\d+)/.exec(wrangler.stdout)?.[1];
+  // These ask wrangler about itself and the account, so they name no configuration.
+  const wrangler = wranglerFor(project, runner, false);
+  const versionCall = wrangler(["--version"]);
+  const version = /(\d+\.\d+\.\d+)/.exec(versionCall.stdout)?.[1];
   // One call, bounded by a timeout, answers both the engine and the rootless check.
   const docker = dockerInfo(runner, project.root);
-  const whoami = runner(exec[0] ?? "npx", [...exec.slice(1), "wrangler", "whoami"], {
-    cwd: project.root,
-  });
+  const whoami = wrangler(["whoami"]);
   const loggedIn =
     whoami.ok && !/not authenticated|not logged in/i.test(whoami.stdout + whoami.stderr);
   return [
     check(
       "wrangler",
-      wrangler.ok && version !== undefined,
+      versionCall.ok && version !== undefined,
       version
         ? `${version} (this CLI was tested with ${TOOLCHAIN_VERSIONS.wrangler})`
         : "not installed",

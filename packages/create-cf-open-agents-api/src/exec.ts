@@ -54,6 +54,7 @@ export function packageManagerExec(manager: PackageManager): readonly string[] {
   }
 }
 
-export function installCommand(manager: PackageManager): string {
-  return `${manager} install`;
+/** The argv that installs the project's dependencies, for running and for printing. */
+export function installCommand(manager: PackageManager): readonly string[] {
+  return [manager, "install"];
 }

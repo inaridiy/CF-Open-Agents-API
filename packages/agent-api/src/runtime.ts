@@ -72,7 +72,7 @@ export const checkpointSchema = Schema.Struct({
   ),
 });
 /** Gateway names a Claude Code session resolves the `haiku`, `sonnet` and `opus` aliases to. */
-export const modelTiersSchema = Schema.Struct({
+const modelTiersSchema = Schema.Struct({
   haiku: Schema.optional(Schema.String),
   sonnet: Schema.optional(Schema.String),
   opus: Schema.optional(Schema.String),
@@ -103,6 +103,11 @@ export const executionSchema = Schema.Struct({
         harness: Schema.String,
         model: Schema.String,
         tiers: Schema.optional(modelTiersSchema),
+        /**
+         * Hosted search resolved once for this target, by the same rule a session's own
+         * tools pass (`hostedWebSearch`): the child keeps a `web_search` tool only here.
+         */
+        webSearch: Schema.optional(Schema.Boolean),
       }),
     ),
   ),

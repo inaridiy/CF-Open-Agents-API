@@ -29,3 +29,6 @@ packages/create-cf-open-agents-api/test/.tmp-*/
 
 # Agent lane worktrees (multi-agent-worktree-hygiene)
 .claude/worktrees/
+
+# The setup CLI ships examples/demo as its demo template; the build copies it there.
+packages/create-cf-open-agents-api/templates/demo/

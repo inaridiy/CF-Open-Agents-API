@@ -2,6 +2,7 @@ import {
   type Execution,
   type JsonValue,
   programmaticInputSchema,
+  programmaticResultSchema,
   workspaceTools,
 } from "cf-open-agents-api";
 import { Data } from "effect";
@@ -64,13 +65,7 @@ export async function executeCode(
     signal,
   });
   if (!response.ok) throw new CodeRunnerUnavailable({ status: response.status });
-  return z
-    .object({
-      content: z.array(z.object({ type: z.literal("text"), text: z.string() })),
-      isError: z.boolean(),
-      terminal: z.boolean().optional(),
-    })
-    .parse(await response.json());
+  return programmaticResultSchema.parse(await response.json());
 }
 export function functionArguments(execution: Execution, name: string, args: unknown): JsonValue {
   if (!codeEnabled(execution)) throw new CodeExecutionDisabled();
@@ -85,3 +80,14 @@ export const codeToolNames = (execution: Execution): string[] => [
   ...(execution.agent.tools ?? []).flatMap((tool) => (tool.type === "function" ? [tool.name] : [])),
   ...(execution.sandbox ? Object.keys(workspaceTools) : []),
 ];
+
+/**
+ * Code that returned while client function calls it raised are still unanswered left
+ * side effects nobody can observe, and so did code that reported itself terminal. The
+ * count of outstanding calls is the caller's: `ToolJob` counts only the calls this
+ * invocation raised, Codex every code call the turn has open.
+ */
+export const codeLeftCallsOpen = (
+  result: { readonly terminal?: boolean; readonly isError: boolean },
+  outstanding: number,
+): boolean => result.terminal === true || (result.isError && outstanding > 0);

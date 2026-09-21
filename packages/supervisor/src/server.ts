@@ -6,11 +6,12 @@ import {
   executionSchema,
   HARNESSES,
   type HarnessName,
+  InvalidRequest,
   io,
   runPromise,
   workspaceRequestSchema,
 } from "cf-open-agents-api";
-import { Context, Data, Duration, Effect, Layer, Match, Option, Ref, Schema } from "effect";
+import { Duration, Effect, Match, Option, Ref, Schema } from "effect";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
@@ -45,6 +46,7 @@ import {
   IdempotencyConflict,
   type InvalidCursor,
   isTaggedFailure,
+  terminal,
   UnsupportedHarness,
 } from "./lifecycle.js";
 import type { InvalidImageData, MediaUnavailable } from "./media.js";
@@ -74,13 +76,6 @@ import type { NoSandboxAssignment, WorkspaceToolFailed } from "./workspace.js";
 type Options = CodexOptions & NativeOptions;
 /** Undefined when the execution names a harness this supervisor does not run. */
 type JobFactory = (execution: Execution, options: Options) => NativeJob | undefined;
-class NativeRuntime extends Context.Tag("supervisor/NativeRuntime")<
-  NativeRuntime,
-  {
-    readonly create: JobFactory;
-    readonly options: Options;
-  }
->() {}
 const factories: Record<HarnessName, (execution: Execution, options: Options) => NativeJob> = {
   codex: (execution, options) => new CodexJob(execution, options),
   "claude-code": (execution, options) => new ClaudeCodeJob(execution, options),
@@ -97,14 +92,8 @@ interface Active {
 export const LONG_POLL_MAX_MS = 25_000;
 const cursorQuery = z.coerce.number().int().min(0);
 
-/** The request body or query did not validate; `issues` is the validator's report. */
-export class InvalidRequest extends Data.TaggedError("InvalidRequest")<{
-  readonly issues: string;
-}> {
-  override get message(): string {
-    return this.issues;
-  }
-}
+// `InvalidRequest` is agent-api's: the same tag carrying the same validator report,
+// and the table below gives it the same 400 its `WIRE` row does.
 const parse = <T>(schema: z.ZodType<T>, input: unknown): Effect.Effect<T, InvalidRequest> =>
   Effect.suspend(() => {
     const result = schema.safeParse(input);
@@ -269,14 +258,14 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   const configured: Options = { ...options, diagnostics };
   // Serialize ownership changes and snapshots, while callbacks remain available during startup.
   const lifecycle = Effect.unsafeMakeSemaphore(1);
-  const layer = Layer.succeed(NativeRuntime, { create: factory, options: configured });
   const lookup = (turn: string) =>
     Effect.gen(function* () {
       const current = yield* Ref.get(active);
       if (!current || current.job.execution.turnId !== turn) return yield* new ExecutionMissing();
       return current.job;
     });
-  const stop = lifecycle.withPermits(1)(
+  /** Closing the server: the owned job, if any, runs its whole stop sequence. */
+  const shutdown = lifecycle.withPermits(1)(
     Effect.gen(function* () {
       const current = yield* Ref.get(active);
       if (current) yield* current.job.stop();
@@ -285,7 +274,6 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   /** The slot's verdict on a start: replay, refuse, or hand the job to the caller. */
   const admit = (body: typeof jobRequest.Type) =>
     Effect.gen(function* () {
-      const runtime = yield* NativeRuntime;
       const previous = yield* Ref.get(active);
       const fingerprint = canonicalJSON({
         execution: body.execution,
@@ -301,9 +289,8 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
         return yield* new AssignmentConflict();
       if (previous && body.execution.generation <= previous.job.execution.generation)
         return yield* new ExecutionSuperseded();
-      if (previous && !["completed", "cancelled", "failed"].includes(previous.job.status))
-        return yield* new ExecutionActive();
-      const job = runtime.create(body.execution, runtime.options);
+      if (previous && !terminal(previous.job.status)) return yield* new ExecutionActive();
+      const job = factory(body.execution, configured);
       if (!job) return yield* new UnsupportedHarness({ harness: body.execution.harness });
       if (previous) yield* previous.job.stop();
       yield* Ref.set(active, { job, fingerprint });
@@ -312,7 +299,6 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
   const app = new Hono();
   app.use("*", bodyLimit({ maxSize: 48 * 1024 * 1024 }));
   app.onError((error) => toResponse(error));
-  app.get("/health", () => Response.json({ harnesses: HARNESSES, ready: true }));
   app.get("/diagnostics", () => Response.json({ lines: recent }));
   app.post("/jobs", (c) =>
     runPromise(
@@ -327,7 +313,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
             return Response.json({ accepted: true });
           }),
         );
-      }).pipe(Effect.provide(layer)),
+      }),
     ),
   );
   /**
@@ -420,6 +406,7 @@ export function createSupervisor(options: Options, factory: JobFactory = createJ
       }),
     ),
   );
-  app.post("/stop", (c) => runPromise(stop.pipe(Effect.as(c.body(null, 204)))));
-  return { app, stop: () => runPromise(stop), shutdown: stop };
+  // `shutdown` is the Effect `main.ts` registers as a finalizer; `stop` is the same
+  // sequence for a Promise-shaped caller, which is how the harness tests tear down.
+  return { app, stop: () => runPromise(shutdown), shutdown };
 }

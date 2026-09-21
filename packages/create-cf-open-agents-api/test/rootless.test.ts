@@ -6,24 +6,18 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 
 import { run, type Runner } from "../src/exec.js";
-import {
-  detectRootlessDocker,
-  type InitOptions,
-  ROOTLESS_FILES,
-  rootlessScript,
-  runInit,
-} from "../src/index.js";
+import { detectRootlessDocker, ROOTLESS_FILES, rootlessScript, runInit } from "../src/index.js";
 import {
   cleanup,
   cliPath,
-  copyFixture,
   emptyDirectory,
+  initOptions,
   type Manifest,
   offline,
   packageRoot,
   readJson,
-  silent,
   snapshot,
+  withFixture,
 } from "./helpers.js";
 
 const ROOTLESS_INFO = '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]\n';
@@ -39,16 +33,6 @@ const engine =
     if (command === "docker") return { ok: true, stdout: info, stderr: "" };
     return { ok: true, stdout: "", stderr: "" };
   };
-const base = (dir: string, extra: Partial<InitOptions> = {}): InitOptions => ({
-  dir,
-  yes: true,
-  force: false,
-  dryRun: false,
-  env: offline,
-  reporter: silent(),
-  token: () => "t".repeat(40),
-  ...extra,
-});
 
 it("detects a rootless engine from docker info on Linux only", () => {
   const calls: string[] = [];
@@ -77,10 +61,11 @@ it("a docker info that never answers is a failed detection, not a hang", () => {
 });
 
 it("offers the dev:rootless patch when Docker runs rootless and the default accepts it", async () => {
-  const dir = copyFixture("vite-project");
-  try {
+  await withFixture("vite-project", async (dir) => {
     const calls: string[] = [];
-    const { plan, answers } = await runInit(base(dir, { runner: engine(ROOTLESS_INFO, calls) }));
+    const { plan, answers } = await runInit(
+      initOptions(dir, { runner: engine(ROOTLESS_INFO, calls) }),
+    );
     expect(calls).toEqual([DOCKER_INFO]);
     expect(answers.rootless).toBe(true);
     expect(plan.created).toContain("scripts/dev-rootless.sh");
@@ -102,36 +87,30 @@ it("offers the dev:rootless patch when Docker runs rootless and the default acce
       expect(check).not.toThrow();
     }
     const before = snapshot(dir);
-    const again = await runInit(base(dir, { runner: engine(ROOTLESS_INFO) }));
+    const again = await runInit(initOptions(dir, { runner: engine(ROOTLESS_INFO) }));
     expect(again.plan.created).toEqual([]);
     expect(again.plan.updated).toEqual([]);
     expect(snapshot(dir)).toEqual(before);
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
 it("adds nothing on a rootful engine, and asks nothing when a flag decided", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    const rootful = await runInit(base(dir, { runner: engine(ROOTFUL_INFO) }));
+  await withFixture("vite-project", async (dir) => {
+    const rootful = await runInit(initOptions(dir, { runner: engine(ROOTFUL_INFO) }));
     expect(rootful.answers.rootless).toBe(false);
     expect(rootful.plan.created).not.toContain("scripts/dev-rootless.sh");
     expect(readJson<Manifest>(dir, "package.json").scripts["dev:rootless"]).toBeUndefined();
     const calls: string[] = [];
     const decided = await runInit(
-      base(dir, { runner: engine(ROOTLESS_INFO, calls), rootless: false }),
+      initOptions(dir, { runner: engine(ROOTLESS_INFO, calls), rootless: false }),
     );
     expect(calls).toEqual([]);
     expect(decided.answers.rootless).toBe(false);
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
-it("--rootless forces the patch and --no-rootless skips the check", () => {
-  const dir = copyFixture("vite-project");
-  try {
+it("--rootless forces the patch and --no-rootless skips the check", async () => {
+  await withFixture("vite-project", async (dir) => {
     const plan = (...flags: string[]) =>
       execFileSync("node", [cliPath, "init", "--yes", "--dry-run", ...flags, dir], {
         env: { ...process.env, ...offline },
@@ -141,9 +120,7 @@ it("--rootless forces the patch and --no-rootless skips the check", () => {
     expect(plan("--rootless")).toContain("scripts/dev-rootless.sh");
     expect(plan("--no-rootless")).not.toContain("dev-rootless");
     expect(plan("--no-code-loader")).not.toContain("CODE_LOADER");
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
 /** Starts one bridge process and resolves with the address it announced. */

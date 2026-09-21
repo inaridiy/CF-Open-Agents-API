@@ -51,11 +51,11 @@ const TX_ERRORS = [
   CheckpointIncompatible,
 ] as const;
 export type SessionTxError = InstanceType<(typeof TX_ERRORS)[number]>;
-export const isSessionTxError = (value: unknown): value is SessionTxError =>
+const isSessionTxError = (value: unknown): value is SessionTxError =>
   TX_ERRORS.some((cls) => value instanceof cls);
 
 /** The outside edge of the seam for a session: see `Repo`. */
 export type SessionRepo = Repo<SessionTx, SessionTxError>;
 
-export const makeSessionRepo = (store: RecordStore, transactional: Transactional): SessionRepo =>
-  makeRepo(makeSessionTx(store), transactional, isSessionTxError, "session");
+export const makeSessionRepo = (store: RecordStore & Transactional): SessionRepo =>
+  makeRepo(makeSessionTx(store), store, isSessionTxError, "session");

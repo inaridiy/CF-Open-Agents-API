@@ -1,5 +1,6 @@
 import { Effect, JSONSchema, Schema } from "effect";
 
+import { sha256Hex } from "./bytes.js";
 import { decode, decodeEffect, io, runPromise, type ServiceError } from "./effect.js";
 import {
   SkillFileMissing,
@@ -108,7 +109,7 @@ export interface SkillReference {
 /** Immutable UTF-8 skill bundles; paths are validated before writing anything. */
 export async function publishSkill(bucket: R2Bucket, input: unknown): Promise<SkillReference> {
   const { manifest, data } = serializeSkill(input);
-  const sha256 = await digest(data);
+  const sha256 = await sha256Hex(data);
   const key = `skills/${manifest.name}/${sha256}.json`;
   await bucket.put(key, data, { onlyIf: { etagDoesNotMatch: "*" } });
   return { key, sha256 };
@@ -138,20 +139,13 @@ function serializeSkill(input: unknown) {
   return { manifest, data };
 }
 
-async function digest(data: string): Promise<string> {
-  return Array.from(
-    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(data))),
-    (b) => b.toString(16).padStart(2, "0"),
-  ).join("");
-}
-
 export async function loadSkill(bucket: R2Bucket, reference: SkillReference) {
   const object = await bucket.get(reference.key);
   if (!object) throw new SkillMissing({ reason: "bundle" });
   if (object.size > 4_000_000) throw new SkillTooLarge({ limit: "stored" });
   const { manifest, data } = serializeSkill(await object.json());
   if (
-    (await digest(data)) !== reference.sha256 ||
+    (await sha256Hex(data)) !== reference.sha256 ||
     reference.key !== `skills/${manifest.name}/${reference.sha256}.json`
   )
     throw new SkillIntegrityMismatch();

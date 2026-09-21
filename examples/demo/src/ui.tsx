@@ -9,14 +9,24 @@ type Artifact = OpenAI.Beta.Agents.Sessions.SessionArtifact;
 type Subagent = OpenAI.Beta.Agents.Subagent;
 type Turn = OpenAI.Beta.Agents.Sessions.Turn;
 
+/**
+ * One renderable step of the transcript. The fold in src/index.tsx keeps these in the
+ * order the event log produced them and hands the live page the very same values, so a
+ * streamed fragment and the page a reload rebuilds are the same view.
+ */
+export type Entry =
+  | { kind: "item"; item: Item; owner: Subagent | null }
+  | { kind: "subagent"; subagent: Subagent }
+  | { kind: "turn_failed"; turn: Turn };
+
 export interface JobState {
   session: Session;
-  items: Item[];
-  /** Delegated children (multi_agent enabled) with their own transcripts. */
-  subagents: { subagent: Subagent; items: Item[] }[];
+  entries: readonly Entry[];
   artifacts: Artifact[];
   /** True while the initial turn is still running; the job page then streams the rest. */
   running: boolean;
+  /** True when replay stopped at the page cap before reaching the end of the log. */
+  truncated: boolean;
 }
 
 const CSS = `
@@ -41,8 +51,8 @@ const CSS = `
   .status.running::before { background: var(--accent); animation: pulse 1.2s infinite; } .status.failed::before { background: #dc2626; }
   .status.requires_action::before { background: #b45309; }
   @keyframes pulse { 50% { opacity: 0.3; } }
-  .item, details.subagent, .outputs { margin: 8px 0; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; --role: var(--muted); }
-  .item .label, summary .label, .from > .label { font-size: 0.75rem; font-weight: 600; color: var(--role); text-transform: uppercase; letter-spacing: 0.04em; }
+  .item, .outputs { margin: 8px 0; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; --role: var(--muted); }
+  .item .label, .from > .label { font-size: 0.75rem; font-weight: 600; color: var(--role); text-transform: uppercase; letter-spacing: 0.04em; }
   .item.user { --role: var(--accent); background: #edf2fd; }
   .item.final_answer { --role: #15803d; } .item.command { --role: #b45309; } .item.subagent { --role: #7e22ce; }
   .item.reasoning { border-style: dashed; background: none; color: var(--muted); }
@@ -51,10 +61,8 @@ const CSS = `
   pre.output { padding: 8px 10px; border-radius: 6px; background: #f6f6f4; }
   code { font-size: 0.875rem; }
   .error { color: #dc2626; }
-  details.subagent > summary { cursor: pointer; font-weight: 600; }
-  details.subagent > summary .label { display: inline; margin-left: 8px; }
-  details.subagent .item, .from .item { background: #f6f6f4; }
   .from { margin: 8px 0; padding-left: 14px; border-left: 2px solid #e9d5ff; --role: #7e22ce; }
+  .from .item { background: #f6f6f4; }
   .from > .label { display: block; margin-top: 8px; }
   ul.files { list-style: none; margin: 0 0 12px; padding: 0; }
   ul.files li { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 0.875rem; }
@@ -62,6 +70,19 @@ const CSS = `
 
 /** Marks where the live page's streamed fragments go; `livePage` splits the layout there. */
 const LIVE_MARK = "<!--live-->";
+
+/**
+ * How much this demo will buffer to build a zip. `zipSync` holds every input file AND the
+ * finished archive in memory at once, so peak usage is roughly twice this total; a Worker
+ * has 128 MB, so the limit is kept well under half of that. The API itself allows far more
+ * per turn (200 MiB per file, 500 MiB per turn; see containers/checkpoint.ts). Past this
+ * total, which one oversized file crosses on its own, the page offers a download per file.
+ */
+const ZIP_LIMIT = 32 * 1024 * 1024;
+
+/** Decided from the artifact metadata alone: `size_bytes` is the published size. */
+export const zipFits = (artifacts: readonly Artifact[]): boolean =>
+  artifacts.reduce((total, artifact) => total + artifact.size_bytes, 0) <= ZIP_LIMIT;
 
 const Layout: FC<PropsWithChildren<{ title: string }>> = ({ title, children }) => (
   <html lang="en">
@@ -105,8 +126,7 @@ export const Home: FC<{ presets: readonly string[] }> = ({ presets }) => (
           </select>
         </label>
         <label>
-          <input type="checkbox" name="subagents" checked /> subagents (cf_delegate to the other
-          presets)
+          <input type="checkbox" name="subagents" /> subagents (cf_delegate to the other presets)
         </label>
         <button type="submit">Build</button>
       </div>
@@ -129,6 +149,16 @@ const agentText = (content: readonly OpenAI.Beta.Agents.AgentContent[]) =>
 const clip = (text: string, max = 4000) =>
   text.length > max ? `${text.slice(0, max)}\n… (${text.length - max} more chars)` : text;
 
+/**
+ * A reasoning item is one text: its summary parts joined by this separator. The fold
+ * writes the same separator ahead of the first delta of a new part, so a block streamed
+ * live and the finished item read alike.
+ */
+export const SUMMARY_SEPARATOR = "\n";
+
+const summaryText = (item: Extract<Item, { type: "reasoning" }>) =>
+  item.summary.map((part) => part.text).join(SUMMARY_SEPARATOR);
+
 const ItemView: FC<{ item: Item }> = ({ item }) => {
   switch (item.type) {
     case "message":
@@ -142,7 +172,7 @@ const ItemView: FC<{ item: Item }> = ({ item }) => {
       return (
         <div class="item reasoning">
           <div class="label">thinking</div>
-          <pre>{item.summary.map((part) => part.text).join("\n")}</pre>
+          <pre>{summaryText(item)}</pre>
         </div>
       );
     case "command_execution":
@@ -199,20 +229,48 @@ const ItemView: FC<{ item: Item }> = ({ item }) => {
   }
 };
 
-const SubagentView: FC<{ subagent: Subagent; items: Item[] }> = ({ subagent, items }) => (
-  <details class="subagent" open={subagent.status === "active"}>
-    <summary>
-      subagent {subagent.name ?? subagent.id}
-      <span class="label">
-        {subagent.status} · {items.length} items
-      </span>
-    </summary>
-    {subagent.instructions ? <pre>{agentText(subagent.instructions)}</pre> : null}
-    {items.map((item) => (
-      <ItemView item={item} />
-    ))}
-  </details>
-);
+const ownerLabel = (owner: Subagent) => `subagent ${owner.name ?? owner.id}`;
+
+/** An item of a delegated child, labelled with the subagent whose turn produced it. */
+const From: FC<PropsWithChildren<{ owner: Subagent | null }>> = ({ owner, children }) =>
+  owner ? (
+    <div class="from">
+      <span class="label">{ownerLabel(owner)}</span>
+      {children}
+    </div>
+  ) : (
+    <>{children}</>
+  );
+
+/** One entry of the transcript; the committed page and the live stream both render this. */
+export const EntryView: FC<{ entry: Entry }> = ({ entry }) => {
+  switch (entry.kind) {
+    case "item":
+      return (
+        <From owner={entry.owner}>
+          <ItemView item={entry.item} />
+        </From>
+      );
+    case "subagent":
+      return (
+        <div class="item subagent">
+          <div class="label">
+            {ownerLabel(entry.subagent)} · {entry.subagent.status}
+          </div>
+          {entry.subagent.instructions && entry.subagent.status === "active" ? (
+            <pre>{agentText(entry.subagent.instructions)}</pre>
+          ) : null}
+        </div>
+      );
+    default:
+      return (
+        <p class="error">
+          turn {entry.turn.id} failed
+          {entry.turn.error ? ` — ${entry.turn.error.message}` : ""}
+        </p>
+      );
+  }
+};
 
 /**
  * The status pill. A failed turn returns the session to `idle` with `session.error` set,
@@ -229,39 +287,63 @@ const Status: FC<{ session: Session; running: boolean }> = ({ session, running }
   </p>
 );
 
-/** The committed transcript: status, items, subagents with their items, and the download once done. */
+/** The committed transcript: status, every entry in log order, and the download once done. */
 const Progress: FC<{ id: string; state: JobState }> = ({ id, state }) => {
-  const { session, items, subagents, artifacts, running } = state;
+  const { session, entries, artifacts, running, truncated } = state;
   return (
     <section id="progress">
       <Status session={session} running={running} />
-      {items.map((item) => (
-        <ItemView item={item} />
-      ))}
-      {subagents.map((child) => (
-        <SubagentView subagent={child.subagent} items={child.items} />
+      {truncated ? (
+        <p class="meta">Transcript truncated: too many events to replay in one request.</p>
+      ) : null}
+      {entries.map((entry) => (
+        <EntryView entry={entry} />
       ))}
       {running ? null : <Outputs id={id} artifacts={artifacts} />}
     </section>
   );
 };
 
+const size = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+/**
+ * The download control, and which one it is offering: one zip while the outputs fit in a
+ * Worker's memory, otherwise a link per file that streams straight from the API.
+ */
 const Outputs: FC<{ id: string; artifacts: Artifact[] }> = ({ id, artifacts }) => {
   if (artifacts.length === 0) return <p>No files were written to /workspace/outputs.</p>;
+  const zip = zipFits(artifacts);
   return (
     <div class="outputs">
       <h2>Outputs</h2>
       <ul class="files">
         {artifacts.map((artifact) => (
           <li>
-            <code>{artifact.path}</code>
-            <span class="meta">{artifact.size_bytes} bytes</span>
+            {zip ? (
+              <code>{artifact.path}</code>
+            ) : (
+              <a href={`/jobs/${id}/files/${artifact.id}`}>
+                <code>{artifact.path}</code>
+              </a>
+            )}
+            <span class="meta">{size(artifact.size_bytes)}</span>
           </li>
         ))}
       </ul>
-      <a class="button" href={`/jobs/${id}/zip`}>
-        Download zip
-      </a>
+      {zip ? (
+        <a class="button" href={`/jobs/${id}/zip`}>
+          Download zip
+        </a>
+      ) : (
+        <p class="meta">
+          These outputs are over {ZIP_LIMIT / (1024 * 1024)} MB together, more than this Worker zips
+          in memory: download them one at a time from the list above.
+        </p>
+      )}
     </div>
   );
 };
@@ -319,28 +401,6 @@ const ENTITIES: Record<string, string> = {
 export const escape = (text: string): string =>
   text.replace(/[&<>"']/g, (char) => ENTITIES[char] ?? char);
 
-const ownerLabel = (owner: Subagent) => `subagent ${owner.name ?? owner.id}`;
-
-/**
- * Live fragments are appended in arrival order, so an item of a delegated child is
- * labelled with its subagent instead of grouped under the `<details>` a reload shows.
- */
-const From: FC<PropsWithChildren<{ owner: Subagent | null }>> = ({ owner, children }) =>
-  owner ? (
-    <div class="from">
-      <span class="label">{ownerLabel(owner)}</span>
-      {children}
-    </div>
-  ) : (
-    <>{children}</>
-  );
-
-export const LiveItem: FC<{ item: Item; owner: Subagent | null }> = ({ item, owner }) => (
-  <From owner={owner}>
-    <ItemView item={item} />
-  </From>
-);
-
 /** A text block left open while its deltas stream in; `closeText` ends it. */
 export const openText = (label: string, cls: string, owner: Subagent | null): string =>
   `${owner ? `<div class="from"><span class="label">${escape(ownerLabel(owner))}</span>` : ""}` +
@@ -348,25 +408,11 @@ export const openText = (label: string, cls: string, owner: Subagent | null): st
 
 export const closeText = (owner: Subagent | null): string => `</pre></div>${owner ? "</div>" : ""}`;
 
-export const LiveSubagent: FC<{ subagent: Subagent }> = ({ subagent }) => (
-  <div class="item subagent">
-    <div class="label">
-      {ownerLabel(subagent)} · {subagent.status}
-    </div>
-    {subagent.instructions && subagent.status === "active" ? (
-      <pre>{agentText(subagent.instructions)}</pre>
-    ) : null}
-  </div>
-);
-
-export const LiveTurnError: FC<{ turn: Turn }> = ({ turn }) => (
-  <p class="error">
-    turn {turn.id} failed
-    {turn.error ? ` — ${turn.error.message}` : ""}
-  </p>
-);
-
-/** The end of a live page: the final status replaces the pill written at the top. */
+/**
+ * The end of a live page: the final status replaces the pill written at the top. The head
+ * of the page was flushed long ago and nothing can edit that pill from here, so a `<style>`
+ * rule hides it instead.
+ */
 export const LiveEnd: FC<{ id: string; session: Session; artifacts: Artifact[] }> = ({
   id,
   session,

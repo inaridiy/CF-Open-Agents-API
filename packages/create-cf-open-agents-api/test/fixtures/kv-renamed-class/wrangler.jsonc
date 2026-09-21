@@ -1,0 +1,13 @@
+{
+  // A project that stored KV state under another class name and renamed it to SessionDO.
+  // The rename is no proof of SQLite storage: the class it renames was declared in
+  // new_classes, so the deployed SessionDO would still have KV storage.
+  "name": "kv-renamed-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-12",
+  "compatibility_flags": ["nodejs_compat", "enable_ctx_exports"],
+  "migrations": [
+    { "tag": "v1", "new_classes": ["LegacySession"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "LegacySession", "to": "SessionDO" }] }
+  ]
+}

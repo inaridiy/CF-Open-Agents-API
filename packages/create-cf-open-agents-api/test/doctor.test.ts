@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 
 import {
+  CliError,
   configChecks,
   devVarsCheck,
   readVendorManifest,
@@ -12,35 +13,19 @@ import {
   snapshotCheck,
   versions,
 } from "../src/index.js";
-import {
-  cleanup,
-  copyFixture,
-  emptyDirectory,
-  offline,
-  read,
-  repoRoot,
-  silent,
-} from "./helpers.js";
+import { parseJsonc } from "../src/jsonc.js";
+import { emptyDirectory, initOptions, read, repoRoot, withFixture } from "./helpers.js";
 
 const failing = (checks: readonly { name: string; ok: boolean }[]) =>
   checks.filter((check) => !check.ok).map((check) => check.name);
 
 it("a generated configuration passes every agreement rule", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-    });
-    const config = JSON.parse(
-      read(dir, "wrangler.jsonc")
-        .replace(/^\s*\/\/.*$/gm, "")
-        .replace(/,(\s*[}\]])/g, "$1"),
-    ) as Parameters<typeof configChecks>[0];
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
+    const config = parseJsonc<Parameters<typeof configChecks>[0]>(
+      read(dir, "wrangler.jsonc"),
+      "wrangler.jsonc",
+    );
     expect(failing(configChecks(config))).toEqual([]);
     expect(failing(configChecks({ ...config, name: "renamed" }))).toEqual([
       "services.MODEL_GATEWAY",
@@ -59,9 +44,53 @@ it("a generated configuration passes every agreement rule", async () => {
       "compatibility_flags.nodejs_compat",
       "compatibility_flags.enable_ctx_exports",
     ]);
-  } finally {
-    cleanup(dir);
-  }
+  });
+});
+
+it("init and doctor agree that a class renamed to SessionDO has SQLite storage", async () => {
+  await withFixture("renamed-class", async (dir) => {
+    await runInit(initOptions(dir));
+    // init leaves the renamed class alone and adds a migration for the other three only.
+    const wrangler = read(dir, "wrangler.jsonc");
+    expect(wrangler).toMatch(
+      /"new_sqlite_classes": \["TenantCatalogDO", "HarnessDO", "SandboxDO"\]/,
+    );
+    expect(wrangler).not.toMatch(/"new_sqlite_classes": \[[^\]]*"SessionDO"/);
+    // doctor used to read new_sqlite_classes alone and call the result broken.
+    const report = runDoctor({ dir, offline: true });
+    expect(failing(report.checks)).toEqual(["image snapshot"]);
+    expect(report.checks.find((item) => item.name === "migrations.SessionDO")?.detail).toBe(
+      "renamed_classes",
+    );
+  });
+});
+
+it("init and doctor both refuse a class renamed from a KV one", async () => {
+  await withFixture("kv-renamed-class", async (dir) => {
+    // The rename chain ends in new_classes, so SessionDO has KV storage however often it
+    // was renamed; init used to accept this and doctor used to call it SQLite.
+    await expect(runInit(initOptions(dir))).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof CliError && /renamed from LegacySession/.test(error.message),
+    );
+    const report = runDoctor({ dir, offline: true });
+    expect(failing(report.checks)).toContain("migrations.SessionDO");
+    expect(report.checks.find((item) => item.name === "migrations.SessionDO")?.detail).toBe(
+      "renamed from LegacySession, which is in new_classes",
+    );
+    // A rename cycle says nothing about storage, and following it must still terminate.
+    const cycled = configChecks({
+      name: "cycles",
+      migrations: [
+        { tag: "v1", renamed_classes: [{ from: "SessionDO", to: "Temporary" }] },
+        { tag: "v2", renamed_classes: [{ from: "Temporary", to: "SessionDO" }] },
+      ],
+    });
+    expect(cycled.find((item) => item.name === "migrations.SessionDO")).toMatchObject({
+      ok: false,
+      detail: "not in new_sqlite_classes",
+    });
+  });
 });
 
 it("the snapshot and .dev.vars checks name what is wrong", () => {
@@ -84,17 +113,8 @@ it("the snapshot and .dev.vars checks name what is wrong", () => {
 });
 
 it("runDoctor combines the file checks with the tool checks through the runner", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      source: repoRoot,
-      reporter: silent(),
-      env: {},
-    });
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir, { source: repoRoot, env: {} }));
     const calls: string[] = [];
     const runner = (command: string, args: readonly string[]) => {
       calls.push([command, ...args].join(" "));
@@ -113,23 +133,12 @@ it("runDoctor combines the file checks with the tool checks through the runner",
     ]);
     writeFileSync(join(dir, ".dev.vars"), "API_TOKEN=short\n");
     expect(failing(runDoctor({ dir, offline: true }).checks)).toEqual([".dev.vars API_TOKEN"]);
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
 it("a docker info that times out fails the docker check and skips the rootless check", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-      rootless: false,
-    });
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
     const timeouts: (number | undefined)[] = [];
     const stalled = (
       command: string,
@@ -149,14 +158,11 @@ it("a docker info that times out fails the docker check and skips the rootless c
     expect(report.checks.find((check) => check.name === "docker")?.detail).toMatch(
       /did not answer within 5000 ms/,
     );
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
 it("a rootless engine needs the dev:rootless script", async () => {
-  const dir = copyFixture("vite-project");
-  try {
+  await withFixture("vite-project", async (dir) => {
     const rootless = (command: string, args: readonly string[]) => {
       if (command === "docker")
         return {
@@ -167,32 +173,14 @@ it("a rootless engine needs the dev:rootless script", async () => {
       if (args.includes("--version")) return { ok: true, stdout: "4.131.1\n", stderr: "" };
       return { ok: true, stdout: "You are logged in", stderr: "" };
     };
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-      rootless: false,
-    });
+    await runInit(initOptions(dir));
     const without = runDoctor({ dir, runner: rootless, cliVersion: versions.CLI_VERSION });
     expect(failing(without.checks)).toEqual(["image snapshot", "docker rootless"]);
     expect(without.checks.find((check) => check.name === "docker rootless")?.detail).toMatch(
       /init --rootless.*temporary workaround/,
     );
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-      rootless: true,
-    });
+    await runInit(initOptions(dir, { rootless: true }));
     const withScript = runDoctor({ dir, runner: rootless, cliVersion: versions.CLI_VERSION });
     expect(failing(withScript.checks)).toEqual(["image snapshot"]);
-  } finally {
-    cleanup(dir);
-  }
+  });
 });

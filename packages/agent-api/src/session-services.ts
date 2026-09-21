@@ -3,6 +3,7 @@ import { Clock, Context, Effect, Layer, ManagedRuntime, Option } from "effect";
 import { StorageFailure } from "./errors.js";
 import type { SessionRepo } from "./persistence/session-repo.js";
 import type { AgentRegistration, RuntimeDriver } from "./runtime.js";
+import type { TurnConfig } from "./session-state.js";
 
 /** What a deployment configures for every session object; see `createAgentService`. */
 export interface SessionDependencies {
@@ -60,6 +61,13 @@ export const driversFrom = (provider: () => SessionDependencies): Context.Tag.Se
   get keepaliveMs() {
     return provider().keepaliveMs ?? 15_000;
   },
+});
+
+/** What a turn needs from the deployment, resolved through `provider` like everything else. */
+export const turnConfig = (drivers: Context.Tag.Service<Drivers>): TurnConfig => ({
+  maxTurnMs: drivers.maxTurnMs,
+  agents: drivers.agents,
+  harness: (name) => Option.getOrUndefined(drivers.get(name)),
 });
 
 /** Durable Object alarms take no signal; interrupting the fiber orphans the platform call. */

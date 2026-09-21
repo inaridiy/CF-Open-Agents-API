@@ -14,15 +14,31 @@ import {
 import type { BetaContentBlock } from "@anthropic-ai/sdk/resources/beta";
 import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { type Execution, type InputMessage, io, workspaceTools } from "cf-open-agents-api";
+import {
+  CONNECTION_FAILURE,
+  type Execution,
+  type InputMessage,
+  io,
+  workspaceTools,
+} from "cf-open-agents-api";
 import { Effect } from "effect";
 import { z } from "zod";
 
+import {
+  closeSubagent,
+  closeSubagentTurn,
+  nowSeconds,
+  openSubagent,
+  openSubagentTurn,
+  randomId,
+  usageEvent,
+} from "./events.js";
 import { type NativeOptions, ToolJob, type ToolScope } from "./job.js";
 import {
   CommandRejected,
   describeFailure,
   ExecutionStopped,
+  statusToTurnCode,
   type TurnErrorCode,
   Wake,
   within,
@@ -143,24 +159,18 @@ export function tierEnv(
 export function claudeTurnError(result: SDKResultMessage): TurnErrorCode | undefined {
   if (result.subtype === "success" && !result.is_error) return undefined;
   const status = result.subtype === "success" ? result.api_error_status : undefined;
-  const byStatus = (code: number | null | undefined): TurnErrorCode | undefined => {
-    if (code === 401 || code === 403) return "authentication_error";
-    if (code === 429) return "rate_limit_exceeded";
-    if (code === 529) return "server_overloaded";
-    if (code === 404) return "resource_not_found";
-    if (code === 400 || code === 413 || code === 422) return "invalid_request";
-    if (code !== null && code !== undefined && code >= 500) return "server_error";
-    return undefined;
-  };
   const errors = result.subtype === "success" ? [result.result] : result.errors;
   const text = errors.join("\n").toLowerCase();
   if (/prompt is too long|context window|context_length/.test(text))
     return "context_length_exceeded";
-  if (/econnrefused|enotfound|econnreset|fetch failed|network error|socket hang up/.test(text))
-    return "connection_failed";
   if (/overloaded/.test(text)) return "server_overloaded";
-  const fromStatus = byStatus(status);
+  // `api_error_status` is an answer from the upstream, so it decides before the
+  // transport phrases do: a 429 whose body mentions a reset connection is a rate
+  // limit, not a connection that never happened. The phrases decide only when the
+  // result carries no status, or one that maps to nothing.
+  const fromStatus = statusToTurnCode(status ?? undefined);
   if (fromStatus) return fromStatus;
+  if (CONNECTION_FAILURE.test(text)) return "connection_failed";
   if (result.subtype === "error_max_budget_usd") return "session_budget_exceeded";
   switch (result.terminal_reason) {
     case "prompt_too_long":
@@ -577,13 +587,10 @@ export class ClaudeCodeJob extends ToolJob {
     }
     if (!child) {
       child = {
-        scope: {
-          subagentId: `subagent_${crypto.randomUUID().replaceAll("-", "")}`,
-          turnId: `turn_${crypto.randomUUID().replaceAll("-", "")}`,
-        },
+        scope: { subagentId: randomId("subagent"), turnId: randomId("turn") },
         name: null,
         instructions: null,
-        openedAt: Math.floor(Date.now() / 1000),
+        openedAt: nowSeconds(),
         status: "in_progress",
         announced: false,
         textForwarded: false,
@@ -598,25 +605,27 @@ export class ClaudeCodeJob extends ToolJob {
   private announce(child: Child): void {
     if (child.announced) return;
     child.announced = true;
-    this.emit({
-      type: "subagent",
-      id: child.scope.subagentId,
-      parentId: null,
-      name: child.name,
-      instructions: child.instructions,
-      status: "active",
-      openedAt: child.openedAt,
-    });
-    this.emit({
-      type: "subagent_turn",
-      id: child.scope.turnId,
-      subagentId: child.scope.subagentId,
-      status: "in_progress",
-      startedAt: child.openedAt,
-      completedAt: null,
-    });
+    this.emit(
+      openSubagent({
+        id: child.scope.subagentId,
+        name: child.name,
+        instructions: child.instructions,
+        openedAt: child.openedAt,
+      }),
+    );
+    this.emit(
+      openSubagentTurn({
+        id: child.scope.turnId,
+        subagentId: child.scope.subagentId,
+        startedAt: child.openedAt,
+      }),
+    );
   }
-  private finish(child: Child, status: Child["status"], lastText?: string): void {
+  private finish(
+    child: Child,
+    status: Exclude<Child["status"], "in_progress">,
+    lastText?: string,
+  ): void {
     if (child.status !== "in_progress") return;
     this.announce(child);
     child.status = status;
@@ -629,23 +638,22 @@ export class ClaudeCodeJob extends ToolJob {
         phase: "final_answer",
         ...child.scope,
       });
-    this.emit({
-      type: "subagent_turn",
-      id: child.scope.turnId,
-      subagentId: child.scope.subagentId,
-      status,
-      startedAt: child.openedAt,
-      completedAt: Math.floor(Date.now() / 1000),
-    });
-    this.emit({
-      type: "subagent",
-      id: child.scope.subagentId,
-      parentId: null,
-      name: child.name,
-      instructions: child.instructions,
-      status: "closed",
-      openedAt: child.openedAt,
-    });
+    this.emit(
+      closeSubagentTurn({
+        id: child.scope.turnId,
+        subagentId: child.scope.subagentId,
+        status,
+        startedAt: child.openedAt,
+      }),
+    );
+    this.emit(
+      closeSubagent({
+        id: child.scope.subagentId,
+        name: child.name,
+        instructions: child.instructions,
+        openedAt: child.openedAt,
+      }),
+    );
   }
   /** Only deployment-owned workspace tools, hosted search and (bounded) native subagents may run. */
   private readonly canUseTool: NonNullable<Options["canUseTool"]> = async (name, toolInput) => {
@@ -865,21 +873,14 @@ export class ClaudeCodeJob extends ToolJob {
       0,
     );
     const output = models.reduce((sum, model) => sum + model.outputTokens, 0);
-    this.emit({
-      type: "usage",
-      id: `usage:${this.execution.turnId}`,
-      usage: {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: input + output,
-        input_tokens_details: {
-          cached_tokens: models.reduce((sum, model) => sum + model.cacheReadInputTokens, 0),
-        },
-        output_tokens_details: {
-          reasoning_tokens: models.reduce((sum, model) => sum + (model.thinkingTokens ?? 0), 0),
-        },
-      },
-    });
+    this.emit(
+      usageEvent(`usage:${this.execution.turnId}`, {
+        input,
+        output,
+        cached: models.reduce((sum, model) => sum + model.cacheReadInputTokens, 0),
+        reasoning: models.reduce((sum, model) => sum + (model.thinkingTokens ?? 0), 0),
+      }),
+    );
   }
   private finalize(message: SDKResultMessage): void {
     for (const child of this.children)

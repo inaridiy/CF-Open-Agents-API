@@ -12,7 +12,7 @@ Deploy or run the [Agent Worker](deployment.md), then add this to the caller's W
 }
 ```
 
-For local development, follow the [README walkthrough](../README.md#first-run-from-this-repository); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
+For local development, follow the [local development walkthrough](../CONTRIBUTING.md#local-development); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
 
 When the API lives in the same Worker as your application (the setup CLI's retrofit), the binding points at the Worker itself: `{ "binding": "AGENTS", "service": "<your worker>", "entrypoint": "Agents" }`. Everything below applies unchanged; `env.AGENTS` is the same `Fetcher & AgentRPC`.
 
@@ -40,7 +40,7 @@ function agentClient(env: Env, tenant: string) {
 
 The request reaches the binding with its path, headers and body; there is no DNS lookup for `agents.internal`. Use `tenantFetch` rather than calling `fetchAs` from the client's `fetch` yourself: a `Request` handed to an RPC method travels by structured clone, which cannot carry the SDK's `AbortSignal` (`DataCloneError: AbortSignal serialization is not enabled`), so `tenantFetch` builds the request without the signal and honors it on the caller's side (the promise rejects with an `AbortError`; the in-flight request completes). `env.AGENTS.fetchAs(tenant, request)` itself is fine for a hand-built request without a signal, such as `new Request("https://agents.internal/cf/v1/capabilities")`, which is how the demo reads the preset list. Validation, idempotency and session ownership within the tenant are unchanged. The same trust rule as for RPC applies: derive `tenant` from your own verified identity (the authenticated user, your service's tenant), never from a request body or header a client controls.
 
-When the caller only holds a token, or forwards end-user requests that must pass through the Agent Worker's own authenticator, use the binding's plain `fetch` with the bearer token instead:
+`examples/caller`'s `/sdk` route is built this way. When a caller only holds a token, or forwards end-user requests that must pass through the Agent Worker's own authenticator, use the binding's plain `fetch` with the bearer token instead — the second path the example exercises, directly, in its test suite:
 
 ```ts
 new OpenAI({

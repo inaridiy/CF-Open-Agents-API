@@ -87,7 +87,7 @@ function starting() {
   const store = new MemoryStore();
   const tx = makeSessionTx(store);
   const input = [{ role: "user" as const, content: [{ type: "input_text" as const, text: "go" }] }];
-  store.transactionSync(() => {
+  store.transaction(() => {
     const started = begin(tx, config, idle, input);
     addInput(tx, started, input);
     tx.save(started);
@@ -97,7 +97,7 @@ function starting() {
 function harness(store: MemoryStore, drivers: Record<string, ReturnType<typeof fixture>>) {
   const armed: number[] = [];
   const layer = Layer.mergeAll(
-    Layer.succeed(Repo, makeSessionRepo(store, store)),
+    Layer.succeed(Repo, makeSessionRepo(store)),
     Layer.succeed(Alarm, {
       arm: (inMs: number) =>
         Effect.sync((): void => {
@@ -169,7 +169,7 @@ it("a fence that no longer holds ends the tick silently after the I/O it was wai
   const driver = fixture({
     poll: async () => {
       // Another writer moved the record on while the poll was in flight.
-      store.transactionSync(() => {
+      store.transaction(() => {
         const record = tx.requireSession();
         tx.save({ ...record, execution: null, phase: "idle" });
       });
@@ -186,7 +186,7 @@ it("a fence that no longer holds ends the tick silently after the I/O it was wai
   // any transition can run, and the transaction it was in leaves nothing behind.
   const events = store.lastEvent();
   const exit = await Effect.runPromiseExit(
-    makeSessionRepo(store, store).transaction((view) => {
+    makeSessionRepo(store).transaction((view) => {
       view.emit({ type: "agent.session.idle", event_id: "evt_stale", session });
       return acceptBatch(
         view,
@@ -208,7 +208,7 @@ it("a fence that no longer holds ends the tick silently after the I/O it was wai
 it("the deadline comes from the clock: an expired turn is stopped and fails with request_timeout", async () => {
   const { store, tx } = starting();
   // `begin` stamps the deadline from the wall clock; pin it to the test clock's timeline.
-  store.transactionSync(() => {
+  store.transaction(() => {
     const record = tx.requireSession();
     if (record.execution)
       tx.save({ ...record, execution: { ...record.execution, deadline: config.maxTurnMs } });
@@ -251,7 +251,7 @@ function queueSteer(store: MemoryStore) {
   const input = [
     { role: "user" as const, content: [{ type: "input_text" as const, text: "more" }] },
   ];
-  store.transactionSync(() => {
+  store.transaction(() => {
     const record = tx.fenced(
       tx.requireSession().execution as NonNullable<SessionRecord["execution"]>,
     );

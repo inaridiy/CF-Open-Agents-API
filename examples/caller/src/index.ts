@@ -1,5 +1,5 @@
-import { ApiError, createSessionSchema, parse, remoteApiError } from "cf-open-agents-api";
-import { type AgentRPC, bearerTenant } from "cf-open-agents-api/cloudflare";
+import { createSessionSchema, parse, remoteApiError } from "cf-open-agents-api";
+import { type AgentRPC, bearerTenant, tenantFetch } from "cf-open-agents-api/cloudflare";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import OpenAI from "openai";
 
@@ -9,6 +9,23 @@ export interface CallerBindings {
   API_TOKEN: string;
 }
 
+/**
+ * The recommended path (docs/service-binding.md): the binding is the credential, so this
+ * Worker names the tenant it has already authenticated and no token crosses the binding.
+ */
+function tenantClient(env: Pick<CallerBindings, "AGENTS">, tenant: string): OpenAI {
+  return new OpenAI({
+    apiKey: "service-binding", // the SDK requires a value; the API never reads it on this path
+    baseURL: "https://agents.internal/v1",
+    fetch: tenantFetch(env.AGENTS, tenant),
+  });
+}
+
+/**
+ * The other path the guide describes, for a caller that holds only the bearer token: the
+ * binding's plain `fetch` goes through the Agent Worker's own authenticator, which derives
+ * the tenant from the token.
+ */
 export function agentClient(env: Pick<CallerBindings, "AGENTS" | "API_TOKEN">): OpenAI {
   return new OpenAI({
     baseURL: "https://agents.internal/v1",
@@ -16,6 +33,17 @@ export function agentClient(env: Pick<CallerBindings, "AGENTS" | "API_TOKEN">): 
     fetch: (input, init) => env.AGENTS.fetch(new Request(input, init)),
   });
 }
+
+/** One page of results. The typed RPC page carries the cursor; the SDK's page does not. */
+const page = <T extends { id?: string | null }>(result: {
+  data: T[];
+  has_more: boolean;
+  last_id?: string | null;
+}) => ({
+  data: result.data,
+  has_more: result.has_more,
+  last_id: result.last_id ?? result.data.at(-1)?.id ?? null,
+});
 
 /** Compare both Service Binding paths using the same session request and result. */
 export default class CallerWorker extends WorkerEntrypoint<CallerBindings> {
@@ -27,7 +55,7 @@ export default class CallerWorker extends WorkerEntrypoint<CallerBindings> {
     );
     if (!match)
       return Response.json({ error: "Use /sdk/sessions or /rpc/sessions" }, { status: 404 });
-    const api = agentClient(this.env);
+    const api = tenantClient(this.env, tenant);
     try {
       return await this.route(request, tenant, match[1] === "sdk", match[2], api);
     } catch (error) {
@@ -57,7 +85,10 @@ export default class CallerWorker extends WorkerEntrypoint<CallerBindings> {
   ): Promise<Response> {
     const input = parse(createSessionSchema, await request.json());
     if (input.stream)
-      throw new ApiError(400, "invalid_request", "This polling example accepts stream: false");
+      return Response.json(
+        { error: "This polling example accepts stream: false" },
+        { status: 400 },
+      );
     const key = request.headers.get("Idempotency-Key") ?? crypto.randomUUID();
     const parameters = {
       ...input,
@@ -72,34 +103,22 @@ export default class CallerWorker extends WorkerEntrypoint<CallerBindings> {
 
   private async list(tenant: string, sdk: boolean, api: OpenAI): Promise<Response> {
     const sessions = api.beta.agents.sessions;
-    const page = sdk ? await sessions.list() : await this.env.AGENTS.listSessions(tenant);
-    return Response.json({ object: "list", data: page.data, has_more: page.has_more });
+    const sessionPage = sdk ? await sessions.list() : await this.env.AGENTS.listSessions(tenant);
+    return Response.json({ object: "list", ...page(sessionPage) });
   }
 
   private async retrieve(tenant: string, sdk: boolean, id: string, api: OpenAI): Promise<Response> {
     const sessions = api.beta.agents.sessions;
-    const session = sdk
-      ? await sessions.retrieve(id)
-      : await this.env.AGENTS.retrieveSession(tenant, id);
-    const items = sdk
-      ? await sessions.items.list(id, { order: "asc", limit: 100 })
-      : await this.env.AGENTS.listItems(tenant, id, { order: "asc", limit: 100 });
-    const turns = sdk
-      ? await sessions.turns.list(id, { order: "desc", limit: 100 })
-      : await this.env.AGENTS.listTurns(tenant, id, { order: "desc", limit: 100 });
-    return Response.json({
-      session,
-      items: {
-        data: items.data,
-        has_more: items.has_more,
-        last_id: items.data.at(-1)?.id ?? null,
-      },
-      turns: {
-        data: turns.data,
-        has_more: turns.has_more,
-        last_id: turns.data.at(-1)?.id ?? null,
-      },
-    });
+    const [session, items, turns] = await Promise.all([
+      sdk ? sessions.retrieve(id) : this.env.AGENTS.retrieveSession(tenant, id),
+      sdk
+        ? sessions.items.list(id, { order: "asc", limit: 100 })
+        : this.env.AGENTS.listItems(tenant, id, { order: "asc", limit: 100 }),
+      sdk
+        ? sessions.turns.list(id, { order: "desc", limit: 100 })
+        : this.env.AGENTS.listTurns(tenant, id, { order: "desc", limit: 100 }),
+    ]);
+    return Response.json({ session, items: page(items), turns: page(turns) });
   }
 
   private async remove(tenant: string, sdk: boolean, id: string, api: OpenAI): Promise<Response> {

@@ -1,10 +1,15 @@
 FROM node:24.15.0-bookworm-slim AS build
 WORKDIR /app
 RUN npm install --global pnpm@11.1.2
+# Only what the supervisor needs: itself, its workspace dependency and the workspace root
+# (which owns the TypeScript toolchain and the compiler options both build files extend).
+# Nothing else in the repository can break this image.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
-COPY packages ./packages
-COPY examples/worker/package.json ./examples/worker/package.json
-RUN pnpm install --frozen-lockfile && pnpm build && pnpm --filter cf-open-agents-api-supervisor deploy --prod --legacy /out
+COPY packages/agent-api ./packages/agent-api
+COPY packages/supervisor ./packages/supervisor
+RUN pnpm install --frozen-lockfile --filter cf-open-agents-api-supervisor... --filter . \
+    && pnpm --filter cf-open-agents-api-supervisor... build \
+    && pnpm --filter cf-open-agents-api-supervisor deploy --prod --legacy /out
 
 FROM node:24.15.0-bookworm-slim
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git && rm -rf /var/lib/apt/lists/*

@@ -189,6 +189,32 @@ it("maps every documented codexErrorInfo variant without throwing", () => {
 });
 
 /**
+ * A connection variant says the runtime never completed the exchange. The status it
+ * gives up on decides only where it names a condition of its own; the shared table's
+ * `4xx -> invalid_request` rule (OpenCode's) would otherwise turn a proxy's 407 or a
+ * 499 into a client error the client never made.
+ */
+it("keeps connection_failed for a status that only says 4xx", () => {
+  expect(turnErrorCode({ httpConnectionFailed: { httpStatusCode: 407 } })).toBe(
+    "connection_failed",
+  );
+  expect(turnErrorCode({ responseStreamDisconnected: { httpStatusCode: 499 } })).toBe(
+    "connection_failed",
+  );
+  // The statuses that name their own condition still decide.
+  expect(turnErrorCode({ httpConnectionFailed: { httpStatusCode: 408 } })).toBe("request_timeout");
+  expect(turnErrorCode({ responseStreamConnectionFailed: { httpStatusCode: 503 } })).toBe(
+    "server_overloaded",
+  );
+  expect(turnErrorCode({ responseTooManyFailedAttempts: { httpStatusCode: 401 } })).toBe(
+    "authentication_error",
+  );
+  // A 400 or 422 is the upstream's rejection of the body, not the shared 4xx rule.
+  expect(turnErrorCode({ httpConnectionFailed: { httpStatusCode: 400 } })).toBe("invalid_request");
+  expect(turnErrorCode({ httpConnectionFailed: { httpStatusCode: 422 } })).toBe("invalid_request");
+});
+
+/**
  * Codex 0.154.0 reports a gateway or exec-server it could not reach as `other` with
  * reqwest's or tokio's transport wording; nothing in the variant says so.
  */
@@ -206,12 +232,16 @@ it("maps connection-level failures reported as other to connection_failed", () =
       "failed to connect to exec-server websocket `ws://sandbox.internal/`: IO error: Connection reset by peer (os error 104)",
     ),
   ).toBe("sandbox_error");
-  // A status that maps to nothing leaves the transport wording to decide.
+  // A status the shared table recognises decides even when the wording is transport-shaped.
   expect(
     turnErrorCode(
       "other",
       "unexpected status 408 Request Timeout: stream disconnected before completion",
     ),
+  ).toBe("request_timeout");
+  // A status that maps to nothing leaves the transport wording to decide.
+  expect(
+    turnErrorCode("other", "unexpected status 302 Found: stream disconnected before completion"),
   ).toBe("connection_failed");
   expect(
     turnErrorCode(

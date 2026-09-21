@@ -5,12 +5,59 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { simulateReadableStream } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import { Effect } from "effect";
 import { expect, it } from "vitest";
 
-import type { Execution, RuntimeBatch } from "../../packages/agent-api/src/index.js";
+import {
+  type Execution,
+  type RuntimeBatch,
+  type RuntimeEvent,
+  runPromise,
+} from "../../packages/agent-api/src/index.js";
 import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/models.js";
+import { McpRequestFailed, reportMcp } from "../../packages/supervisor/src/remote-tools.js";
 import { createSupervisor } from "../../packages/supervisor/src/server.js";
 import { serveFetch } from "./http.js";
+
+/**
+ * `mcp_call.error` is the transport's word for a call that never answered: a tool that
+ * answered `isError` put its own failure in `output`, which is what the model and the
+ * client read, so the event carries `success: false` and no error message of ours.
+ */
+it("reports a tool-reported failure without the transport's message", async () => {
+  const events: RuntimeEvent[] = [];
+  const emit = (event: RuntimeEvent) => events.push(event);
+  const call = { id: "mcp_unit", server: "fixture", name: "lookup", arguments: {} };
+  const answered = await runPromise(
+    reportMcp(
+      emit,
+      call,
+      Effect.succeed({ isError: true, content: [{ type: "text", text: "no such row" }] }),
+    ),
+  );
+  expect(answered).toMatchObject({ isError: true });
+  expect(events.at(-1)).toMatchObject({ type: "mcp", success: false, error: null });
+  expect(events.at(-1)).toHaveProperty("output.isError", true);
+  // A call that did not answer is the one the transport failed.
+  await expect(
+    runPromise(
+      reportMcp(
+        emit,
+        call,
+        Effect.fail(
+          new McpRequestFailed({ server: "fixture", operation: "lookup", cause: "transport gone" }),
+        ),
+      ),
+    ),
+  ).rejects.toThrow();
+  expect(events.at(-1)).toMatchObject({
+    output: null,
+    error: "MCP request failed",
+    success: false,
+  });
+  await runPromise(reportMcp(emit, call, Effect.succeed({ content: [] })));
+  expect(events.at(-1)).toMatchObject({ success: true, error: null });
+});
 
 const mcpResult = (method: string) => {
   if (method === "initialize")

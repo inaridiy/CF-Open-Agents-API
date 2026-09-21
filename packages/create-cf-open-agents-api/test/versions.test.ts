@@ -35,10 +35,9 @@ it("the generated pins agree with the workspace", () => {
     else expect(example.dependencies?.[name], name).toBe(version);
     expect(cli.devDependencies?.[name], `${name} in the CLI's devDependencies`).toBe(version);
   }
-  expect(versions.TOOLCHAIN_VERSIONS.wrangler).toBe(root.devDependencies?.wrangler);
-  expect(versions.TOOLCHAIN_VERSIONS["@cloudflare/workers-types"]).toBe(
-    root.devDependencies?.["@cloudflare/workers-types"],
-  );
+  // Every toolchain pin, not a hand-picked subset: `typescript` was two majors behind.
+  for (const [name, version] of Object.entries(versions.TOOLCHAIN_VERSIONS))
+    expect(root.devDependencies?.[name], name).toBe(version);
   expect(readFileSync(join(packageRoot, "package.json"), "utf8")).toContain(
     `"version": "${versions.CLI_VERSION}"`,
   );

@@ -13,9 +13,14 @@ const isHook = (/** @type {string} */ command) => {
   const hook = /^(?:pre|post)(.+)$/.exec(command);
   return hook?.[1] !== undefined && hook[1] in manifest.scripts;
 };
+// A developer reads the README first and CONTRIBUTING for the rest; a command must be in one.
+const contributing = await readFile(new URL("../CONTRIBUTING.md", import.meta.url), "utf8");
 for (const command of Object.keys(manifest.scripts))
   if (!(lifecycle.has(command) || isHook(command)))
-    assert(readme.includes(`pnpm ${command}`), `Document pnpm ${command} in README.md`);
+    assert(
+      readme.includes(`pnpm ${command}`) || contributing.includes(`pnpm ${command}`),
+      `Document pnpm ${command} in README.md or CONTRIBUTING.md`,
+    );
 const library =
   /** @type {{ name: string, repository: { url: string }, exports: Record<string, unknown>, dependencies: Record<string, string> }} */ (
     JSON.parse(

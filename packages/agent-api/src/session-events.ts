@@ -2,7 +2,7 @@ import type { Subagent, TokenUsage } from "openai/resources/beta/agents/agents";
 
 import { InvalidRuntimeEvent } from "./errors.js";
 import type { Kind } from "./persistence/kind.js";
-import type { RecordStore } from "./persistence/record-store.js";
+import { eachRecord, type RecordStore } from "./persistence/record-store.js";
 import { SessionKinds } from "./persistence/session-kinds.js";
 import type {
   ActiveSession,
@@ -707,70 +707,64 @@ export function finishOutputItems(
   itemKind: Kind<AgentSessionItem>,
 ): void {
   const db = tx.store;
-  let after: string | undefined;
-  do {
-    const page = db.list(
-      SessionKinds.output,
-      { order: "asc", limit: 100, after },
-      { field: "item.turn_id", value: turnId },
-    );
-    for (const { index, item } of page.data) {
-      if (item.status !== "in_progress") continue;
-      item.status = "incomplete";
-      db.put(itemKind, item.id, item);
-      const key = db.outputKey(item.id);
-      if (key) db.put(SessionKinds.output, key, { index, item } satisfies OutputPosition);
-      const context = {
-        session_id: record.session.id,
-        turn_id: turnId,
-        item_id: item.id,
-        output_index: index,
-      };
-      if (item.type === "reasoning") {
-        for (const [summary_index, part] of item.summary.entries()) {
-          db.append({
-            ...context,
-            event_id: identifier("evt"),
-            type: "agent.session.turn.reasoning_summary_text.done",
-            summary_index,
-            text: part.text,
-          } satisfies AgentSessionEvent);
-          db.append({
-            ...context,
-            event_id: identifier("evt"),
-            type: "agent.session.turn.reasoning_summary_part.done",
-            summary_index,
-            part,
-            status: "incomplete",
-          } satisfies AgentSessionEvent);
-        }
-      } else if (item.type === "message") {
-        for (const [content_index, part] of item.content.entries()) {
-          db.append({
-            ...context,
-            event_id: identifier("evt"),
-            type: "agent.session.turn.output_text.done",
-            content_index,
-            text: part.text,
-          } satisfies AgentSessionEvent);
-          db.append({
-            ...context,
-            event_id: identifier("evt"),
-            type: "agent.session.turn.content_part.done",
-            content_index,
-            part,
-          } satisfies AgentSessionEvent);
-        }
+  for (const { index, item } of eachRecord(db, SessionKinds.output, {
+    field: "item.turn_id",
+    value: turnId,
+  })) {
+    if (item.status !== "in_progress") continue;
+    item.status = "incomplete";
+    db.put(itemKind, item.id, item);
+    const key = db.outputKey(item.id);
+    if (key) db.put(SessionKinds.output, key, { index, item } satisfies OutputPosition);
+    const context = {
+      session_id: record.session.id,
+      turn_id: turnId,
+      item_id: item.id,
+      output_index: index,
+    };
+    if (item.type === "reasoning") {
+      for (const [summary_index, part] of item.summary.entries()) {
+        db.append({
+          ...context,
+          event_id: identifier("evt"),
+          type: "agent.session.turn.reasoning_summary_text.done",
+          summary_index,
+          text: part.text,
+        } satisfies AgentSessionEvent);
+        db.append({
+          ...context,
+          event_id: identifier("evt"),
+          type: "agent.session.turn.reasoning_summary_part.done",
+          summary_index,
+          part,
+          status: "incomplete",
+        } satisfies AgentSessionEvent);
       }
-      db.append({
-        session_id: record.session.id,
-        turn_id: turnId,
-        event_id: identifier("evt"),
-        type: "agent.session.turn.item.done",
-        item,
-        output_index: index,
-      } satisfies AgentSessionEvent);
+    } else if (item.type === "message") {
+      for (const [content_index, part] of item.content.entries()) {
+        db.append({
+          ...context,
+          event_id: identifier("evt"),
+          type: "agent.session.turn.output_text.done",
+          content_index,
+          text: part.text,
+        } satisfies AgentSessionEvent);
+        db.append({
+          ...context,
+          event_id: identifier("evt"),
+          type: "agent.session.turn.content_part.done",
+          content_index,
+          part,
+        } satisfies AgentSessionEvent);
+      }
     }
-    after = page.has_more ? (page.last_id ?? undefined) : undefined;
-  } while (after);
+    db.append({
+      session_id: record.session.id,
+      turn_id: turnId,
+      event_id: identifier("evt"),
+      type: "agent.session.turn.item.done",
+      item,
+      output_index: index,
+    } satisfies AgentSessionEvent);
+  }
 }

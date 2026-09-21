@@ -2,6 +2,7 @@ import { getSandbox } from "@cloudflare/sandbox";
 import { Effect, Stream } from "effect";
 import { z } from "zod";
 
+import { sha256Hex } from "../bytes.js";
 import { attempt, io, type ServiceError } from "../effect.js";
 import { InvalidJson, Superseded, TransportFailure } from "../errors.js";
 import { HARNESSES } from "../harnesses.js";
@@ -9,10 +10,10 @@ import { proxyMcp } from "../mcp.js";
 import { fetchAssignedImage } from "../media.js";
 import { readModelBodyEffect } from "../models/body.js";
 import { constrainCodexSearch } from "../models/codex-search.js";
-import { programmaticInputSchema } from "../programmatic-contract.js";
+import { programmaticInputSchema, type ProgrammaticResult } from "../programmatic-contract.js";
 import { runProgrammatic } from "../programmatic.js";
 import { executeWorkspaceTool } from "../sandbox-tools.js";
-import { modelAllowed, permittedCodeTool, sha256Hex, superseded } from "./assignment.js";
+import { modelAllowed, permittedCodeTool, superseded } from "./assignment.js";
 import { assignment, type ContainerBindings, type HarnessHost, write } from "./host.js";
 
 /**
@@ -123,14 +124,14 @@ export function programmaticRequest(host: HarnessHost, request: Request) {
           content: [{ type: "text", text: programmaticFailureText(error) }],
           isError: true,
           terminal,
-        });
+        } satisfies ProgrammaticResult);
       });
     return yield* execute.pipe(
       Effect.map((value) =>
         Response.json({
           content: [{ type: "text", text: JSON.stringify(value) }],
           isError: false,
-        }),
+        } satisfies ProgrammaticResult),
       ),
       Effect.catchAll(failed),
       Effect.ensuring(

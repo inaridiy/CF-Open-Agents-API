@@ -3,6 +3,7 @@ import { z } from "zod";
 import { StoredObjectMissing } from "../errors.js";
 import {
   createSessionSchema,
+  deleted,
   eventsSchema,
   forkSessionSchema,
   metadataSchema,
@@ -11,7 +12,7 @@ import {
   sessionPageSchema,
 } from "../protocol.js";
 import type { ServiceOptions } from "../runtime.js";
-import { jsonBody, type RouteApp } from "./context.js";
+import { jsonBody, objects, type RouteApp } from "./context.js";
 
 export function registerSessionRoutes<Env>(app: RouteApp<Env>, options: ServiceOptions<Env>) {
   app.post("/v1/agents/sessions", async (c) => {
@@ -74,8 +75,9 @@ export function registerSessionRoutes<Env>(app: RouteApp<Env>, options: ServiceO
   });
   app.get("/cf/v1/sessions/:id/events", async (c) => {
     const after = parse(z.coerce.number().int().min(0), c.req.query("after") ?? "0");
+    const limit = parse(z.coerce.number().int().min(1).max(1_000), c.req.query("limit") ?? "100");
     return Response.json(
-      await (await c.env.session(c.get("tenant"), c.req.param("id"))).replay(after),
+      await (await c.env.session(c.get("tenant"), c.req.param("id"))).replay(after, limit),
     );
   });
   app.get("/v1/agents/sessions/:id/items", async (c) =>
@@ -161,7 +163,7 @@ export function registerSessionRoutes<Env>(app: RouteApp<Env>, options: ServiceO
     const artifact = await (
       await c.env.session(c.get("tenant"), c.req.param("id"))
     ).artifact(c.req.param("artifact"));
-    const object = await options.objects?.(c.env.env).get(artifact.key);
+    const object = await objects(options, c.env).get(artifact.key);
     if (!object) throw new StoredObjectMissing({ object: "artifact_content" });
     return new Response(object.body, {
       headers: {
@@ -175,12 +177,8 @@ export function registerSessionRoutes<Env>(app: RouteApp<Env>, options: ServiceO
   app.delete("/v1/agents/sessions/:id/artifacts/:artifact", async (c) => {
     const stub = await c.env.session(c.get("tenant"), c.req.param("id"));
     const artifact = await stub.artifact(c.req.param("artifact"));
-    await options.objects?.(c.env.env).delete(artifact.key);
+    await objects(options, c.env).delete(artifact.key);
     await stub.deleteArtifact(artifact.id);
-    return Response.json({
-      id: artifact.id,
-      object: "agent.session.artifact.deleted",
-      deleted: true,
-    });
+    return Response.json(deleted(artifact.id, "agent.session.artifact.deleted"));
   });
 }

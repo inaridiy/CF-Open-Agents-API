@@ -15,7 +15,6 @@ export const initCommand = define({
       required: false,
       description: "Project directory (default: current directory)",
     },
-    dir: { type: "string", description: "Project directory, as an option" },
     yes: { type: "boolean", short: "y", description: "Accept every default without prompting" },
     force: {
       type: "boolean",
@@ -56,29 +55,34 @@ export const initCommand = define({
       type: "string",
       description: "Path of the composition module (default: next to the entry)",
     },
+    // Maintainer flags: they exist to run an unpublished checkout, which the CLI README
+    // documents under "Running an unpublished checkout". `hidden` keeps them out of --help.
     library: {
       type: "string",
-      description:
-        "Pre-publication: cf-open-agents-api tarball or directory for a file: dependency",
+      hidden: true,
+      description: "Maintainer: cf-open-agents-api tarball or directory for a file: dependency",
     },
     "cli-package": {
       type: "string",
-      description: "Pre-publication: this CLI's tarball or directory for the postinstall hook",
+      hidden: true,
+      description: "Maintainer: this CLI's tarball or directory for the postinstall hook",
     },
     ref: {
       type: "string",
-      description: "Git ref of the image snapshot (default: v<this version>)",
+      hidden: true,
+      description: "Maintainer: git ref of the image snapshot (default: v<this version>)",
     },
     source: {
       type: "string",
-      description: "Local repository checkout to snapshot instead of downloading",
+      hidden: true,
+      description: "Maintainer: local repository checkout to snapshot instead of downloading",
     },
     install: { type: "boolean", description: "Run the package manager install afterwards" },
   },
   run: async (ctx) => {
     const values = ctx.values;
     await runInit({
-      dir: values.dir ?? values.directory ?? process.cwd(),
+      dir: values.directory ?? process.cwd(),
       yes: Boolean(values.yes),
       force: Boolean(values.force),
       dryRun: Boolean(values["dry-run"]),

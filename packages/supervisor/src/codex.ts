@@ -46,6 +46,14 @@ import {
   webSearchItem,
 } from "./codex-protocol.js";
 import { DELEGATION_TOOLS } from "./delegation.js";
+import {
+  closeSubagent,
+  functionCall,
+  openSubagent,
+  randomId,
+  subagentTurn,
+  usageEvent,
+} from "./events.js";
 import { Job, type JobOptions, ToolUnavailable } from "./job.js";
 import { AppServer, type RpcFailure, type RpcMessage } from "./json-rpc.js";
 import {
@@ -54,16 +62,19 @@ import {
   describeFailure,
   ExecutionCancelled,
   ExecutionStopped,
+  terminal,
   type TaggedFailure,
 } from "./lifecycle.js";
 import {
   CodeCallsOutstanding,
   codeEnabled,
+  codeLeftCallsOpen,
   codeToolNames,
   executeCode,
   functionArguments,
 } from "./programmatic.js";
-import { executeWorkspace } from "./workspace.js";
+import { paginate, reportMcp } from "./remote-tools.js";
+import { asToolResult, executeWorkspace } from "./workspace.js";
 
 export { messageErrorCode, turnErrorCode } from "./codex-protocol.js";
 
@@ -174,7 +185,7 @@ export class CodexJob extends Job {
       yield* server.exited.pipe(
         Effect.andThen(
           Effect.sync(() => {
-            if (!this.closing && !["completed", "cancelled", "failed"].includes(this.status))
+            if (!this.closing && !terminal(this.status))
               this.lifecycle.fail("native_harness_exited");
           }),
         ),
@@ -348,15 +359,14 @@ export class CodexJob extends Job {
       active: true,
     };
     this.children.set(thread.id, state);
-    this.emit({
-      type: "subagent",
-      id: childId(thread.id),
-      parentId: parent === this.threadId ? null : childId(parent),
-      name: state.name,
-      instructions: null,
-      openedAt: state.openedAt,
-      status: "active",
-    });
+    this.emit(
+      openSubagent({
+        id: childId(thread.id),
+        parentId: parent === this.threadId ? null : childId(parent),
+        name: state.name,
+        openedAt: state.openedAt,
+      }),
+    );
   }
   private turnStarted(params: unknown, origin: Origin): void {
     if (origin.child && origin.nativeThread) {
@@ -385,14 +395,15 @@ export class CodexJob extends Job {
     const turn = result.data.turn;
     child.turnId = turn.id;
     child.active = started;
-    this.emit({
-      type: "subagent_turn",
-      id: childTurnId(turn.id),
-      subagentId: childId(nativeThread),
-      status: childTurnStatus(child.active, turn.status),
-      startedAt: turn.startedAt ?? child.openedAt,
-      completedAt: turn.completedAt,
-    });
+    this.emit(
+      subagentTurn({
+        id: childTurnId(turn.id),
+        subagentId: childId(nativeThread),
+        status: childTurnStatus(child.active, turn.status),
+        startedAt: turn.startedAt ?? child.openedAt,
+        completedAt: turn.completedAt,
+      }),
+    );
     if (child.active && this.cancelRequested)
       void this.perform(this.interruptNative(nativeThread, turn.id)).catch((error) =>
         this.lifecycle.fail(error instanceof Error ? error.message : "subagent_interrupt_failed"),
@@ -440,18 +451,19 @@ export class CodexJob extends Job {
       totalTokens: (previous?.usage.totalTokens ?? 0) + last.totalTokens,
     };
     this.usageByTurn.set(key, { lastTotal: total, usage });
-    this.emit({
-      ...origin.scope,
-      type: "usage",
-      id: key,
-      usage: {
-        input_tokens: usage.inputTokens,
-        input_tokens_details: { cached_tokens: usage.cachedInputTokens },
-        output_tokens: usage.outputTokens,
-        output_tokens_details: { reasoning_tokens: usage.reasoningOutputTokens },
-        total_tokens: usage.totalTokens,
-      },
-    });
+    this.emit(
+      usageEvent(
+        key,
+        {
+          input: usage.inputTokens,
+          output: usage.outputTokens,
+          cached: usage.cachedInputTokens,
+          reasoning: usage.reasoningOutputTokens,
+          total: usage.totalTokens,
+        },
+        origin.scope,
+      ),
+    );
   }
   private reasoningSummary(
     type: "reasoning_delta" | "reasoning_part",
@@ -560,15 +572,14 @@ export class CodexJob extends Job {
     }
     if (item.tool === "resumeAgent" || item.tool === "sendInput" || item.tool === "followupTask")
       state.closed = false;
-    this.emit({
-      type: "subagent",
+    const record = {
       id: childId(id),
       parentId: state.parent === this.threadId ? null : childId(state.parent),
       name: state.name,
       instructions: state.instructions,
       openedAt: state.openedAt,
-      status: state.closed ? "closed" : "active",
-    });
+    };
+    this.emit(state.closed ? closeSubagent(record) : openSubagent(record));
   }
   private completedItem(item: CompletedItem, origin: Origin): void {
     switch (item.type) {
@@ -637,14 +648,9 @@ export class CodexJob extends Job {
     }
     this.pendingTools.set(parsed.data.callId, requestId);
     this.lifecycle.setStatus("waiting");
-    this.emit({
-      ...origin.scope,
-      type: "function_call",
-      id: parsed.data.callId,
-      callId: parsed.data.callId,
-      name: parsed.data.tool,
-      arguments: parsed.data.arguments,
-    });
+    this.emit(
+      functionCall(parsed.data.callId, parsed.data.tool, parsed.data.arguments, origin.scope),
+    );
   }
   /**
    * EXPERIMENTAL Codex tool: no interactive client sits behind this API. Surface the
@@ -716,7 +722,7 @@ export class CodexJob extends Job {
   /** Idempotent: a terminal or unstarted job has nothing left to interrupt. */
   private cancelTurn(): Effect.Effect<void, RpcFailure> {
     return Effect.gen(this, function* () {
-      if (!this.server || ["completed", "cancelled", "failed"].includes(this.status)) return;
+      if (!this.server || terminal(this.status)) return;
       this.cancelRequested = true;
       // A finished root must read as cancelled before a settling child can seal the outcome.
       this.lifecycle.requestCancel();
@@ -797,8 +803,8 @@ export class CodexJob extends Job {
         this.options.programmaticUrl,
         invocation,
       );
-      if (result.terminal || (result.isError && this.pendingCode.size))
-        throw new CodeCallsOutstanding();
+      // Codex counts every code call the turn has open, not only this invocation's.
+      if (codeLeftCallsOpen(result, this.pendingCode.size)) throw new CodeCallsOutstanding();
       this.server?.respond(requestId, {
         success: !result.isError,
         contentItems: result.content.map((part) => ({ type: "inputText", text: part.text })),
@@ -829,40 +835,40 @@ export class CodexJob extends Job {
       const server = this.server;
       if (!context || !server)
         return yield* new ToolUnavailable({ message: "No active code invocation" });
-      let cursor: string | undefined;
-      const seen = new Set<string>();
-      do {
-        const listed = yield* server.request("mcpServerStatus/list", {
-          threadId: context.threadId,
-          detail: "toolsAndAuthOnly",
-          cursor,
-          limit: 100,
-        });
-        const page = yield* attempt("codex.mcpServers", () => this.mcpStatusPage.parse(listed));
-        for (const listing of page.data)
-          for (const tool of Object.values(listing.tools)) {
-            const configured = this.execution.agent.tools?.find(
-              (candidate) => candidate.type === "mcp" && candidate.server_label === listing.name,
-            );
-            if (
-              configured?.type === "mcp" &&
-              configured.allowed_tools &&
-              !configured.allowed_tools.includes(tool.name)
-            )
-              continue;
-            if (context.mcp.size >= 1000)
-              return yield* new ToolUnavailable({ message: "MCP tool catalog is too large" });
-            context.mcp.set(`mcp__${listing.name}__${tool.name}`, {
-              server: listing.name,
-              name: tool.name,
-              schema: tool.inputSchema,
+      yield* paginate(
+        (cursor) =>
+          Effect.gen(this, function* () {
+            const listed = yield* server.request("mcpServerStatus/list", {
+              threadId: context.threadId,
+              detail: "toolsAndAuthOnly",
+              cursor,
+              limit: 100,
             });
-          }
-        cursor = page.nextCursor ?? undefined;
-        if (cursor && seen.has(cursor))
-          return yield* new ToolUnavailable({ message: "MCP pagination did not advance" });
-        if (cursor) seen.add(cursor);
-      } while (cursor);
+            const page = yield* attempt("codex.mcpServers", () => this.mcpStatusPage.parse(listed));
+            for (const listing of page.data)
+              for (const tool of Object.values(listing.tools)) {
+                const configured = this.execution.agent.tools?.find(
+                  (candidate) =>
+                    candidate.type === "mcp" && candidate.server_label === listing.name,
+                );
+                if (
+                  configured?.type === "mcp" &&
+                  configured.allowed_tools &&
+                  !configured.allowed_tools.includes(tool.name)
+                )
+                  continue;
+                if (context.mcp.size >= 1000)
+                  return yield* new ToolUnavailable({ message: "MCP tool catalog is too large" });
+                context.mcp.set(`mcp__${listing.name}__${tool.name}`, {
+                  server: listing.name,
+                  name: tool.name,
+                  schema: tool.inputSchema,
+                });
+              }
+            return page.nextCursor ?? undefined;
+          }),
+        () => new ToolUnavailable({ message: "MCP pagination did not advance" }),
+      );
       return [...codeToolNames(this.execution), ...context.mcp.keys()];
     }).pipe(Effect.mapError(asFailure("codex.codeTools")));
   }
@@ -877,75 +883,51 @@ export class CodexJob extends Job {
       if (!codeEnabled(this.execution) || this.closing || this.abort.signal.aborted)
         return yield* new ToolUnavailable({ message: "No active code assignment" });
       if (this.execution.sandbox && Object.hasOwn(workspaceTools, name)) {
-        const result = yield* io("codex.workspace", () =>
-          executeWorkspace(
-            this.options.sandboxUrl,
-            name as keyof typeof workspaceTools,
-            args,
-            this.abort.signal,
-            (event) => this.emit({ ...event, ...context.scope }),
+        return asToolResult(
+          yield* io("codex.workspace", () =>
+            executeWorkspace(
+              this.options.sandboxUrl,
+              name as keyof typeof workspaceTools,
+              args,
+              this.abort.signal,
+              (event) => this.emit({ ...event, ...context.scope }),
+            ),
           ),
         );
-        return {
-          content: [{ type: "text", text: result.text }],
-          isError: result.exitCode !== null && result.exitCode !== 0,
-        };
       }
       const mcp = context.mcp.get(name);
       if (mcp) {
         const input = yield* attempt("codex.mcpInput", () =>
           z.json().parse(z.fromJSONSchema(mcp.schema).parse(args)),
         );
-        const id = `mcp_${crypto.randomUUID().replaceAll("-", "")}`;
-        const record = (output: JsonValue | null, error: string | null, success: boolean) =>
-          this.emit({
-            ...context.scope,
-            type: "mcp",
-            id,
-            name: mcp.name,
-            server: mcp.server,
-            arguments: input,
-            output,
-            error,
-            success,
-          });
         const server = this.server;
         if (!server) return yield* new ToolUnavailable({ message: "No active code invocation" });
-        return yield* server
-          .request("mcpServer/tool/call", {
-            threadId: context.threadId,
+        return yield* reportMcp(
+          (event) => this.emit(event),
+          {
+            id: randomId("mcp"),
             server: mcp.server,
-            tool: mcp.name,
+            name: mcp.name,
             arguments: input,
-          })
-          .pipe(
-            Effect.flatMap((raw) => attempt("codex.mcpOutput", () => z.json().parse(raw))),
-            Effect.tap((output) =>
-              Effect.sync(() =>
-                record(
-                  output,
-                  null,
-                  !(output && typeof output === "object" && "isError" in output && output.isError),
-                ),
-              ),
-            ),
-            Effect.tapError(() => Effect.sync(() => record(null, "MCP request failed", false))),
-          );
+            scope: context.scope,
+          },
+          server
+            .request("mcpServer/tool/call", {
+              threadId: context.threadId,
+              server: mcp.server,
+              tool: mcp.name,
+              arguments: input,
+            })
+            .pipe(Effect.flatMap((raw) => attempt("codex.mcpOutput", () => z.json().parse(raw)))),
+        );
       }
       const input = yield* attempt("codex.functionArguments", () =>
         functionArguments(this.execution, name, args),
       );
-      const id = `call_${crypto.randomUUID().replaceAll("-", "")}`;
+      const id = randomId("call");
       const result = yield* Deferred.make<JsonValue, ExecutionStopped | ExecutionCancelled>();
       this.pendingCode.set(id, result);
-      this.emit({
-        ...context.scope,
-        type: "function_call",
-        id,
-        callId: id,
-        name,
-        arguments: input,
-      });
+      this.emit(functionCall(id, name, input, context.scope));
       this.lifecycle.setStatus("waiting");
       return yield* Deferred.await(result);
     }).pipe(Effect.mapError(asFailure("codex.codeTool")));

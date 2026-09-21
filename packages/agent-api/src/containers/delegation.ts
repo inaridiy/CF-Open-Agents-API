@@ -77,6 +77,45 @@ export function delegateRequest(host: HarnessHost, request: Request) {
     return new Response(null, { status: 404 });
   });
 }
+/**
+ * The execution a delegated child runs: the parent's turn narrowed to one target preset.
+ * The child inherits the parent's client, MCP and code tools; hosted search survives only
+ * where the delegate entry says the target's runtime and model connection provide it, a
+ * fact the session resolved once when it built the turn's delegate list.
+ */
+export function childExecution(
+  current: Assignment,
+  delegation: NonNullable<Assignment["delegation"]>,
+  delegate: NonNullable<Assignment["delegation"]>["delegates"][number],
+  child: { subagentId: string; turnId: string; prompt: string; capabilityRoots: string[] },
+): Execution {
+  return {
+    sessionId: current.sessionId,
+    turnId: child.turnId,
+    generation: current.generation,
+    harness: delegate.harness,
+    model: delegate.model,
+    ...(delegate.tiers ? { tiers: delegate.tiers } : {}),
+    agent: {
+      model: delegate.alias,
+      instructions: delegation.agent.instructions ?? null,
+      tools: (delegation.agent.tools ?? []).filter(
+        (tool) => tool.type !== "web_search" || delegate.webSearch === true,
+      ),
+      reasoning: delegation.agent.reasoning ?? null,
+      multi_agent: { enabled: false },
+    },
+    input: [{ role: "user", content: [{ type: "input_text", text: child.prompt }] }],
+    checkpoint: null,
+    deadline: delegation.deadline,
+    sandbox: current.sandbox,
+    ...(delegation.environmentId ? { environmentId: delegation.environmentId } : {}),
+    capabilityRoots: child.capabilityRoots,
+    ...(current.tenant ? { tenant: current.tenant } : {}),
+    ...(current.vaultIds ? { vaultIds: [...current.vaultIds] } : {}),
+    parent: { turnId: current.turnId, subagentId: child.subagentId },
+  };
+}
 function spawnChild(
   host: HarnessHost,
   current: Assignment,
@@ -94,33 +133,12 @@ function spawnChild(
       return new Response("Concurrent subagent limit reached", { status: 409 });
     const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
     const turnId = `turn_${crypto.randomUUID().replaceAll("-", "")}`;
-    const execution: Execution = {
-      sessionId: current.sessionId,
+    const execution = childExecution(current, delegation, delegate, {
+      subagentId,
       turnId,
-      generation: current.generation,
-      harness: delegate.harness,
-      model: delegate.model,
-      ...(delegate.tiers ? { tiers: delegate.tiers } : {}),
-      agent: {
-        model: delegate.alias,
-        instructions: delegation.agent.instructions ?? null,
-        // Children keep the parent's client, MCP and code tools; provider search follows the child runtime.
-        tools: (delegation.agent.tools ?? []).filter(
-          (tool) => tool.type !== "web_search" || delegate.harness === "codex",
-        ),
-        reasoning: delegation.agent.reasoning ?? null,
-        multi_agent: { enabled: false },
-      },
-      input: [{ role: "user", content: [{ type: "input_text", text: parsed.data.prompt }] }],
-      checkpoint: null,
-      deadline: delegation.deadline,
-      sandbox: current.sandbox,
-      ...(delegation.environmentId ? { environmentId: delegation.environmentId } : {}),
+      prompt: parsed.data.prompt,
       capabilityRoots: host.environment.capabilityRoots(),
-      ...(current.tenant ? { tenant: current.tenant } : {}),
-      ...(current.vaultIds ? { vaultIds: [...current.vaultIds] } : {}),
-      parent: { turnId: current.turnId, subagentId },
-    };
+    });
     yield* write((tx) => {
       tx.putChild(subagentId, { execution });
       tx.putAssignment({ ...current, children: [...children, subagentId] });

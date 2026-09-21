@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import type { Files } from "../fs.js";
+import { appendBlock, type Files } from "../fs.js";
 import type { StepResult } from "../plan.js";
 import { MINIMUM_TOKEN_LENGTH, randomToken } from "../token.js";
 
@@ -32,22 +32,15 @@ function upsertLine(lines: string[], key: string, value: string, comment?: strin
     lines[index] = `${key}=${value}`;
     return;
   }
-  if (lines.length > 0 && lines.at(-1) !== "") lines.push("");
-  if (comment) lines.push(comment);
-  lines.push(`${key}=${value}`);
+  appendBlock(lines, [...(comment ? [comment] : []), `${key}=${value}`]);
 }
-
-const trimTrailing = (lines: string[]) => {
-  while (lines.length > 0 && lines.at(-1) === "") lines.pop();
-  return lines;
-};
 
 /** `.dev.vars` with a usable API token, the provider key line and local backups. */
 export function ensureDevVars(options: DevVarsOptions): StepResult {
   const path = join(options.files.root, ".dev.vars");
   const existing = options.files.read(path) ?? "";
   const values = parseDevVars(existing);
-  const lines = trimTrailing(existing.split(/\r?\n/));
+  const lines = appendBlock(existing.split(/\r?\n/), []);
   const notes: string[] = [];
   const token = values.get("API_TOKEN") ?? "";
   if (token.length < MINIMUM_TOKEN_LENGTH) {
@@ -73,10 +66,11 @@ export function ensureDevVarsExample(options: DevVarsOptions): StepResult {
   const path = join(options.files.root, ".dev.vars.example");
   const existing = options.files.read(path) ?? "";
   const values = parseDevVars(existing);
-  const lines = trimTrailing(existing.split(/\r?\n/));
-  if (!values.has("API_TOKEN")) lines.push("API_TOKEN=replace-with-at-least-32-random-characters");
+  const lines = appendBlock(existing.split(/\r?\n/), []);
+  const append = (block: readonly string[]) => appendBlock(lines, block, false);
+  if (!values.has("API_TOKEN")) append(["API_TOKEN=replace-with-at-least-32-random-characters"]);
   if (options.secret && !values.has(options.secret.name))
-    lines.push(options.secret.comment, `${options.secret.name}=`);
-  if (!values.has("LOCAL_BACKUPS")) lines.push(LOCAL_BACKUPS_COMMENT, "LOCAL_BACKUPS=true");
+    append([options.secret.comment, `${options.secret.name}=`]);
+  if (!values.has("LOCAL_BACKUPS")) append([LOCAL_BACKUPS_COMMENT, "LOCAL_BACKUPS=true"]);
   return options.files.write(path, `${lines.join("\n")}\n`);
 }

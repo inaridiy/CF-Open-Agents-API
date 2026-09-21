@@ -12,13 +12,12 @@ export const doctorCommand = define({
       required: false,
       description: "Project directory (default: current directory)",
     },
-    dir: { type: "string", description: "Project directory, as an option" },
     json: { type: "boolean", description: "Print the report as JSON" },
     offline: { type: "boolean", description: "Skip the docker and wrangler checks" },
   },
   run: (ctx) => {
     const report = runDoctor({
-      dir: ctx.values.dir ?? ctx.values.directory ?? process.cwd(),
+      dir: ctx.values.directory ?? process.cwd(),
       offline: Boolean(ctx.values.offline),
     });
     console.log(ctx.values.json ? JSON.stringify(report, null, 2) : renderReport(report));

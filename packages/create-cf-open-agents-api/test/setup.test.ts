@@ -1,7 +1,10 @@
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { expect, it } from "vitest";
 
 import { accountIds, CliError, runInit, runSetup, type SetupOptions } from "../src/index.js";
-import { cleanup, copyFixture, emptyDirectory, offline, silent } from "./helpers.js";
+import { initOptions, silent, withEmptyDirectory, withFixture } from "./helpers.js";
 
 it("extracts account ids from wrangler whoami output", () => {
   const output = `
@@ -19,16 +22,8 @@ it("extracts account ids from wrangler whoami output", () => {
 });
 
 it("creates the buckets and puts every secret in one wrangler call, reading values from the environment", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-    });
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
     const calls: { args: string[]; input?: string }[] = [];
     const runner = (_command: string, args: readonly string[], options?: { input?: string }) => {
       calls.push({ args: [...args], input: options?.input });
@@ -70,22 +65,50 @@ it("creates the buckets and puts every secret in one wrangler call, reading valu
     );
     expect(missing).toBeInstanceOf(CliError);
     expect((missing as CliError).message).toMatch(/R2_SECRET_ACCESS_KEY is not set/);
-  } finally {
-    cleanup(dir);
-  }
+  });
+});
+
+it("uploads a provider key added to .dev.vars by hand next to the recorded one", async () => {
+  await withEmptyDirectory(async (dir) => {
+    await runInit(initOptions(dir, { template: "minimal", provider: "anthropic" }));
+    // A composition extended by hand with a second provider reads a key the record does not
+    // name. The record decides what init writes; it must not decide what production keeps.
+    appendFileSync(join(dir, ".dev.vars"), "OPENAI_API_KEY=sk-second\n");
+    const calls: { args: string[]; input?: string }[] = [];
+    const env = {
+      API_TOKEN: "p".repeat(40),
+      OPENAI_API_KEY: "sk-second",
+      ANTHROPIC_API_KEY: "sk-recorded",
+      R2_ACCESS_KEY_ID: "id",
+      R2_SECRET_ACCESS_KEY: "secret",
+      CLOUDFLARE_R2_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+    };
+    const plan = await runSetup({
+      dir,
+      dryRun: false,
+      fromEnv: true,
+      skipSecrets: false,
+      skipBuckets: true,
+      env,
+      reporter: silent(),
+      runner: (_command, args, options?: { input?: string }) => {
+        calls.push({ args: [...args], input: options?.input });
+        return { ok: true, stdout: "", stderr: "" };
+      },
+    });
+    expect(plan.updated).toEqual([
+      "secrets API_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, CLOUDFLARE_R2_ACCOUNT_ID",
+    ]);
+    // --from-env reads the union the same way, so neither key is dropped on the way up.
+    expect(JSON.parse(calls.find((call) => call.args.includes("bulk"))?.input ?? "{}")).toEqual(
+      env,
+    );
+  });
 });
 
 it("a dry run prints the commands and calls nothing", async () => {
-  const dir = copyFixture("vite-project");
-  try {
-    await runInit({
-      dir,
-      yes: true,
-      force: false,
-      dryRun: false,
-      env: offline,
-      reporter: silent(),
-    });
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
     const calls: string[][] = [];
     const runner = (_command: string, args: readonly string[]) => {
       calls.push([...args]);
@@ -107,14 +130,11 @@ it("a dry run prints the commands and calls nothing", async () => {
     expect(plan.notes.join("\n")).toMatch(
       /Would run npx wrangler secret bulk --config wrangler.jsonc with the values on stdin/,
     );
-  } finally {
-    cleanup(dir);
-  }
+  });
 });
 
 it("refuses a directory without a Wrangler configuration", async () => {
-  const dir = emptyDirectory();
-  try {
+  await withEmptyDirectory(async (dir) => {
     await expect(
       runSetup({
         dir,
@@ -127,7 +147,5 @@ it("refuses a directory without a Wrangler configuration", async () => {
     ).rejects.toSatisfy(
       (error: unknown) => error instanceof CliError && /init first/.test(error.message),
     );
-  } finally {
-    cleanup(dir);
-  }
+  });
 });

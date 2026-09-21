@@ -6,18 +6,19 @@ import OpenAI from "openai";
 
 import {
   closeText,
+  type Entry,
+  EntryView,
   ErrorPage,
   escape,
   Home,
   Job,
   type JobState,
   LiveEnd,
-  LiveItem,
   livePage,
-  LiveSubagent,
-  LiveTurnError,
   openText,
   render,
+  SUMMARY_SEPARATOR,
+  zipFits,
 } from "./ui.js";
 
 interface Bindings {
@@ -28,8 +29,8 @@ interface Bindings {
 type Session = OpenAI.Beta.Agents.AgentSession;
 type SessionEvent = OpenAI.Beta.Agents.AgentSessionEvent;
 type Item = OpenAI.Beta.Agents.AgentSessionItem;
+type Artifact = OpenAI.Beta.Agents.Sessions.SessionArtifact;
 type Subagent = OpenAI.Beta.Agents.Subagent;
-type Turn = OpenAI.Beta.Agents.Sessions.Turn;
 
 /**
  * The tenant every session of this app belongs to. A Service Binding caller names the
@@ -74,26 +75,6 @@ async function presetNames(env: Bindings): Promise<string[]> {
 
 const running = (session: Session) => session.status === "in_progress";
 
-/** The committed state of a settled session, from the SDK's list endpoints. */
-async function loadJob(client: OpenAI, id: string, session: Session): Promise<JobState> {
-  const sessions = client.beta.agents.sessions;
-  const [items, children] = await Promise.all([
-    collect(sessions.items.list(id, { order: "asc", limit: 100 })),
-    collect(sessions.subagents.list(id, { order: "asc" })),
-  ]);
-  // Delegated children report through the parent session but keep their own items.
-  const subagents = await Promise.all(
-    children.map(async (subagent) => ({
-      subagent,
-      items: await collect(
-        sessions.subagents.items.list(subagent.id, { session_id: id, order: "asc", limit: 100 }),
-      ),
-    })),
-  );
-  const artifacts = running(session) ? [] : await collect(sessions.artifacts.list(id));
-  return { session, items, subagents, artifacts, running: running(session) };
-}
-
 async function collect<T>(page: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = [];
   for await (const item of page) out.push(item);
@@ -102,27 +83,42 @@ async function collect<T>(page: AsyncIterable<T>): Promise<T[]> {
 
 // --- The event log ----------------------------------------------------------------------
 
-/** What one event changed, for the live page to append; the fold keeps the state itself. */
+/**
+ * What one event changed. A renderable change is an `Entry`: the same value the fold keeps
+ * for the committed page and the live page appends as a fragment. Text deltas are written
+ * into the open block instead, and `settled` ends the stream.
+ */
 type Change =
+  | Entry
   | { kind: "text"; id: string; owner: Subagent | null; label: string; cls: string; text: string }
-  | { kind: "item"; item: Item; owner: Subagent | null }
-  | { kind: "subagent"; subagent: Subagent }
-  | { kind: "turn_failed"; turn: Turn }
   | { kind: "settled" };
 
+type ItemEntry = Extract<Entry, { kind: "item" }>;
+
+/** Where an event's items are tracked and, for a delegated child, whose they are. */
+interface Owner {
+  subagent: Subagent | null;
+  items: Map<string, ItemEntry>;
+}
+
 /**
- * A fold over the session's event log. The same reducer rebuilds the committed transcript
- * from `GET /cf/v1/sessions/:id/events?after=<seq>` and applies the live stream after it,
- * so a page loaded mid-turn shows exactly what the log holds and then continues from it.
+ * A fold over the session's event log, and the only source of a transcript here. The same
+ * reducer builds a settled page and the committed head of a running one from
+ * `GET /cf/v1/sessions/:id/events?after=<seq>`, then applies the live stream on top, so a
+ * page loaded at any moment shows exactly what the log holds and continues from there.
  */
 class Transcript {
   session: Session;
-  readonly items = new Map<string, Item>();
-  readonly subagents = new Map<string, { subagent: Subagent; items: Map<string, Item> }>();
+  /** Every renderable change in log order; the live page appends these same values. */
+  private readonly entries: Entry[] = [];
+  private readonly root: Owner = { subagent: null, items: new Map() };
+  private readonly subagents = new Map<string, Owner>();
   /** Turn id → subagent id: an item's turn tells whose transcript it belongs to. */
   private readonly turns = new Map<string, string | null>();
   /** The last sequence number applied; live frames at or below it are duplicates. */
   seq = 0;
+  /** Set by `replayInto` when the log was too long to fold in full; see `REPLAY_PAGE_CAP`. */
+  truncated = false;
 
   constructor(session: Session) {
     this.session = session;
@@ -132,26 +128,27 @@ class Transcript {
     return running(this.session);
   }
 
-  state(): JobState {
+  /** Artifacts are published by the checkpoint, not by the log, so they are passed in. */
+  state(artifacts: Artifact[] = []): JobState {
     return {
       session: this.session,
-      items: [...this.items.values()],
-      subagents: [...this.subagents.values()].map(({ subagent, items }) => ({
-        subagent,
-        items: [...items.values()],
-      })),
-      artifacts: [],
+      entries: this.entries,
+      artifacts,
       running: this.running,
+      truncated: this.truncated,
     };
   }
 
   /** The transcript an item of `turnId` belongs to: a delegated child's, or the root's. */
   private owner(turnId: string | null): Owner {
     const subagentId = turnId ? this.turns.get(turnId) : null;
-    const entry = subagentId ? this.subagents.get(subagentId) : undefined;
-    return entry
-      ? { subagent: entry.subagent, items: entry.items }
-      : { subagent: null, items: this.items };
+    return (subagentId ? this.subagents.get(subagentId) : undefined) ?? this.root;
+  }
+
+  /** Keep a renderable change in log order and hand it to the live page. */
+  private push<T extends Entry>(entry: T): T {
+    this.entries.push(entry);
+    return entry;
   }
 
   apply(event: SessionEvent): Change | null {
@@ -177,7 +174,7 @@ class Transcript {
         return null;
       case "agent.session.turn.failed":
         this.turns.set(event.turn.id, event.turn.subagent_id);
-        return event.turn.error ? { kind: "turn_failed", turn: event.turn } : null;
+        return event.turn.error ? this.push({ kind: "turn_failed", turn: event.turn }) : null;
       case "agent.session.turn.item.added":
         return this.applyItem(this.owner(event.turn_id), event.item, false);
       case "agent.session.turn.item.done":
@@ -197,19 +194,28 @@ class Transcript {
   }
 
   private applySubagent(subagent: Subagent, announce: boolean): Change | null {
-    const entry = this.subagents.get(subagent.id);
-    if (entry) entry.subagent = subagent;
+    const owner = this.subagents.get(subagent.id);
+    if (owner) owner.subagent = subagent;
     else this.subagents.set(subagent.id, { subagent, items: new Map() });
-    return announce ? { kind: "subagent", subagent } : null;
+    return announce ? this.push({ kind: "subagent", subagent }) : null;
   }
 
   private applyItem(owner: Owner, item: Item, done: boolean): Change | null {
-    if (item.id && (done || !owner.items.has(item.id))) owner.items.set(item.id, item);
-    return done ? { kind: "item", item, owner: owner.subagent } : null;
+    const known = item.id ? owner.items.get(item.id) : undefined;
+    if (known) {
+      // `item.done` carries the finished item; it replaces the one the deltas wrote into.
+      if (done) known.item = item;
+      return done ? known : null;
+    }
+    // An item with no id cannot be matched later, so it joins the transcript once, at done.
+    if (!(item.id || done)) return null;
+    const entry = this.push({ kind: "item" as const, item, owner: owner.subagent });
+    if (item.id) owner.items.set(item.id, entry);
+    return done ? entry : null;
   }
 
   private applyText(owner: Owner, itemId: string, delta: string): Change | null {
-    const item = owner.items.get(itemId);
+    const item = owner.items.get(itemId)?.item;
     if (item?.type !== "message") return null;
     const part = item.content[0];
     if (part?.type === "output_text") part.text += delta;
@@ -230,37 +236,60 @@ class Transcript {
     index: number,
     delta: string,
   ): Change | null {
-    const item = owner.items.get(itemId);
+    const item = owner.items.get(itemId)?.item;
     if (item?.type !== "reasoning") return null;
-    // Summary parts are shown joined by newlines, as the reasoning item view does.
-    const newPart = item.summary.length > 0 && item.summary.length <= index;
+    // Both the live block and the finished item (`summaryText` in ui.tsx) join summary parts
+    // with SUMMARY_SEPARATOR; diffing the joined string before and after this delta, instead
+    // of guessing whether it starts a new part, keeps the two in step even when a part is
+    // skipped or stays empty.
+    const before = item.summary.map((p) => p.text).join(SUMMARY_SEPARATOR);
     while (item.summary.length <= index) item.summary.push({ type: "summary_text", text: "" });
     const part = item.summary[index];
     if (part) part.text += delta;
-    const text = (newPart ? "\n" : "") + delta;
+    const after = item.summary.map((p) => p.text).join(SUMMARY_SEPARATOR);
     return {
       kind: "text",
       id: itemId,
       owner: owner.subagent,
       label: "thinking",
       cls: "reasoning",
-      text,
+      text: after.slice(before.length),
     };
   }
 }
 
-/** Where an event's item is stored and, for a delegated child, whose it is. */
-interface Owner {
-  subagent: Subagent | null;
-  items: Map<string, Item>;
+/** The library's maximum rows per page, and how many pages one replay will fetch: 40 ×
+ * 1,000 rows covers a very long transcript in a handful of subrequests, well under the
+ * Workers Free plan's limit of 50 subrequests per request. */
+const REPLAY_PAGE_ROWS = 1000;
+const REPLAY_PAGE_CAP = 40;
+
+/**
+ * Fold the durable log into `log`, from its cursor to the end; a page is up to
+ * `REPLAY_PAGE_ROWS` rows. Past `REPLAY_PAGE_CAP` pages the loop stops and `log.truncated`
+ * is set, so the caller renders what was folded plus a notice instead of the loop running
+ * until it outruns the subrequest limit and throws.
+ */
+async function replayInto(env: Bindings, id: string, log: Transcript): Promise<Transcript> {
+  for (let page = 0; page < REPLAY_PAGE_CAP; page++) {
+    const response = await cf(
+      env,
+      `/sessions/${id}/events?after=${log.seq}&limit=${REPLAY_PAGE_ROWS}`,
+    );
+    if (!response.ok) throw new Error(`Event replay failed with ${response.status}`);
+    const rows = await response.json<{ seq: number; event: SessionEvent }[]>();
+    const last = rows.at(-1);
+    if (!last) return log;
+    for (const row of rows) log.apply(row.event);
+    log.seq = last.seq;
+  }
+  log.truncated = true;
+  return log;
 }
 
-/** One page of the durable log after `seq`; the route returns at most 100 rows. */
-async function replay(env: Bindings, id: string, after: number) {
-  const response = await cf(env, `/sessions/${id}/events?after=${after}`);
-  if (!response.ok) throw new Error(`Event replay failed with ${response.status}`);
-  return response.json<{ seq: number; event: SessionEvent }[]>();
-}
+/** A settled job: the folded log, plus the artifacts its checkpoint published. */
+const settled = async (client: OpenAI, id: string, log: Transcript): Promise<JobState> =>
+  log.state(await collect(client.beta.agents.sessions.artifacts.list(id)));
 
 /** Frames of the live SSE stream: `id:` is the log sequence number, `data:` the event. */
 async function* frames(
@@ -299,18 +328,11 @@ async function streamJob(c: Context<{ Bindings: Bindings }>, id: string, session
   const client = agentClient(c.env);
   const live = await client.beta.agents.sessions.events.stream(id).asResponse();
   if (!live.body) throw new Error("Event stream has no body");
-  const log = new Transcript(session);
-  for (let after = 0; ;) {
-    const rows = await replay(c.env, id, after);
-    const last = rows.at(-1);
-    if (!last) break;
-    for (const row of rows) log.apply(row.event);
-    after = log.seq = last.seq;
-  }
+  const log = await replayInto(c.env, id, new Transcript(session));
   if (!log.running) {
     // Settled between the retrieve and the replay: the plain page is exact.
     await live.body.cancel();
-    return c.html(<Job id={id} state={await loadJob(client, id, log.session)} />);
+    return c.html(<Job id={id} state={await settled(client, id, log)} />);
   }
   const reader = live.body.pipeThrough(new TextDecoderStream()).getReader();
   c.header("content-type", "text/html; charset=UTF-8");
@@ -319,12 +341,18 @@ async function streamJob(c: Context<{ Bindings: Bindings }>, id: string, session
     async (out) => {
       // The browser went away: release the API's listener; the turn itself continues.
       out.onAbort(() => reader.cancel());
-      const [head, tail] = await livePage(id, log.state());
+      const headState = log.state();
+      const [head, tail] = await livePage(id, headState);
       await out.write(head);
       /** The text block currently open, if any. */
       const block: { open: { id: string; owner: Subagent | null } | null } = { open: null };
-      /** Items whose text streamed live; their `item.done` would repeat it. */
-      const streamed = new Set<string>();
+      // Item ids already rendered — in the head, or as a streamed text block — so a later
+      // `item.done` for the same id (arriving live) is not rendered again.
+      const rendered = new Set<string>(
+        headState.entries.flatMap((entry) =>
+          entry.kind === "item" && entry.item.id ? [entry.item.id] : [],
+        ),
+      );
       const close = async () => {
         if (block.open) await out.write(closeText(block.open.owner));
         block.open = null;
@@ -339,19 +367,16 @@ async function streamJob(c: Context<{ Bindings: Bindings }>, id: string, session
             await close();
             await out.write(openText(change.label, change.cls, change.owner));
             block.open = { id: change.id, owner: change.owner };
-            streamed.add(change.id);
+            rendered.add(change.id);
           }
           await out.write(escape(change.text));
           continue;
         }
         await close();
         if (change.kind === "settled") break;
-        if (change.kind === "item") {
-          if (change.item.id && streamed.has(change.item.id)) continue;
-          await out.write(await render(<LiveItem item={change.item} owner={change.owner} />));
-        } else if (change.kind === "subagent")
-          await out.write(await render(<LiveSubagent subagent={change.subagent} />));
-        else await out.write(await render(<LiveTurnError turn={change.turn} />));
+        if (change.kind === "item" && change.item.id && rendered.has(change.item.id)) continue;
+        // The fold kept this entry, so a reload renders the same view from the log.
+        await out.write(await render(<EntryView entry={change} />));
       }
       await close();
       await reader.cancel();
@@ -368,6 +393,33 @@ async function streamJob(c: Context<{ Bindings: Bindings }>, id: string, session
     },
   );
 }
+
+/** An artifact's name below /workspace/outputs; that is where the instructions send them. */
+const relative = (path: string) =>
+  path.startsWith(OUTPUTS) ? path.slice(OUTPUTS.length) : path.replace(/^\/+/, "");
+
+/** A download filename: the last segment, without the characters that end the quoting. */
+const filename = (path: string) =>
+  relative(path)
+    .split("/")
+    .at(-1)
+    ?.replace(/["\\\r\n]/g, "") || "artifact";
+
+/**
+ * A zip entry name unique among those already used in this archive. Two artifacts can
+ * `relative()` to the same name (one under /workspace/outputs, one outside it but sharing
+ * the same tail); a repeat gets a numbered suffix instead of overwriting the first file.
+ */
+const uniqueEntryName = (used: ReadonlySet<string>, name: string): string => {
+  if (!used.has(name)) return name;
+  const dot = name.lastIndexOf(".");
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let n = 2; ; n++) {
+    const candidate = `${base} (${n})${ext}`;
+    if (!used.has(candidate)) return candidate;
+  }
+};
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -400,32 +452,55 @@ app.post("/jobs", async (c) => {
 });
 
 // A running job streams; a settled one (idle, failed, or requires_action, which this demo
-// cannot answer because it declares no function tools) is one complete page.
+// cannot answer because it declares no function tools) is one complete page. Both are the
+// same fold over the same log, so the two pages render the same transcript.
 app.get("/jobs/:id", async (c) => {
   const id = c.req.param("id");
   const client = agentClient(c.env);
   const session = await client.beta.agents.sessions.retrieve(id);
   if (running(session)) return streamJob(c, id, session);
-  return c.html(<Job id={id} state={await loadJob(client, id, session)} />);
+  const log = await replayInto(c.env, id, new Transcript(session));
+  return c.html(<Job id={id} state={await settled(client, id, log)} />);
 });
 
-// Bundle every artifact the completed turn published under /workspace/outputs.
+// Bundle every artifact the completed turn published under /workspace/outputs, as long as
+// the whole set fits in this Worker's memory; past that the job page links each file.
 app.get("/jobs/:id/zip", async (c) => {
   const id = c.req.param("id");
   const sessions = agentClient(c.env).beta.agents.sessions;
+  const artifacts = await collect(sessions.artifacts.list(id));
+  if (artifacts.length === 0) return c.text("No artifacts for this session", 404);
+  if (!zipFits(artifacts))
+    return c.text("Too large to zip here; download the files one at a time", 413);
   const files: Record<string, Uint8Array> = {};
-  for await (const artifact of sessions.artifacts.list(id)) {
+  const names = new Set<string>();
+  for (const artifact of artifacts) {
     const response = await sessions.artifacts.content(artifact.id, { session_id: id });
-    const name = artifact.path.startsWith(OUTPUTS)
-      ? artifact.path.slice(OUTPUTS.length)
-      : artifact.path.replace(/^\/+/, "");
+    const name = uniqueEntryName(names, relative(artifact.path));
+    names.add(name);
     files[name] = new Uint8Array(await response.arrayBuffer());
   }
-  if (Object.keys(files).length === 0) return c.text("No artifacts for this session", 404);
   return c.body(zipSync(files), 200, {
     "content-type": "application/zip",
-    "content-disposition": `attachment; filename="${id}.zip"`,
+    // Same sanitizer as the per-file route below: the id is a route param too.
+    "content-disposition": `attachment; filename="${filename(id)}.zip"`,
   });
+});
+
+// One artifact, passed straight through: the bytes stream from the API to the browser and
+// no part of the file is ever held in the Worker, whatever its size.
+app.get("/jobs/:id/files/:artifact", async (c) => {
+  const id = c.req.param("id");
+  const sessions = agentClient(c.env).beta.agents.sessions;
+  const artifact = await sessions.artifacts.retrieve(c.req.param("artifact"), { session_id: id });
+  const response = await sessions.artifacts.content(artifact.id, { session_id: id });
+  const headers = new Headers({
+    "content-type": "application/octet-stream",
+    "content-disposition": `attachment; filename="${filename(artifact.path)}"`,
+  });
+  const length = response.headers.get("content-length");
+  if (length) headers.set("content-length", length);
+  return new Response(response.body, { headers });
 });
 
 app.onError((error, c) => {

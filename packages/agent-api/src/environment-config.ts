@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Paths are container paths, never host paths. Reject aliases before materialization. */
-export const workspacePathSchema = z
+const workspacePathSchema = z
   .string()
   .max(4096)
   .refine(
@@ -41,7 +41,7 @@ export const environmentFileSchema = z.discriminatedUnion("type", [
 /** Inline and pinned skill/plugin archives an environment installs, in total, per environment. */
 export const CAPABILITY_BYTES_LIMIT = 64 * 1024 * 1024;
 /** One inline archive; pinned skill bundles are bounded by the Skills API's 16 MiB. */
-export const INLINE_CAPABILITY_LIMIT = 16 * 1024 * 1024;
+const INLINE_CAPABILITY_LIMIT = 16 * 1024 * 1024;
 const source = z.strictObject({
   type: z.literal("base64"),
   media_type: z.literal("application/zip"),
@@ -66,7 +66,7 @@ function inlineCapabilityBytes(configuration: {
   for (const plugin of configuration.plugins ?? []) total += base64Size(plugin.source.data);
   return total;
 }
-export const networkSchema = z.strictObject({
+const networkSchema = z.strictObject({
   access: z.enum(["enabled", "disabled", "restricted"]),
   allowed_domains: z
     .array(
