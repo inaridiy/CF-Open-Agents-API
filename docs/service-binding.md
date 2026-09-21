@@ -12,7 +12,7 @@ Deploy or run the [Agent Worker](deployment.md), then add this to the caller's W
 }
 ```
 
-For local development, follow the [README walkthrough](../README.md#first-run-from-this-repository); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
+For local development, follow the [local development walkthrough](../CONTRIBUTING.md#local-development); `pnpm dev:caller` starts both Workers together. The Agent Worker example disables `workers.dev` and preview URLs; its Service Binding still works.
 
 When the API lives in the same Worker as your application (the setup CLI's retrofit), the binding points at the Worker itself: `{ "binding": "AGENTS", "service": "<your worker>", "entrypoint": "Agents" }`. Everything below applies unchanged; `env.AGENTS` is the same `Fetcher & AgentRPC`.
 

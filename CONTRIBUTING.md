@@ -2,6 +2,29 @@
 
 Use Node 24 and the pinned pnpm (`11.1.2`). Run `pnpm install --frozen-lockfile` from the repository root; the `prepare` hook patches TypeScript and oxlint for the Effect language service. Coding-agent entrypoints, the toolchain and the vendored skills are described in the [development harness guide](docs/development-harness.md); `.agents/` and `pnpm check:harness` exist for coding agents, and a human contributor can ignore them.
 
+## Local development
+
+The examples run against your Cloudflare account: Workers AI has no local emulator, so `wrangler dev` sends `AI` binding calls to the account you are logged into, and the `workers` preset counts against your Workers AI usage. Docker must be running; the first `wrangler dev` builds both images.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm bootstrap        # writes the worker, demo and caller .dev.vars with one random API_TOKEN
+pnpm exec wrangler login
+pnpm dev:caller       # builds the library first, then both images; caller on http://localhost:8788
+```
+
+`pnpm dev` runs the Agent Worker alone on `http://localhost:8787`; `pnpm dev:caller` runs the caller example together with it. Leave `OPENAI_API_KEY` empty in `.dev.vars` if you have no key: presets are built only when a session selects them, and the `workers` preset never calls OpenAI. Then, with the `API_TOKEN` from `examples/worker/.dev.vars`:
+
+```sh
+export AGENT_API_TOKEN=...
+curl http://localhost:8788/sdk/sessions \
+  -H "Authorization: Bearer $AGENT_API_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: first-report' \
+  -d '{"agent":{"model":"workers"},"environment":{"type":"openai_hosted"},"input":"Write /workspace/outputs/report.txt with a short greeting, then read it back and report the result."}'
+```
+
+Poll `GET /sdk/sessions/<id>` with the same header until `session.status` is `idle`, `requires_action` or `failed`; the response includes the items and turns. `DELETE /sdk/sessions/<id>` removes the session. The [caller source](examples/caller/src/index.ts) implements this journey through both the SDK (`/sdk`) and typed RPC (`/rpc`). Use `"model":"codex"` with a real `OPENAI_API_KEY` for the full Codex experience; `claude` and `opencode` run the other runtimes against the same key through the portable AI SDK adapter. On a rootless Docker engine, see [local runtime notes](docs/deployment.md#local-runtime-notes).
+
 ## Toolchain
 
 | Command                   | Purpose                                                                                       |
