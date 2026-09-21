@@ -53,4 +53,6 @@ const tagged = () => {
 if (!tagged()) run("git", ["tag", "--annotate", tag, "--message", `Release ${version}`]);
 run("pnpm", ["exec", "changeset", "git-tag"]);
 run("git", ["push", "origin", "--tags"]);
-run("pnpm", ["exec", "changeset", "publish", "--no-git-tag"]);
+// `changeset publish` chooses the dist-tag itself (`latest`, or `next` for a prerelease
+// version) and ignores `publishConfig.tag`, so the alpha tag is passed explicitly.
+run("pnpm", ["exec", "changeset", "publish", "--no-git-tag", "--tag", "alpha"]);
