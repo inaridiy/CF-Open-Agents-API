@@ -1,6 +1,6 @@
 {
   "name": "create-cf-open-agents-api",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Add the CF-Open-Agents-API to an existing Cloudflare Workers project or create a new one: bindings, composition, Docker image snapshot, dev vars, buckets and secrets",
   "homepage": "https://github.com/inaridiy/CF-Open-Agents-API#readme",
   "bugs": {
