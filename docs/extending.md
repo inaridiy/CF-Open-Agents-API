@@ -177,7 +177,7 @@ A model provider that speaks one of the three protocols needs no driver, only a 
 
 ## Tools and assets
 
-`defineTool` validates arguments and results with Effect Schema and takes an Effect-valued `execute`. Use its `effect` method for composition and its `call` Promise adapter in SDK tool handlers. `webSearch` and `knowledgeSearch` wrap provider functions and return source URLs; a corpus search is not presented as a public-web search.
+`defineTool` validates arguments and results with Effect Schema and takes an Effect-valued `execute`. Use its `effect` method for composition and its `call` Promise adapter in SDK tool handlers. `webSearch` and `knowledgeSearch` wrap provider functions and return source URLs; a corpus search is not presented as a public-web search. [Web search](web-search.md) compares this with the provider's hosted search.
 
 ```ts
 import { webSearch } from "cf-open-agents-api/tools";

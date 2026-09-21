@@ -4,7 +4,7 @@ Use the `client` from the [Service Binding guide](service-binding.md#connect-the
 
 ## Images, web search and streamed progress
 
-Hosted web search needs a preset on Codex or Claude Code whose model connection provides it: `webSearch: true` on a preset whose gateway entry is a `nativeModel` connection, like the example's `codex` preset. The portable AI SDK adapter does not carry hosted search. OpenCode has no hosted search; expose search as a function tool there. Images work on every harness; the portable AI SDK adapter still needs a provider that accepts them.
+Hosted web search needs a preset on Codex or Claude Code whose model connection provides it: `webSearch: true` on a preset whose gateway entry is a `nativeModel` connection, like the example's `codex` preset. The portable AI SDK adapter does not carry hosted search. OpenCode has no hosted search; expose search as a function tool there, as [Web search](web-search.md) shows. Images work on every harness; the portable AI SDK adapter still needs a provider that accepts them.
 
 ```ts
 const visual = await client.beta.agents.sessions.create({

@@ -93,5 +93,6 @@ Production is two commands in the generated project, `pnpm dlx create-cf-open-ag
 | The setup CLI and the generated files           | [create-cf-open-agents-api](../packages/create-cf-open-agents-api/README.md) |
 | Embedding the library in your own Worker        | [Library API](library-api.md)                                                |
 | Files, skills, templates, MCP, subagents, forks | [Environments and tools](environments-and-tools.md)                          |
+| Hosted web search, or a search of your own      | [Web search](web-search.md)                                                  |
 | Presets, model adapters, custom drivers         | [Extending](extending.md)                                                    |
 | What the official SDK can and cannot do here    | [Compatibility profile](compatibility.md)                                    |

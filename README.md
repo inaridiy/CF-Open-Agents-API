@@ -245,7 +245,7 @@ const session = await client.beta.agents.sessions.create({
 });
 ```
 
-`mode` is `live` (the default), `cached`, or `disabled`; `allowed_domains`, `context_size` and `location` are forwarded to Codex and `allowed_domains` is enforced on Claude Code. A preset without `webSearch: true` rejects the tool, so a deployment decides which presets may reach the web. `GET /cf/v1/capabilities` shows the flag per preset. Details and the image example are in [Environments and tools](docs/environments-and-tools.md#images-web-search-and-streamed-progress).
+`mode` is `live` (the default), `cached`, or `disabled`; `allowed_domains`, `context_size` and `location` are forwarded to Codex and `allowed_domains` is enforced on Claude Code. A preset without `webSearch: true` rejects the tool, so a deployment decides which presets may reach the web. `GET /cf/v1/capabilities` shows the flag per preset. [Web search](docs/web-search.md) compares hosted search with a search of your own as a function tool or an MCP server, and shows both.
 
 ## Develop
 
