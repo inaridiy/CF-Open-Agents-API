@@ -1,0 +1,62 @@
+[
+  {
+    "path": "brands/codex.svg",
+    "url": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-svg/icons/codex.svg",
+    "license": "Lobe Icons MIT; Codex mark belongs to OpenAI",
+    "sha256": "d08b4e824cd6727e89617f59e4737273ff53e44c1da849d016dd64dfd08b33e1"
+  },
+  {
+    "path": "brands/claude-code.png",
+    "url": "https://code.claude.com/docs/_mintlify/favicons/claude-code/pLsy-mRpNksna2sx/_generated/favicon/android-chrome-192x192.png",
+    "license": "Official Claude Code documentation icon; Anthropic trademark",
+    "sha256": "d4e5e8e9990ac52f147a74ae80b9e69cdc612264b84a76cdb5c43b53b73a1707"
+  },
+  {
+    "path": "brands/opencode.svg",
+    "url": "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/console/app/src/asset/brand/opencode-logo-light-square.svg",
+    "license": "Official OpenCode brand asset; Anomaly trademark",
+    "sha256": "b1c48d82ebd304eab820658387642bcf4c9b8350d6860894d0fe21ddca25ef3f"
+  },
+  {
+    "path": "brands/cloudflare.svg",
+    "url": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-svg/icons/cloudflare-color.svg",
+    "license": "Lobe Icons MIT; Cloudflare trademark",
+    "sha256": "cee35d3f0ecb7925ce0a89aeaff8b907cadae7c3fe44a23e4001cc8d5ee57502"
+  },
+  {
+    "path": "brands/github.svg",
+    "url": "https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/static-svg/icons/github.svg",
+    "license": "Lobe Icons MIT; GitHub trademark",
+    "sha256": "1bd763b5d53ab1618e0afce72aacffc7e93d1249c395f713b3b055c087526625"
+  },
+  {
+    "path": "Inter.ttf",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz,wght%5D.ttf",
+    "license": "SIL Open Font License 1.1",
+    "sha256": "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031"
+  },
+  {
+    "path": "JetBrainsMono.ttf",
+    "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf",
+    "license": "SIL Open Font License 1.1",
+    "sha256": "48715a42ec242c21e9f02692891e147d022299a52e48d5e413e1a942193ffeda"
+  },
+  {
+    "path": "audio/sweep.mp3",
+    "url": "https://assets.mixkit.co/active_storage/sfx/166/166-preview.mp3",
+    "license": "Mixkit Sound Effects Free License; Fast small sweep transition",
+    "sha256": "5d8153579cfbd4ec23738494dff8dec95b3737981578222b793eff9e3fdd4ca8"
+  },
+  {
+    "path": "audio/click.mp3",
+    "url": "https://assets.mixkit.co/active_storage/sfx/2585/2585-preview.mp3",
+    "license": "Mixkit Sound Effects Free License; On or off light switch tap",
+    "sha256": "dda541a92e6e4be23637d4ee483a6fa67f037ff50427c410730ff4b998346559"
+  },
+  {
+    "path": "audio/settle.mp3",
+    "url": "https://assets.mixkit.co/active_storage/sfx/2299/2299-preview.mp3",
+    "license": "Mixkit Sound Effects Free License; Short bass hit",
+    "sha256": "8bd0c7fd63fbb8a4442ffe1176aa41b260d1fafbcf728e3c63648eb5bcd4e16b"
+  }
+]

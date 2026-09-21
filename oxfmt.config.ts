@@ -20,5 +20,7 @@ export default defineConfig({
     "**/test/fixtures/**",
     "**/test/.tmp-*/**",
     "**/.wrangler/**",
+    // Preserve the unmodified, model-generated artifact shown in the launch film.
+    "video/public/demo/**",
   ],
 });

@@ -1,0 +1,32 @@
+{
+  "url": "http://127.0.0.1:8787/jobs/sess_99c3a607271441349665dec0deb48893",
+  "title": "Job sess_99c3a607271441349665dec0deb48893",
+  "width": 1920,
+  "pageH": 1080,
+  "elements": {
+    "main": {
+      "x": 564,
+      "y": 0,
+      "w": 792,
+      "h": 395
+    },
+    "header": {
+      "x": 580,
+      "y": 32,
+      "w": 760,
+      "h": 44
+    },
+    "form": null,
+    "textarea": null,
+    "button": null,
+    ".status": {
+      "x": 580,
+      "y": 136,
+      "w": 112.078125,
+      "h": 35
+    },
+    ".outputs": null,
+    ".final_answer": null,
+    "canvas": null
+  }
+}
