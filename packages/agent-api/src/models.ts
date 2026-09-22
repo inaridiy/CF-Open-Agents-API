@@ -128,7 +128,11 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
               break;
             // Provider-private signatures and encrypted content remain native-only.
             case "error":
-              throw new Error("Upstream model request failed");
+              // The provider's message names the reason (capacity, quota, a bad key) for
+              // the gateway's log line; request and response bodies stay out of it.
+              throw new Error("Upstream model request failed", {
+                cause: providerErrorSummary(part.error),
+              });
             case "finish":
               yield { type: "finish", reason: part.finishReason, usage: part.totalUsage };
               break;
@@ -168,3 +172,9 @@ export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectM
 }
 
 export type { LanguageModelUsage };
+
+/** One line naming a provider failure, never its request or response bodies. */
+function providerErrorSummary(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return typeof error === "string" ? error : "unknown provider error";
+}
