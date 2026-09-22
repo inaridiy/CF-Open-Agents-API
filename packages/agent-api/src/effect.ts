@@ -43,6 +43,25 @@ export const io = <A>(operation: string, f: (signal: AbortSignal) => PromiseLike
 export const attempt = <A>(operation: string, f: () => A) =>
   Effect.try({ try: f, catch: (cause) => failure(operation, cause) });
 
+/** The messages down a failure's `cause` chain, for a log line an operator reads. */
+export function causeChain(error: unknown): string[] {
+  const chain: string[] = [];
+  for (let current = error, depth = 0; current !== undefined && depth < 8; depth += 1) {
+    chain.push(describe(current));
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return chain;
+}
+function describe(value: unknown): string {
+  if (value instanceof Error) return `${value.name}: ${value.message}`;
+  if (typeof value !== "object" || value === null) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "[unserializable cause]";
+  }
+}
+
 /** Every boundary runner settles the same way: the value, or the squashed cause thrown as itself. */
 export function settle<A, E>(exit: Exit.Exit<A, E>): A {
   if (Exit.isSuccess(exit)) return exit.value;

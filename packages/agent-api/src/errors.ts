@@ -340,6 +340,13 @@ const DEFINITE = {
     "environment_unavailable",
     "Environment driver is unavailable",
   ],
+  /** The Sandbox SDK signs backup URLs with R2 secrets the deployment did not set. */
+  BackupCredentialsMissing: [
+    503,
+    "environment_unavailable",
+    (p: { missing: readonly string[] }) =>
+      `Sandbox backups need the secrets ${p.missing.join(", ")}; set them with wrangler secret put (LOCAL_BACKUPS=true under wrangler dev)`,
+  ],
   CapabilityBudgetExceeded: [
     413,
     "capability_limit",
@@ -480,6 +487,7 @@ export class EnvironmentSetupFailed extends definite("EnvironmentSetupFailed") {
 export class EnvironmentWriteFailed extends definite("EnvironmentWriteFailed") {}
 export class EnvironmentListFailed extends definite("EnvironmentListFailed") {}
 export class EnvironmentDriverUnavailable extends definite("EnvironmentDriverUnavailable") {}
+export class BackupCredentialsMissing extends definite("BackupCredentialsMissing") {}
 export class CapabilityBudgetExceeded extends definite("CapabilityBudgetExceeded") {}
 export class StoredObjectMissing extends definite("StoredObjectMissing") {}
 export class ObjectStorageUnavailable extends definite("ObjectStorageUnavailable") {}

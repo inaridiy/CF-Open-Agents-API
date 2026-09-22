@@ -45,6 +45,8 @@ pnpm exec wrangler deploy
 
    `BACKUP_BUCKET_NAME` is a plain variable read by the Sandbox SDK. `LOCAL_BACKUPS` is read by the library and must stay unset in production; it switches backups to Wrangler's local bucket emulation. The sandbox container itself never receives R2 or model credentials, only short-lived presigned URLs.
 
+   A deployment without the R2 secrets (or `LOCAL_BACKUPS`) answers every hosted session creation with `503 environment_unavailable` naming the missing secrets, before any container starts. A setup that fails inside the sandbox instead marks the session `environment_setup_failed`; the cause is in the Worker's logs as `Environment setup failed` with the session id.
+
 4. Decide how the API is reached. The minimal template and `examples/worker` set `workers_dev: false` and `preview_urls: false`; a Service Binding works without any public route. The demo template publishes on workers.dev by default and its page has no login, so put Cloudflare Access in front of it or replace the page with your own auth before sharing the URL (`workers_dev: false` keeps it off workers.dev). Add a custom domain or route only if you host the HTTP API, and replace the single-tenant authenticator first.
 
 5. Deploy:
