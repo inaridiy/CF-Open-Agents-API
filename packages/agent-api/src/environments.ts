@@ -33,6 +33,12 @@ export const environmentFilePageSchema = z.strictObject({
   path: z.string().nullable().optional(),
 });
 export interface EnvironmentDriver {
+  /**
+   * Whether this deployment can host an environment at all, answered before a session
+   * reserves one. A failure here is the creation's answer; `prepare` failing instead
+   * marks the environment and the session failed.
+   */
+  preflight?(): Effect.Effect<void, ServiceError>;
   prepare(spec: EnvironmentSpec): Effect.Effect<void, ServiceError>;
   status(spec: EnvironmentSpec): Effect.Effect<EnvironmentInfo["status"], ServiceError>;
   upload(

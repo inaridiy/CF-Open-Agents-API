@@ -5,6 +5,7 @@ import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/
 import ExampleCallerWorker from "../../examples/caller/src/index.js";
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
 import type { EnvironmentDriver } from "../../packages/agent-api/src/environments.js";
+import { BackupCredentialsMissing } from "../../packages/agent-api/src/errors.js";
 import { ApiError } from "../../packages/agent-api/src/protocol.js";
 import type {
   Execution,
@@ -265,6 +266,15 @@ function scriptedEnvironments(env: TestEnv): EnvironmentDriver {
       new ApiError(503, "environment_unavailable", "Scripted environments hold no files"),
     );
   return {
+    // A stored marker stands in for a deployment without backup credentials.
+    preflight: () =>
+      Effect.promise(() => env.ASSETS.get("environment-preflight")).pipe(
+        Effect.flatMap((blocked) =>
+          blocked
+            ? Effect.fail(new BackupCredentialsMissing({ missing: ["R2_ACCESS_KEY_ID"] }))
+            : Effect.void,
+        ),
+      ),
     prepare: () => Effect.void,
     status: (spec) =>
       Effect.promise(async () => {

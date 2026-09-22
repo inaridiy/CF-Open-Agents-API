@@ -10,6 +10,7 @@ export {
 } from "./effect.js";
 export {
   ArtifactLimitExceeded,
+  BackupCredentialsMissing,
   ArtifactListFailed,
   AssignmentConflict,
   BodyTooLarge,

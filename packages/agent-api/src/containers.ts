@@ -36,7 +36,13 @@ import {
 } from "./containers/sandbox.js";
 import { decode, io, settle } from "./effect.js";
 import type { EnvironmentDriver } from "./environments.js";
-import { CommandRejected, ExecutionMissing, Superseded, TransportFailure } from "./errors.js";
+import {
+  BackupCredentialsMissing,
+  CommandRejected,
+  ExecutionMissing,
+  Superseded,
+  TransportFailure,
+} from "./errors.js";
 import { HARNESSES, type HarnessName } from "./harnesses.js";
 import { type HarnessTx, makeHarnessRepo, makeHarnessTx } from "./persistence/harness-tx.js";
 import type { Checkpoint, Execution, RuntimeCommand, RuntimeDriver } from "./runtime.js";
@@ -370,9 +376,29 @@ export class HarnessContainer<
   }
 }
 
+/**
+ * The secrets `@cloudflare/sandbox` signs backup URLs with. The SDK only checks them when
+ * the first backup runs, after the container booted, and its message never leaves the
+ * harness; naming them before a session exists turns a misdeployment into a 503.
+ */
+export function missingBackupCredentials(env: ContainerBindings): string[] {
+  if (env.LOCAL_BACKUPS === "true") return [];
+  const missing: string[] = [];
+  if (!(env.CLOUDFLARE_R2_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID))
+    missing.push("CLOUDFLARE_R2_ACCOUNT_ID");
+  if (!env.R2_ACCESS_KEY_ID) missing.push("R2_ACCESS_KEY_ID");
+  if (!env.R2_SECRET_ACCESS_KEY) missing.push("R2_SECRET_ACCESS_KEY");
+  if (!env.BACKUP_BUCKET_NAME) missing.push("BACKUP_BUCKET_NAME");
+  return missing;
+}
+
 export function containerEnvironments(env: ContainerBindings): EnvironmentDriver {
   const stub = (sessionId: string) => env.HARNESS.getByName(sessionId);
   return {
+    preflight: () => {
+      const missing = missingBackupCredentials(env);
+      return missing.length ? Effect.fail(new BackupCredentialsMissing({ missing })) : Effect.void;
+    },
     prepare: (spec) =>
       io("environment.prepare", () => stub(spec.sessionId).prepareEnvironment(spec)),
     status: (spec) => io("environment.status", () => stub(spec.sessionId).environmentStatus(spec)),

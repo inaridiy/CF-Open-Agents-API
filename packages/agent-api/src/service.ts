@@ -5,7 +5,7 @@ import type { Hono } from "hono";
 import { sha256Hex } from "./bytes.js";
 import type { CatalogObject, Reservation } from "./catalog.js";
 import { agentResource, ReservationResult, ReserveResult } from "./catalog.js";
-import { attempt, io, runPromise } from "./effect.js";
+import { attempt, causeChain, io, runPromise } from "./effect.js";
 import {
   type HostedConfiguration,
   hostedConfigurationSchema,
@@ -163,15 +163,23 @@ export function createAgentService<Env extends AgentBindings>(
           io("api.createSession", () => catalog.commit(idempotencyKey)),
         );
         if (reservation.ready) return yield* io("api.createSession", () => stub.retrieve());
-        yield* io("api.createSession", () => stub.initialize(reservation.record));
         const environmentSpec = reservation.record.environmentSpec;
-        if (environmentSpec) {
+        const environments = environmentSpec ? options.environments?.(this.env) : undefined;
+        if (environmentSpec && !environments) return yield* new EnvironmentDriverUnavailable();
+        // A deployment that cannot host any environment answers before anything is written,
+        // so a retry after the fix starts clean.
+        if (environments?.preflight) yield* environments.preflight();
+        yield* io("api.createSession", () => stub.initialize(reservation.record));
+        if (environmentSpec && environments) {
           yield* io("api.environment.register", () => catalog.registerEnvironment(environmentSpec));
-          const environments = options.environments?.(this.env);
-          if (!environments) return yield* new EnvironmentDriverUnavailable();
           yield* io("api.environment.pending", () => stub.environmentStatus("pending"));
           const prepared = yield* environments.prepare(environmentSpec).pipe(Effect.either);
           if (prepared._tag === "Left") {
+            // The client only learns `environment_setup_failed`; the cause is for the operator.
+            yield* Effect.logError("Environment setup failed", {
+              session_id: reservation.id,
+              cause: causeChain(prepared.left),
+            });
             yield* io("api.environment.failed", () => stub.environmentStatus("failed"));
             yield* commit;
             return yield* io("api.createSession", () => stub.retrieve());

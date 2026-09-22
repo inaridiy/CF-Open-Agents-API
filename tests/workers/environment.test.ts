@@ -6,6 +6,10 @@ import OpenAI from "openai";
 import type { AgentSessionEvent } from "openai/resources/beta/agents/agents";
 import { afterEach, expect, it } from "vitest";
 
+import {
+  type ContainerBindings,
+  missingBackupCredentials,
+} from "../../packages/agent-api/src/containers.js";
 import { SessionKinds } from "../../packages/agent-api/src/persistence/session-kinds.js";
 import type * as WorkerModule from "./worker.js";
 import type { SessionDO, TestEnv } from "./worker.js";
@@ -114,4 +118,44 @@ it("reports a lost sandbox as environment.disconnected and a restored one as con
   expect((await statuses()).at(-1)).toBe("agent.session.environment.connected");
   // The session itself stays usable throughout.
   expect((await api.beta.agents.sessions.retrieve(session.id)).status).toBe("idle");
+});
+
+it("answers creation with 503 before reserving an environment the deployment cannot host", async () => {
+  await env.ASSETS.put("environment-preflight", "blocked");
+  const refused: unknown = await api.beta.agents.sessions
+    .create({ agent: { model: "test-hosted" }, environment: { type: "openai_hosted" } })
+    .catch((error: unknown) => error);
+  expect(refused).toBeInstanceOf(OpenAI.APIError);
+  const apiError = refused as InstanceType<typeof OpenAI.APIError>;
+  expect(apiError.status).toBe(503);
+  expect(apiError.code).toBe("environment_unavailable");
+  expect(apiError.message).toContain("R2_ACCESS_KEY_ID");
+  // Nothing was committed: the tenant lists no session, and the fixed deployment starts clean.
+  expect((await api.beta.agents.sessions.list()).data).toEqual([]);
+  await env.ASSETS.delete("environment-preflight");
+  const session = await api.beta.agents.sessions.create({
+    agent: { model: "test-hosted" },
+    environment: { type: "openai_hosted" },
+  });
+  expect(session.status).toBe("idle");
+  expect(
+    (await replay(session.id))
+      .map(({ event }) => event.type)
+      .filter((type) => type.startsWith("agent.session.environment.")),
+  ).toEqual(["agent.session.environment.pending", "agent.session.environment.connected"]);
+});
+
+it("names every backup secret the Sandbox SDK reads, unless backups are local", () => {
+  expect(missingBackupCredentials({ LOCAL_BACKUPS: "true" } as ContainerBindings)).toEqual([]);
+  expect(
+    missingBackupCredentials({ BACKUP_BUCKET_NAME: "workspaces" } as ContainerBindings),
+  ).toEqual(["CLOUDFLARE_R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]);
+  expect(
+    missingBackupCredentials({
+      CLOUDFLARE_ACCOUNT_ID: "a",
+      R2_ACCESS_KEY_ID: "k",
+      R2_SECRET_ACCESS_KEY: "s",
+      BACKUP_BUCKET_NAME: "workspaces",
+    } as ContainerBindings),
+  ).toEqual([]);
 });

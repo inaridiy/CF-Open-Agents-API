@@ -19,6 +19,12 @@ export interface ContainerBindings {
   /** Optional trusted service that sends configured service-origin MCP requests. */
   MCP?: Fetcher;
   LOCAL_BACKUPS?: string;
+  /** Read by `@cloudflare/sandbox` to sign backup URLs; unset, only `LOCAL_BACKUPS` works. */
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  CLOUDFLARE_R2_ACCOUNT_ID?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  BACKUP_BUCKET_NAME?: string;
   CATALOG: DurableObjectNamespace<CatalogObject>;
 }
 
