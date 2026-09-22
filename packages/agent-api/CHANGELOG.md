@@ -2,6 +2,12 @@
 
 Entries from 0.4.1 on are written by `changeset version` from the pull requests' changesets. Earlier entries cover the library and the setup CLI together.
 
+## 0.4.2
+
+### Patch Changes
+
+- [#12](https://github.com/inaridiy/CF-Open-Agents-API/pull/12) [`ebd1a2c`](https://github.com/inaridiy/CF-Open-Agents-API/commit/ebd1a2ccdf956b1533f1f3569686898b1785645a) Thanks [@inaridiy](https://github.com/inaridiy)! - Refuse hosted session creation with `503 environment_unavailable` naming the R2 secrets the Sandbox SDK needs (`CLOUDFLARE_R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `BACKUP_BUCKET_NAME`) when a deployment sets neither them nor `LOCAL_BACKUPS`, instead of starting a container and failing the session as `environment_setup_failed` with no cause anywhere. Environment drivers may declare a `preflight`, and a setup failure now logs its cause chain with the session id.
+
 ## 0.4.1
 
 ### Patch Changes
