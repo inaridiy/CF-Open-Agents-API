@@ -1,5 +1,6 @@
 import type { FinishReason, LanguageModelUsage } from "ai";
 
+import { causeChain } from "../effect.js";
 import { ModelOutputFailed } from "../errors.js";
 import type { ModelInput } from "./input.js";
 
@@ -388,7 +389,13 @@ export async function encodeModelResponse(
         return;
       }
       yield* epilogue(hasCalls);
-    } catch {
+    } catch (error) {
+      // The client only learns `model_output_failed`; the reason is for the operator.
+      console.warn("Model output failed", {
+        model: input.model,
+        finish: finish ?? null,
+        cause: causeChain(error),
+      });
       if (!input.stream) throw new ModelOutputFailed();
       yield* failed();
     } finally {
