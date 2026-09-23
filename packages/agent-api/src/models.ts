@@ -10,6 +10,7 @@ import {
 import { Effect } from "effect";
 
 import { io } from "./effect.js";
+import { ModelUpstreamRejected } from "./errors.js";
 import { type EffectModelAdapter, fetchWithoutRedirect, modelAdapter } from "./models/gateway.js";
 import {
   decodeModelRequest,
@@ -24,6 +25,7 @@ import { encodeModelResponse, type ModelChunk } from "./models/output.js";
 export {
   createModelGateway,
   type EffectModelAdapter,
+  fallbackModel,
   fetchWithoutRedirect,
   type ModelAdapter,
   modelAdapter,
@@ -119,42 +121,62 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
           ...(options.timeoutMs === undefined ? [] : [AbortSignal.timeout(options.timeoutMs)]),
         ]),
       });
+      type Part =
+        Awaited<ReturnType<(typeof result.fullStream)[typeof Symbol.asyncIterator]>> extends {
+          next(): Promise<IteratorResult<infer P>>;
+        }
+          ? P
+          : never;
+      const parts = result.fullStream[Symbol.asyncIterator]();
+      const abort = Effect.sync(() => controller.abort());
+      // Nothing is committed to the harness until the upstream has answered with output
+      // or a finish; an error before that fails the request, so a fallback can try the
+      // next model with the same request.
+      const first = yield* io("model.first", async () => {
+        for (;;) {
+          const next = await parts.next();
+          if (next.done || substantive(next.value.type)) return next;
+        }
+      }).pipe(Effect.onError(() => abort));
+      if (!first.done && first.value.type === "error") {
+        // The provider's message names the reason (capacity, quota, a bad key) for the
+        // gateway's log line; request and response bodies stay out of it.
+        console.warn("Model upstream rejected the request", {
+          model: input.model,
+          cause: providerErrorSummary(first.value.error),
+        });
+        controller.abort();
+        return yield* new ModelUpstreamRejected();
+      }
+      function translate(part: Part): ModelChunk | undefined {
+        switch (part.type) {
+          case "text-delta":
+            return { type: "text", id: part.id, text: part.text };
+          case "reasoning-delta":
+            return { type: "reasoning", id: part.id, text: part.text };
+          case "tool-call":
+            if (part.invalid) throw new Error("Model returned an invalid tool call");
+            return { type: "call", id: part.toolCallId, name: part.toolName, input: part.input };
+          // Provider-private signatures and encrypted content remain native-only.
+          case "error":
+            throw new Error("Upstream model request failed", {
+              cause: providerErrorSummary(part.error),
+            });
+          case "finish":
+            return { type: "finish", reason: part.finishReason, usage: part.totalUsage };
+          default:
+            return undefined;
+        }
+      }
       async function* chunks(): AsyncGenerator<ModelChunk> {
-        for await (const part of result.fullStream) {
-          switch (part.type) {
-            case "text-delta":
-              yield { type: "text", id: part.id, text: part.text };
-              break;
-            case "reasoning-delta":
-              yield { type: "reasoning", id: part.id, text: part.text };
-              break;
-            case "tool-call":
-              if (part.invalid) throw new Error("Model returned an invalid tool call");
-              yield {
-                type: "call",
-                id: part.toolCallId,
-                name: part.toolName,
-                input: part.input,
-              };
-              break;
-            // Provider-private signatures and encrypted content remain native-only.
-            case "error":
-              // The provider's message names the reason (capacity, quota, a bad key) for
-              // the gateway's log line; request and response bodies stay out of it.
-              throw new Error("Upstream model request failed", {
-                cause: providerErrorSummary(part.error),
-              });
-            case "finish":
-              yield { type: "finish", reason: part.finishReason, usage: part.totalUsage };
-              break;
-            default:
-              break;
-          }
+        for (let next = first; !next.done; next = await parts.next()) {
+          const chunk = translate(next.value);
+          if (chunk) yield chunk;
         }
       }
       return yield* io("model.encode", () =>
         encodeModelResponse(input, chunks(), () => controller.abort()),
-      ).pipe(Effect.onError(() => Effect.sync(() => controller.abort())));
+      ).pipe(Effect.onError(() => abort));
     }),
   );
 }
@@ -184,6 +206,9 @@ export function openAICompatibleModel(options: OpenAICompatibleOptions): EffectM
 
 export type { LanguageModelUsage };
 
+/** The stream parts that carry output or an outcome; the rest are framing. */
+const substantive = (type: string) =>
+  ["text-delta", "reasoning-delta", "tool-call", "finish", "error"].includes(type);
 /** One line naming a provider failure, never its request or response bodies. */
 function providerErrorSummary(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;

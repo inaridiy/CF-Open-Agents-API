@@ -115,6 +115,7 @@ Runtime drivers, HarnessDO and the Containers, the environment workspace, the mo
 | `ModelInputTooLarge`            |                             | The gateway request exceeds 4 MiB.                                                                  | 413 `model_input_too_large`            |
 | `ModelInputUnsupported`         |                             | The portable adapter cannot translate provider-specific content.                                    | 400 `unsupported_model_input`          |
 | `ModelOutputFailed`             |                             | The upstream output failed or was incomplete.                                                       | 503 `model_output_failed`              |
+| `ModelUpstreamRejected`         |                             | The upstream answered with an error before any output; `fallbackModel` tries the next model.        | 503 `model_upstream_rejected`          |
 | `ProgrammaticExecutionFailed`   | `reason`                    | Model-written code failed definitely.                                                               | 422 `programmatic_execution_failed`    |
 | `ProgrammaticOutcomeUncertain`  | `reason`                    | A tool call ended without a confirmed result; the code may have had effects.                        | 422 `programmatic_execution_uncertain` |
 | `ProgrammaticInputTooLarge`     |                             | Code and arguments exceed 256 KB.                                                                   | 413 `programmatic_input_too_large`     |

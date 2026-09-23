@@ -1,8 +1,13 @@
 import { Context, Effect, Layer } from "effect";
 
 import { readBounded } from "../bytes.js";
-import { attempt, io, runPromise, type ServiceError } from "../effect.js";
-import { ModelNotFound, ModelProtocolMismatch, projectApiError } from "../errors.js";
+import { attempt, causeChain, io, runPromise, type ServiceError } from "../effect.js";
+import {
+  ModelNotFound,
+  ModelProtocolMismatch,
+  ModelUpstreamRejected,
+  projectApiError,
+} from "../errors.js";
 import { isRedirect, requestWithoutRedirect } from "../http.js";
 import { readModelBodyEffect } from "./body.js";
 
@@ -143,6 +148,58 @@ function gatewayFailure(error: ServiceError): Response {
 }
 /** A registered model: an adapter, or a factory called only when that name is selected. */
 export type ModelRegistration = ModelAdapter | (() => ModelAdapter);
+
+/** An answer no model produced output for; the next candidate may do better. */
+const rejected = (response: Response) => response.status === 429 || response.status >= 500;
+const describeOutcome = (outcome: ServiceError | Response) =>
+  outcome instanceof Response ? `HTTP ${outcome.status}` : causeChain(outcome).join(" <- ");
+
+/**
+ * One registry entry backed by several models, tried in order. A candidate is skipped when
+ * it fails before producing output: an adapter failure (`aiSDKModel` fails with
+ * `ModelUpstreamRejected` when the provider errors before its first token) or an answer
+ * with status 429 or 5xx (`nativeModel` passes the provider's status through). Output that
+ * already started streaming is never retried on another model. Each candidate is built
+ * only when its turn comes, and the last outcome answers when every candidate failed.
+ */
+export function fallbackModel(candidates: Record<string, ModelRegistration>): EffectModelAdapter {
+  const names = Object.keys(candidates);
+  if (names.length === 0) throw new Error("fallbackModel needs at least one model");
+  return modelAdapter((request) =>
+    Effect.gen(function* () {
+      const bytes = yield* io("model.body", () => request.arrayBuffer());
+      const call = (name: string) =>
+        Effect.gen(function* () {
+          const adapter = yield* attempt("model.registration", () =>
+            resolveModel(candidates[name] as ModelRegistration),
+          );
+          const copy = new Request(request, { body: bytes, signal: request.signal });
+          const response =
+            "effect" in adapter
+              ? yield* (adapter as EffectModelAdapter).effect(copy)
+              : yield* io("model.inference", () => adapter.fetch(copy));
+          return response;
+        });
+      let last: ServiceError | Response | undefined;
+      for (const [index, name] of names.entries()) {
+        if (request.signal.aborted) break;
+        const outcome = yield* call(name).pipe(Effect.either);
+        if (outcome._tag === "Right" && !rejected(outcome.right)) return outcome.right;
+        last = outcome._tag === "Right" ? outcome.right : outcome.left;
+        const next = names[index + 1];
+        if (next === undefined) break;
+        console.warn("Model fallback", { from: name, to: next, cause: describeOutcome(last) });
+        const discarded = last;
+        if (discarded instanceof Response)
+          yield* io("model.discard", () => discarded.body?.cancel() ?? Promise.resolve()).pipe(
+            Effect.ignore,
+          );
+      }
+      if (last instanceof Response) return last;
+      return yield* Effect.fail(last ?? new ModelUpstreamRejected());
+    }),
+  );
+}
 class Models extends Context.Tag("agent-api/Models")<
   Models,
   Readonly<Record<string, ModelRegistration>>
