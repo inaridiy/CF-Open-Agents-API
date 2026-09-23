@@ -123,8 +123,8 @@ Claude Code is designed for Claude models. Anthropic does not officially support
 import { aiSDKModel, openAICompatibleModel } from "cf-open-agents-api/models";
 
 const portable = aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra"), {
-  maxOutputTokens: 8192, // upper bound; the harness may ask for less
-  timeoutMs: 120_000,
+  maxOutputTokens: 32_768, // optional upper bound; unset, the provider's own limit applies
+  timeoutMs: 600_000, // optional; unset, only the turn deadline bounds a request
   // Static options, or a function of the settings decoded from the harness request.
   providerOptions: ({ reasoningEffort, outputSchema }) =>
     reasoningEffort ? { openai: { reasoningSummary: "auto" } } : undefined,
