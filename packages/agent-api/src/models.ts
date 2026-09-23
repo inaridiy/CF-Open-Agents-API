@@ -39,10 +39,17 @@ export interface ModelSettings {
   outputSchema?: OutputSchema;
 }
 export interface AIModelOptions {
+  /** Upper bound on output tokens; unset, the provider's own limit applies. */
   maxOutputTokens?: number;
+  /** Abort a request after this long; unset, only the turn deadline bounds it. */
   timeoutMs?: number;
   /** Static provider options, or a mapping from the decoded request settings. */
   providerOptions?: ProviderOptions | ((settings: ModelSettings) => ProviderOptions | undefined);
+}
+/** The smaller of two optional limits, or none when neither is set. */
+function bound(requested: number | undefined, allowed: number | undefined): number | undefined {
+  if (requested === undefined) return allowed;
+  return allowed === undefined ? requested : Math.min(requested, allowed);
 }
 /** The AI SDK's provider-neutral reasoning levels stop at `xhigh`; `max` rounds down. */
 function standardReasoning(
@@ -91,7 +98,9 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
         toolChoice: input.toolChoice,
         temperature: input.temperature,
         topP: input.topP,
-        maxOutputTokens: Math.min(input.maxOutputTokens ?? 8192, options.maxOutputTokens ?? 8192),
+        // The tighter of what the harness asked for and what the deployment allows; with
+        // neither, the provider's own output limit applies.
+        maxOutputTokens: bound(input.maxOutputTokens, options.maxOutputTokens),
         reasoning: standardReasoning(input.reasoningEffort),
         // With a structured output the model's text is the JSON document; the
         // harness validates it, so the stream is forwarded without a second parse.
@@ -102,10 +111,12 @@ export function aiSDKModel(model: LanguageModel, options: AIModelOptions = {}): 
             : options.providerOptions,
         maxRetries: 0,
         onError: () => {}, // Return a sanitized protocol error; never log provider request bodies.
+        // No timeout of its own: the turn deadline and the runtime's stream handling
+        // bound a request unless the deployment sets `timeoutMs`.
         abortSignal: AbortSignal.any([
           request.signal,
           controller.signal,
-          AbortSignal.timeout(options.timeoutMs ?? 120_000),
+          ...(options.timeoutMs === undefined ? [] : [AbortSignal.timeout(options.timeoutMs)]),
         ]),
       });
       async function* chunks(): AsyncGenerator<ModelChunk> {
