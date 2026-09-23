@@ -385,6 +385,8 @@ const DEFINITE = {
     "Unsupported translated model input; use a native model preset for provider-specific content",
   ],
   ModelOutputFailed: [503, "model_output_failed", "Upstream model output failed or was incomplete"],
+  /** The upstream answered with an error before any output; a fallback may try the next model. */
+  ModelUpstreamRejected: [503, "model_upstream_rejected", "Upstream model rejected the request"],
 
   // Runtime: programmatic tool calling.
   ProgrammaticExecutionFailed: [
@@ -498,6 +500,7 @@ export class ModelInputMissing extends definite("ModelInputMissing") {}
 export class ModelInputTooLarge extends definite("ModelInputTooLarge") {}
 export class ModelInputUnsupported extends definite("ModelInputUnsupported") {}
 export class ModelOutputFailed extends definite("ModelOutputFailed") {}
+export class ModelUpstreamRejected extends definite("ModelUpstreamRejected") {}
 export class ProgrammaticExecutionFailed extends definite("ProgrammaticExecutionFailed") {}
 export class ProgrammaticOutcomeUncertain extends definite("ProgrammaticOutcomeUncertain") {}
 export class ProgrammaticInputTooLarge extends definite("ProgrammaticInputTooLarge") {}

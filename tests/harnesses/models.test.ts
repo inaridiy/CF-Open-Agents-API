@@ -9,6 +9,7 @@ import { expect, it } from "vitest";
 import {
   aiSDKModel,
   createModelGateway,
+  fallbackModel,
   modelAdapter,
   nativeModel,
   openAICompatibleModel,
@@ -303,40 +304,60 @@ it("rejects unsupported/oversized input before inference and never completes tru
   expect(body).not.toContain("response.completed");
 });
 
-it("cancelling a gateway stream aborts the in-flight AI SDK model call", async () => {
-  let signal: AbortSignal | undefined;
-  const started = Promise.withResolvers<void>();
-  const gateway = createModelGateway(() => ({
-    primary: aiSDKModel(
+it("cancelling a gateway request or its stream aborts the in-flight AI SDK model call", async () => {
+  /** A model that answers `parts` after the framing, then stays open until it is aborted. */
+  const open = (parts: unknown[], started: PromiseWithResolvers<AbortSignal | undefined>) =>
+    aiSDKModel(
       new MockLanguageModelV4({
         doStream: async (options) => {
-          signal = options.abortSignal;
-          started.resolve();
+          started.resolve(options.abortSignal);
           return {
             stream: new ReadableStream({
               start(controller) {
                 controller.enqueue({ type: "stream-start", warnings: [] });
-                signal?.addEventListener("abort", () => controller.close(), { once: true });
+                for (const part of parts as never[]) controller.enqueue(part);
+                options.abortSignal?.addEventListener("abort", () => controller.close(), {
+                  once: true,
+                });
               },
             }),
           };
         },
       }),
+    );
+  const stalled = Promise.withResolvers<AbortSignal | undefined>();
+  const talking = Promise.withResolvers<AbortSignal | undefined>();
+  const gateway = createModelGateway(() => ({
+    stalled: open([], stalled),
+    talking: open(
+      [
+        { type: "text-start", id: "msg" },
+        { type: "text-delta", id: "msg", delta: "partial" },
+      ],
+      talking,
     ),
   }));
-  const response = await gateway.fetch(
+  const request = (model: string, signal?: AbortSignal) =>
     new Request("https://gateway.test/v1/responses", {
       method: "POST",
-      body: JSON.stringify({ model: "primary", input: "Hello", stream: true }),
-    }),
-    {},
-  );
+      body: JSON.stringify({ model, input: "Hello", stream: true }),
+      signal,
+    });
+  // Before the first token nothing is committed, so the caller aborts the request itself.
+  const controller = new AbortController();
+  const pending = gateway.fetch(request("stalled", controller.signal), {});
+  const stalledSignal = await stalled.promise;
+  controller.abort();
+  await pending;
+  expect(stalledSignal?.aborted).toBe(true);
+  // Once output flows, cancelling the response body aborts the model call.
+  const response = await gateway.fetch(request("talking"), {});
   if (!response.body) throw new Error("Missing stream");
   const reader = response.body.getReader();
   await reader.read();
-  await started.promise;
+  const talkingSignal = await talking.promise;
   await reader.cancel();
-  expect(signal?.aborted).toBe(true);
+  expect(talkingSignal?.aborted).toBe(true);
 });
 
 const answerSchema = {
@@ -609,4 +630,91 @@ it("builds a registry entry only when a session selects it", async () => {
   expect(failed.status).toBe(400);
   const body = await failed.json<{ error: { type: string } }>();
   expect(body.error.type).toBe("model_gateway_error");
+});
+
+/** A mock whose stream answers `parts` after the framing every provider sends first. */
+const mockModel = (parts: unknown[], onCall?: () => void) =>
+  new MockLanguageModelV4({
+    doStream: async () => {
+      onCall?.();
+      return {
+        stream: simulateReadableStream({
+          chunks: [{ type: "stream-start", warnings: [] }, ...parts] as never[],
+        }),
+      };
+    },
+  });
+const answered = (text: string) => [
+  { type: "text-start", id: "msg" },
+  { type: "text-delta", id: "msg", delta: text },
+  { type: "text-end", id: "msg" },
+  { type: "finish", finishReason: { unified: "stop", raw: undefined }, usage },
+];
+
+it("falls back to the next model when the upstream rejects the request before any output", async () => {
+  const calls = { busy: 0, down: 0, ready: 0 };
+  const gateway = createModelGateway(() => ({
+    chain: fallbackModel({
+      busy: () =>
+        aiSDKModel(
+          mockModel(
+            [{ type: "error", error: new Error("Service temporarily at capacity") }],
+            () => calls.busy++,
+          ),
+        ),
+      down: () => {
+        calls.down++;
+        return modelAdapter(() => Effect.succeed(new Response("busy", { status: 429 })));
+      },
+      ready: () => aiSDKModel(mockModel(answered("Third model answered."), () => calls.ready++)),
+    }),
+  }));
+  const request = (body: object) =>
+    new Request("https://gateway.test/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ model: "chain", input: "Hello", ...body }),
+    });
+  const streaming = await gateway.fetch(request({ stream: true }), {});
+  expect(streaming.status).toBe(200);
+  const body = await streaming.text();
+  expect(body).toContain("Third model answered.");
+  expect(body).toContain("response.completed");
+  expect(body).not.toContain("response.failed");
+  expect(calls).toEqual({ busy: 1, down: 1, ready: 1 });
+  const document = await gateway.fetch(request({}), {});
+  expect(document.status).toBe(200);
+  expect(calls).toEqual({ busy: 2, down: 2, ready: 2 });
+});
+
+it("answers with the last outcome when every model rejects, and never retries started output", async () => {
+  const gateway = createModelGateway(() => ({
+    allBusy: fallbackModel({
+      first: aiSDKModel(mockModel([{ type: "error", error: new Error("capacity") }])),
+      second: modelAdapter(() => Effect.succeed(new Response("overloaded", { status: 503 }))),
+    }),
+    partial: fallbackModel({
+      first: aiSDKModel(
+        mockModel([
+          { type: "text-start", id: "msg" },
+          { type: "text-delta", id: "msg", delta: "partial" },
+          { type: "error", error: new Error("dropped") },
+        ]),
+      ),
+      second: aiSDKModel(mockModel(answered("never asked"))),
+    }),
+  }));
+  const request = (model: string, body: object) =>
+    new Request("https://gateway.test/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ model, input: "Hello", ...body }),
+    });
+  const exhausted = await gateway.fetch(request("allBusy", { stream: true }), {});
+  expect(exhausted.status).toBe(503);
+  expect(await exhausted.text()).toBe("overloaded");
+  const partial = await gateway.fetch(request("partial", { stream: true }), {});
+  expect(partial.status).toBe(200);
+  const body = await partial.text();
+  expect(body).toContain("partial");
+  expect(body).toContain("response.failed");
+  expect(body).not.toContain("never asked");
 });

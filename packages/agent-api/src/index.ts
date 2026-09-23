@@ -66,6 +66,7 @@ export {
   ModelNotFound,
   ModelNotRegistered,
   ModelOutputFailed,
+  ModelUpstreamRejected,
   ModelProtocolMismatch,
   NetworkPolicyBroadened,
   NetworkPolicyConflict,

@@ -149,6 +149,26 @@ What it does not carry: provider reasoning blocks and signatures across requests
 
 `modelAdapter(effect)` adapts an Effect-valued implementation to the gateway contract when neither helper fits.
 
+### `fallbackModel`
+
+`fallbackModel(candidates)` makes one registry entry out of several models, tried in the order written. A candidate is skipped when it fails before producing any output: `aiSDKModel` fails the request with `ModelUpstreamRejected` when the provider answers with an error before its first token (Workers AI at capacity, a quota, a bad key), and `nativeModel` passes the provider's status through, so a 429 or 5xx moves on as well. Output that already started streaming is never retried elsewhere, because the harness has seen it. Each candidate is built only when its turn comes, every switch is logged as `Model fallback`, and the last outcome answers when all of them failed.
+
+```ts
+import { fallbackModel } from "cf-open-agents-api/models";
+
+models: (env) => {
+  const workersAI = createWorkersAI({ binding: env.AI });
+  return {
+    workers: () =>
+      fallbackModel({
+        deepseek: () => aiSDKModel(workersAI("@cf/deepseek-ai/deepseek-v4-flash-0731")),
+        glm: () => aiSDKModel(workersAI("@cf/zai-org/glm-5.3-flash")),
+        qwen: () => aiSDKModel(workersAI("@cf/qwen/qwen3.8-27b")),
+      }),
+  };
+},
+```
+
 ## Sandbox replacement
 
 | Harness                  | Integration                                                                                       | Native state                            |
