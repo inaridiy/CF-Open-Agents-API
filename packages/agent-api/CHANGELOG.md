@@ -2,6 +2,18 @@
 
 Entries from 0.4.1 on are written by `changeset version` from the pull requests' changesets. Earlier entries cover the library and the setup CLI together.
 
+## 0.5.0
+
+### Minor Changes
+
+- [#16](https://github.com/inaridiy/CF-Open-Agents-API/pull/16) [`cbd90b9`](https://github.com/inaridiy/CF-Open-Agents-API/commit/cbd90b977e8531d98da7c54a8ebc1fa830fcabd5) Thanks [@inaridiy](https://github.com/inaridiy)! - Add `fallbackModel(candidates)` to `cf-open-agents-api/models`: one registry entry backed by several models tried in order, for providers whose models go "temporarily at capacity" one at a time. To make that possible, `aiSDKModel` now waits for the provider's first token before committing a response: an error before any output fails the request with the new `ModelUpstreamRejected` (503 `model_upstream_rejected`) instead of a 200 stream that ends in `response.failed`, and a `nativeModel` answer of 429 or 5xx also moves the chain on. Output that already started is never retried on another model.
+
+### Patch Changes
+
+- [#14](https://github.com/inaridiy/CF-Open-Agents-API/pull/14) [`127e66f`](https://github.com/inaridiy/CF-Open-Agents-API/commit/127e66f81d5b4718276de81f74578f275014e4f4) Thanks [@inaridiy](https://github.com/inaridiy)! - Log why a model gateway stream failed. When the provider errors or its output ends without a finish, the gateway still answers the runtime with `model_output_failed` (which Codex reports as `connection_failed`), but it now logs `Model output failed` with the registry model name, the finish reason and the provider's error line, such as Workers AI's "Service temporarily at capacity". Request and response bodies are never logged.
+
+- [#15](https://github.com/inaridiy/CF-Open-Agents-API/pull/15) [`b16b71c`](https://github.com/inaridiy/CF-Open-Agents-API/commit/b16b71ce3909f5546e502cf0ba3b2efcccaa72d8) Thanks [@inaridiy](https://github.com/inaridiy)! - `aiSDKModel` and `openAICompatibleModel` no longer impose a 120-second request timeout or an 8192-token output cap of their own. Unset, the provider's own limits apply and the turn deadline bounds the request; `timeoutMs` and `maxOutputTokens` remain available as deployment-side bounds, and a harness request's `max_output_tokens` is still honoured. Reasoning models on Workers AI, which routinely think past 8192 tokens and two minutes, were failing every large task as `connection_failed` because of these defaults.
+
 ## 0.4.2
 
 ### Patch Changes
