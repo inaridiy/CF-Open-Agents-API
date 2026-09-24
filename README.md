@@ -33,6 +33,8 @@ Open <http://localhost:8787>, type a prompt, pick a preset and press **Build**. 
 
 ![A finished job with the transcript, thinking and the zip download](docs/images/demo-job.png)
 
+Deploying needs the R2 API token and the other secrets `setup` asks for; `.dev.vars` stays local. The QuickStart's [Deploy](docs/quickstart.md#deploy) section lists them.
+
 To add the API to a Worker you already have (a Vite app, a Hono Worker, anything Wrangler deploys), run `init` in its directory instead. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition in `src/agents.ts` and snapshots the Docker build context into `.cf-open-agents-api/`. The [CLI README](packages/create-cf-open-agents-api/README.md) covers `init`, `setup` and `doctor`.
 
 ## Use it from your Worker

@@ -79,11 +79,29 @@ Change a model: add an entry to `models` and point a preset's `model` (or a `tie
 
 **A second `wrangler dev` broke the first one?** Two `wrangler dev` sessions on the same Docker engine with the same Dockerfile remove each other's image tags; run one at a time. See [known issues](known-issues.md).
 
-## Next
+## Deploy
 
 **Before you deploy the demo.** The demo page has no login: with the default `workers_dev: true`, anyone who finds the workers.dev URL can create sessions and run agents on your account. Put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) in front of the Worker or replace the page with your own auth first; `workers_dev: false` in `wrangler.jsonc` keeps it private to Service Bindings.
 
-Production is two commands in the generated project, `pnpm dlx create-cf-open-agents-api@alpha setup` (R2 buckets and secrets) and `pnpm exec wrangler deploy`; see [deployment](deployment.md) for the cost model and the manual steps.
+**Secrets first, then deploy.** Nothing in `.dev.vars` reaches production: `wrangler deploy` uploads the code and the bindings, and every secret has to be set on the Worker. Locally, `LOCAL_BACKUPS=true` keeps sandbox backups on Wrangler's R2 emulator, which needs no credentials. In production the Sandbox SDK writes each workspace backup to your R2 bucket through presigned URLs, and it signs those with an R2 API token, so a deployment without these secrets refuses every hosted session with `503 environment_unavailable` naming the ones that are missing.
+
+| Secret                                     | Where it comes from                                                                                                                                                                                  |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Cloudflare dashboard, R2 → Manage R2 API Tokens → Create API token, with Object Read & Write on the workspaces bucket (`<worker>-workspaces`). The dashboard shows the access key ID and secret once |
+| `CLOUDFLARE_R2_ACCOUNT_ID`                 | Your account ID, as printed by `pnpm exec wrangler whoami`                                                                                                                                           |
+| `API_TOKEN`                                | Any 32 or more random characters. Only HTTP callers need it; the demo page talks to the API over a Service Binding                                                                                   |
+| Provider keys (`OPENAI_API_KEY`, ...)      | Whatever `models` in `src/agents.ts` reads. The `workers` preset uses the `AI` binding and needs none                                                                                                |
+
+`setup` creates both R2 buckets and asks for every secret in one go; deploy afterwards:
+
+```sh
+pnpm dlx create-cf-open-agents-api@alpha setup
+pnpm exec wrangler deploy
+```
+
+By hand, that is `pnpm exec wrangler r2 bucket create <worker>-checkpoints` and `<worker>-workspaces`, then `pnpm exec wrangler secret put <NAME>` for each secret. Secrets take effect on the next request without a redeploy. Never set `LOCAL_BACKUPS` in production. See [deployment](deployment.md) for the cost model and the rest of the walkthrough.
+
+## Next
 
 | Topic                                           | Guide                                                                        |
 | ----------------------------------------------- | ---------------------------------------------------------------------------- |
