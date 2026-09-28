@@ -557,6 +557,55 @@ try {
   console.log(
     "PASS: official SDK → Codex Container → Worker model egress; cached search restrictions, image input and durable usage.",
   );
+  if (selected.includes("codex")) {
+    /** Smoke-only route of the test Worker: shorten idle timeouts and read container liveness. */
+    const smoke = async (/** @type {string} */ id, action = "state", query = "") => {
+      const response = await fetch(`http://127.0.0.1:8799/smoke/${action}/${id}${query}`);
+      assert.equal(response.status, 200, await response.clone().text());
+      return /** @type {{ harness: boolean, sandbox: boolean }} */ (await response.json());
+    };
+    const until = async (
+      /** @type {string} */ id,
+      /** @type {{ harness: boolean, sandbox: boolean }} */ expected,
+    ) => {
+      for (let i = 0; i < 90; i++) {
+        if (JSON.stringify(await smoke(id)) === JSON.stringify(expected)) return;
+        await delay(1_000);
+      }
+      assert.deepEqual(await smoke(id), expected, "Containers did not reach the expected state");
+    };
+    // Codex leaves exec-server running in the sandbox, which alone keeps it awake.
+    const completed = async () => {
+      const session = await sessions.create({
+        agent: { model: "codex" },
+        environment: { type: "openai_hosted" },
+        input: "idle-proof: write the idle marker.",
+      });
+      sessionId = session.id;
+      await complete();
+      await remember();
+      assert.deepEqual(await smoke(session.id), { harness: true, sandbox: true });
+      return session.id;
+    };
+    // An idle harness stops after the turn, and its sandbox goes with it.
+    const idle = await completed();
+    await smoke(idle, "idle-harness", "?seconds=3");
+    await until(idle, { harness: false, sandbox: false });
+    // A harness that stopped without releasing its sandbox: the sandbox ends itself.
+    const orphan = await completed();
+    await smoke(orphan, "idle-harness", "?seconds=3&keep-sandbox=true");
+    await until(orphan, { harness: false, sandbox: true });
+    await smoke(orphan, "idle-sandbox", "?seconds=3");
+    await until(orphan, { harness: false, sandbox: false });
+    // Deleting a completed session releases both containers at once.
+    const deleted = await completed();
+    await sessions.delete(deleted);
+    sessionId = "";
+    await until(deleted, { harness: false, sandbox: false });
+    console.log(
+      "PASS: codex harness and sandbox containers stop after an idle turn, after an orphaned harness, and on deletion.",
+    );
+  }
 } catch (error) {
   await remember();
   for (const name of owned) {

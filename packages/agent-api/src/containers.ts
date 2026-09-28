@@ -1,6 +1,6 @@
 import { Container } from "@cloudflare/containers";
 import { getSandbox, type ISandbox } from "@cloudflare/sandbox";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Effect, Layer, ManagedRuntime, Option } from "effect";
 
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
 import {
@@ -25,6 +25,7 @@ import {
   HarnessRepo,
   type HarnessServices,
   read,
+  releaseBody,
   write,
 } from "./containers/host.js";
 import * as proxies from "./containers/proxies.js";
@@ -242,6 +243,8 @@ export class HarnessContainer<
           ),
         ),
       );
+      // The job is dispatched either way; releasing the body only lets the Container sleep.
+      yield* io("startAttempt.release", () => releaseBody(result)).pipe(Effect.ignore);
       if (!result.ok)
         return yield* new TransportFailure({
           operation: "startAttempt",
@@ -303,7 +306,9 @@ export class HarnessContainer<
           }),
         );
         if (command.type === "cancel") this.abortCodeExecutions();
-        if (!result.ok) {
+        if (result.ok)
+          yield* io("controlExecution.release", () => releaseBody(result)).pipe(Effect.ignore);
+        else {
           // A definite rejection is an API error the session can act on; anything else is retried.
           const body = yield* io(
             "controlExecution.body",
@@ -343,7 +348,7 @@ export class HarnessContainer<
           const response = await this.containerFetch("http://harness/diagnostics", {
             signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
           });
-          if (!response.ok) return;
+          if (!response.ok) return releaseBody(response);
           const { lines } = (await response.json()) as { lines?: string[] };
           if (lines?.length) {
             const hint = diagnosticsHint(lines);
@@ -373,6 +378,94 @@ export class HarnessContainer<
         yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
       }
     });
+  }
+  /**
+   * The session was deleted: revoke the assignment, then end the delegated children's
+   * containers, this one, and the sandbox it owns. Deletion is refused while a turn is
+   * active, so nothing here discards uncommitted work.
+   */
+  releaseCompute(): Promise<void> {
+    return this.run(
+      this.lifecycle.withPermits(1)(
+        this.workspace.withPermits(1)(
+          Effect.gen(this, function* () {
+            this.abortCodeExecutions();
+            const current = yield* read((tx) => tx.assignment());
+            if (current && !current.revoked)
+              yield* write((tx) => tx.putAssignment({ ...current, revoked: true }));
+            for (const subagentId of current?.children ?? [])
+              yield* io("releaseCompute.child", () => this.child(subagentId).releaseCompute()).pipe(
+                Effect.ignore,
+              );
+            if (this.ctx.container?.running) yield* io("releaseCompute", () => this.destroy());
+            if (current?.parent) return;
+            // A session prepared before its first turn has a sandbox but no assignment yet;
+            // a child whose start failed early has neither.
+            const prepared = yield* read((tx) => tx.sandbox());
+            const sessionId = current?.sessionId ?? (prepared ? this.ctx.id.name : undefined);
+            if (!sessionId || !(current?.sandbox || prepared)) return;
+            yield* write((tx) => tx.forgetSandbox());
+            yield* io("releaseCompute", () => getSandbox(this.env.SANDBOX, sessionId).destroy());
+          }),
+        ),
+      ),
+    );
+  }
+  /**
+   * Whether the session's sandbox is in use: the harness container runs, or a workspace
+   * operation (setup, a fork's restore, a starting turn) holds it before the harness does.
+   * The sandbox asks before its idle timeout ends it.
+   */
+  sandboxHeld(): Promise<boolean> {
+    return this.run(
+      Effect.map(
+        this.workspace.withPermitsIfAvailable(1)(Effect.void),
+        (free) => (this.ctx.container?.running ?? false) || Option.isNone(free),
+      ),
+    );
+  }
+  /**
+   * Polls renew this container's activity throughout a turn, so reaching `sleepAfter`
+   * means no turn is being reconciled. Nothing needs a graceful exit then, and a
+   * supervisor that hangs on SIGTERM must not keep the container, or its sandbox, alive.
+   */
+  override async onActivityExpired(): Promise<void> {
+    if (!this.ctx.container?.running) return;
+    console.log("Activity expired, destroying the harness container", {
+      harness: this.ctx.id.name,
+    });
+    await this.destroy();
+  }
+  /**
+   * However the harness container stopped (idle, crashed, replaced), the sandbox it owns
+   * goes with it: the Sandbox SDK keeps a container awake while any process it started
+   * runs, and Codex's `exec-server` never exits. The next turn restores the committed
+   * workspace. A start, checkpoint, stop or release in progress owns the sandbox and
+   * decides for itself.
+   */
+  override onStop(): Promise<void> {
+    return this.run(
+      this.lifecycle
+        .withPermitsIfAvailable(1)(
+          this.workspace.withPermits(1)(
+            Effect.gen(this, function* () {
+              const current = yield* read((tx) => tx.assignment());
+              if (!current?.sandbox || current.parent) return;
+              yield* write((tx) => tx.forgetSandbox());
+              yield* io("onStop.sandbox", () =>
+                getSandbox(this.env.SANDBOX, current.sessionId).destroy(),
+              );
+            }),
+          ),
+        )
+        .pipe(
+          Effect.asVoid,
+          // A rejection would fail the Container's alarm and enter its retry loop.
+          Effect.catchAllCause((cause) =>
+            Effect.logWarning("Releasing the sandbox of a stopped harness failed", cause),
+          ),
+        ),
+    );
   }
 }
 
@@ -465,6 +558,9 @@ export function containerDriver(env: ContainerBindings, harness: HarnessName): R
     checkpoint: async (execution) => stub(execution).checkpointExecution(execution),
     stop: async (execution) => {
       await stub(execution).stopExecution(execution);
+    },
+    release: async (sessionId) => {
+      await env.HARNESS.getByName(sessionId).releaseCompute();
     },
   });
 }

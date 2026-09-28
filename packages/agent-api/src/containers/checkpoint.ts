@@ -15,7 +15,7 @@ import { copyKnownLength } from "../files.js";
 import { HARNESSES } from "../harnesses.js";
 import type { Checkpoint, Execution } from "../runtime.js";
 import { superseded } from "./assignment.js";
-import { assignment, HarnessBindings, type HarnessHost, read, write } from "./host.js";
+import { assignment, HarnessBindings, type HarnessHost, read, releaseBody, write } from "./host.js";
 import { rememberSandbox } from "./sandbox.js";
 
 const ARTIFACT_FILE_LIMIT = 200 * 1024 * 1024;
@@ -110,11 +110,13 @@ export function snapshot(host: HarnessHost, execution: Execution) {
     const response = yield* io("snapshot", (signal) =>
       host.containerFetch(`http://harness/jobs/${execution.turnId}/checkpoint`, { signal }),
     );
-    if (!response.ok || !response.body)
+    if (!response.ok || !response.body) {
+      yield* io("snapshot.release", () => releaseBody(response)).pipe(Effect.ignore);
       return yield* new TransportFailure({
         operation: "snapshot",
         cause: `Native checkpoint failed (${response.status})`,
       });
+    }
     // containerFetch may return a chunked stream; R2 requires a known length.
     const bytes = yield* io("snapshot", () => response.arrayBuffer());
     // The checkpoint record below names this object: its outcome must be observed.

@@ -43,6 +43,13 @@ export const read = <A>(f: (tx: HarnessTx) => Sync<A>) =>
 export const write = <A>(f: (tx: HarnessTx) => Sync<A>) =>
   Effect.flatMap(HarnessRepo, (repo) => repo.transaction(f));
 export const assignment = read((tx) => tx.requireAssignment());
+/**
+ * `@cloudflare/containers` counts a proxied response as in flight until its body has been
+ * read, and a Container with a request in flight never reaches `sleepAfter`. Every
+ * `containerFetch` answer whose body is not read is released with this.
+ */
+export const releaseBody = (response: Response): Promise<void> =>
+  response.body?.cancel() ?? Promise.resolve();
 
 /**
  * What the programs in this directory need from the object that runs them: its bindings,
