@@ -257,6 +257,11 @@ function fixture(env: TestEnv, name = "fixture", longPoll = false): RuntimeDrive
     stop: async (execution) => {
       await stub(execution).stop();
     },
+    // A stored marker makes the release fail, as a lost container call would.
+    release: async (sessionId) => {
+      if (await env.ASSETS.head("release-failure")) throw new Error("Scripted release failure");
+      await env.SCRIPTED.getByName(`release/${sessionId}`).stop();
+    },
   });
 }
 /** Scripted environment driver: setup is a no-op and the status is read from R2 so tests can flip it. */

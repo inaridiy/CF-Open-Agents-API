@@ -44,6 +44,30 @@ export class SandboxContainer extends Sandbox<ContainerBindings> {
     await this.setAllowedHosts(allowedHosts(access, network));
     await this.setDeniedHosts(access === "disabled" ? ["*"] : []);
   }
+  /**
+   * The SDK keeps a container awake while any process it started runs, and Codex's
+   * `exec-server` never exits, so idleness alone never ends this sandbox. The harness
+   * container of the same session releases it when it stops; this covers a harness that
+   * stopped without doing so (a crash, or a deployment that predates that release). The
+   * HarnessDO also reports a workspace operation that holds the sandbox before its
+   * container runs. Without a name (an alarm scheduled before names were stored) the SDK
+   * decides.
+   */
+  override async onActivityExpired(): Promise<void> {
+    const sessionId = this.ctx.id.name;
+    if (sessionId && this.ctx.container?.running) {
+      const held = await this.env.HARNESS.getByName(sessionId)
+        .sandboxHeld()
+        .catch(() => true);
+      if (!held) {
+        await this.destroy().catch((error: unknown) =>
+          console.warn("Releasing an orphaned sandbox failed", { sessionId, error: String(error) }),
+        );
+        return;
+      }
+    }
+    await super.onActivityExpired();
+  }
   override async fetch(request: Request): Promise<Response> {
     if (new URL(request.url).hostname === "sandbox.internal")
       return this.containerFetch(request, 4500);

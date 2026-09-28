@@ -517,6 +517,29 @@ it("deleting a session purges its object and the catalog's reservation records",
   });
 });
 
+it("deleting a session releases its compute, and a failed release still deletes it", async () => {
+  const released = (id: string) =>
+    runInDurableObject(env.SCRIPTED.getByName(`release/${id}`), (_instance, state) =>
+      state.storage.get<boolean>("stopped"),
+    );
+  const session = await api.beta.agents.sessions.create(params);
+  await api.beta.agents.sessions.delete(session.id);
+  expect(await released(session.id)).toBe(true);
+
+  const kept = await api.beta.agents.sessions.create(params);
+  await env.ASSETS.put("release-failure", "on");
+  try {
+    expect(await api.beta.agents.sessions.delete(kept.id)).toMatchObject({
+      id: kept.id,
+      deleted: true,
+    });
+  } finally {
+    await env.ASSETS.delete("release-failure");
+  }
+  expect(await released(kept.id)).toBeUndefined();
+  await expect(api.beta.agents.sessions.retrieve(kept.id)).rejects.toMatchObject({ status: 404 });
+});
+
 it("pages and fork transcripts stay bounded when records are large", async () => {
   const session = await api.beta.agents.sessions.create(params);
   const result = await runInDurableObject<SessionDO, unknown>(

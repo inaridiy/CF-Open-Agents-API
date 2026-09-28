@@ -361,6 +361,11 @@ export interface RuntimeDriver {
   ): Effect.Effect<void, CommandRejected | ExecutionMissing | TransportFailure>;
   checkpoint(execution: Execution): Effect.Effect<Checkpoint, RuntimeRejected | TransportFailure>;
   stop(execution: Execution): Effect.Effect<void, TransportFailure>;
+  /**
+   * Release whatever compute the session still holds once it is deleted. Called after the
+   * deletion committed and never with a turn active; a failure is logged, not answered.
+   */
+  release?(sessionId: string): Effect.Effect<void, TransportFailure>;
 }
 
 /**
@@ -393,6 +398,7 @@ export interface PromiseRuntimeDriver {
   ): Promise<void>;
   checkpoint(execution: Execution, signal: AbortSignal): Promise<Checkpoint>;
   stop(execution: Execution, signal: AbortSignal): Promise<void>;
+  release?(sessionId: string, signal: AbortSignal): Promise<void>;
 }
 const call = <A, E>(f: (signal: AbortSignal) => Promise<A>, onFailure: (cause: unknown) => E) =>
   Effect.tryPromise({ try: (signal) => f(signal), catch: onFailure });
@@ -423,6 +429,11 @@ export const fromPromiseDriver = (driver: PromiseRuntimeDriver): RuntimeDriver =
   checkpoint: (execution) =>
     call((signal) => driver.checkpoint(execution, signal), rejected("runtime.checkpoint")),
   stop: (execution) => call((signal) => driver.stop(execution, signal), transport("runtime.stop")),
+  release: (sessionId) =>
+    call(
+      (signal) => driver.release?.(sessionId, signal) ?? Promise.resolve(),
+      transport("runtime.release"),
+    ),
 });
 
 export interface AgentRegistration {

@@ -14,7 +14,13 @@ import { programmaticInputSchema, type ProgrammaticResult } from "../programmati
 import { runProgrammatic } from "../programmatic.js";
 import { executeWorkspaceTool } from "../sandbox-tools.js";
 import { modelAllowed, permittedCodeTool, superseded } from "./assignment.js";
-import { assignment, type ContainerBindings, type HarnessHost, write } from "./host.js";
+import {
+  assignment,
+  type ContainerBindings,
+  type HarnessHost,
+  releaseBody,
+  write,
+} from "./host.js";
 
 /**
  * The outbound hosts a harness container reaches through the Container's handler, each
@@ -63,11 +69,13 @@ export function programmaticRequest(host: HarnessHost, request: Request) {
           `http://harness/jobs/${current.turnId}/code-tools?invocation=${invocation}`,
         ),
       );
-      if (!catalog.ok)
+      if (!catalog.ok) {
+        yield* io("programmatic.catalog.release", () => releaseBody(catalog)).pipe(Effect.ignore);
         return yield* new TransportFailure({
           operation: "programmatic.catalog",
           cause: "Code tool catalog is unavailable",
         });
+      }
       // The container proposes names; the Worker's assignment decides what code may call.
       const tools = yield* io("programmatic.tools", async () =>
         z
@@ -96,7 +104,10 @@ export function programmaticRequest(host: HarnessHost, request: Request) {
                 signal,
               }),
             );
-            if (!result.ok) throw new Error("Programmatic tool call failed");
+            if (!result.ok) {
+              await releaseBody(result);
+              throw new Error("Programmatic tool call failed");
+            }
             return result.json();
           },
         }),

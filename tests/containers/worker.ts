@@ -42,10 +42,59 @@ const Harness = createHarness<Bindings>(async (sandbox, _execution, env) => {
   await installSkill(env.CHECKPOINTS, reference, sandbox);
 });
 
-export { Harness as HarnessDO };
-export class SandboxDO extends SandboxContainer {}
+/**
+ * Smoke-only hooks: shorten the idle timeout instead of waiting ten minutes, and keep the
+ * sandbox when the harness stops so the sandbox's own orphan check is exercised.
+ */
+export class HarnessDO extends Harness {
+  async idleAfter(seconds: number, keepSandbox: boolean): Promise<void> {
+    await this.ctx.storage.put("smoke-keep-sandbox", keepSandbox);
+    this.sleepAfter = `${seconds}s`;
+    this.renewActivityTimeout();
+    await this.scheduleNextAlarm();
+  }
+  override async onStop(): Promise<void> {
+    if (!(await this.ctx.storage.get<boolean>("smoke-keep-sandbox"))) await super.onStop();
+  }
+  running(): boolean {
+    return this.ctx.container?.running ?? false;
+  }
+}
+// Outbound handlers are registered per class name.
+HarnessDO.outboundByHost = Harness.outboundByHost ?? {};
+export class SandboxDO extends SandboxContainer {
+  async idleAfter(seconds: number): Promise<void> {
+    await this.setSleepAfter(seconds);
+    await this.scheduleNextAlarm();
+  }
+  running(): boolean {
+    return this.ctx.container?.running ?? false;
+  }
+}
 export { ContainerProxy };
-export default class AgentWorker extends service.AgentWorker {}
+export default class AgentWorker extends service.AgentWorker {
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const [, scope, action, sessionId] = url.pathname.split("/");
+    if (scope !== "smoke" || !sessionId)
+      return (await super.fetch?.(request)) ?? new Response(null, { status: 404 });
+    const harness = this.env.HARNESS.getByName(
+      sessionId,
+    ) as unknown as DurableObjectStub<HarnessDO>;
+    const sandbox = this.env.SANDBOX.getByName(
+      sessionId,
+    ) as unknown as DurableObjectStub<SandboxDO>;
+    const seconds = Number(url.searchParams.get("seconds") ?? "3");
+    if (action === "idle-harness")
+      await harness.idleAfter(seconds, url.searchParams.get("keep-sandbox") === "true");
+    else if (action === "idle-sandbox") await sandbox.idleAfter(seconds);
+    else if (action !== "state") return new Response(null, { status: 404 });
+    return Response.json({
+      harness: await harness.running(),
+      sandbox: await sandbox.running(),
+    });
+  }
+}
 
 /** Actual AI SDK model boundary; inference is scripted and makes no paid request. */
 const gateway = createModelGateway(() => ({
@@ -364,6 +413,12 @@ async function scripted(options: StreamOptions): Promise<StreamResult> {
   if (restored && !history.includes("Container execution complete"))
     throw new Error("Missing native history");
   if (request.includes("programmatic-proof")) return programmaticProof(context);
+  if (request.includes("idle-proof"))
+    return once(
+      shell("printf IDLE > /workspace/idle.txt", codex, definitions),
+      "Idle proof written.",
+      toolResults,
+    );
   if (request.includes("delegate-proof")) return delegationProof(context);
   if (request.includes("child-proof"))
     return once(

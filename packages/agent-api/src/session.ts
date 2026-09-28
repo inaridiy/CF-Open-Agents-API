@@ -415,11 +415,28 @@ export class SessionObject<Env = unknown> extends DurableObject<Env> {
       yield* this.reconciliation.withPermitsIfAvailable(1)(tick);
     }).pipe(Effect.asVoid);
   }
+  /**
+   * The deletion commits first. Releasing the session's compute follows as best effort:
+   * the session is already gone, and the containers' idle timeout still ends them.
+   */
   delete(): Promise<Deleted> {
     return this.run(
-      Effect.flatMap(Repo, (repo) => repo.transaction(markDeleted)).pipe(
-        Effect.tap(() => this.close),
-      ),
+      Effect.gen(this, function* () {
+        const repo = yield* Repo;
+        const deleted = yield* repo.transaction(markDeleted);
+        yield* this.close;
+        const record = yield* repo.read((tx) => tx.session());
+        const driver = record && Option.getOrUndefined((yield* Drivers).get(record.driver));
+        if (driver?.release)
+          yield* driver
+            .release(deleted.id)
+            .pipe(
+              Effect.catchAll((error) =>
+                Effect.logWarning("Releasing a deleted session's compute failed", error),
+              ),
+            );
+        return deleted;
+      }),
     );
   }
   purge(): Promise<void> {
