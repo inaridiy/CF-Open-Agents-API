@@ -2,6 +2,12 @@
 
 Entries from 0.4.1 on are written by `changeset version` from the pull requests' changesets. Earlier entries cover the library and the setup CLI together.
 
+## 0.5.1
+
+### Patch Changes
+
+- [#19](https://github.com/inaridiy/CF-Open-Agents-API/pull/19) [`cc579d3`](https://github.com/inaridiy/CF-Open-Agents-API/commit/cc579d30135030e6c02d93d78cd63ecf06e2a0cd) Thanks [@inaridiy](https://github.com/inaridiy)! - Stop harness and sandbox containers once a session is idle or deleted. The harness never reached its idle timeout because an unread `POST /jobs` response stayed counted as a request in flight; a Codex sandbox never slept because the Sandbox SDK keeps a container awake while `exec-server` runs; and deleting a session left both running. HarnessDO now releases every Container response body, destroys its idle container and the sandbox it owns, and a sandbox whose harness is gone ends itself. `RuntimeDriver` gains an optional `release(sessionId)`, called after a session's deletion commits.
+
 ## 0.5.0
 
 ### Minor Changes
