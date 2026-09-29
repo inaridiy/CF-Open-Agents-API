@@ -1,5 +1,12 @@
 # cf-open-agents-api-supervisor
 
+## 0.5.1
+
+### Patch Changes
+
+- Updated dependencies [[`cc579d3`](https://github.com/inaridiy/CF-Open-Agents-API/commit/cc579d30135030e6c02d93d78cd63ecf06e2a0cd)]:
+  - cf-open-agents-api@0.5.1
+
 ## 0.5.0
 
 ### Patch Changes
