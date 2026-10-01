@@ -53,6 +53,21 @@ try {
   }
   assert.equal(library.peerDependencies.effect, "^3.22.2");
   // The setup CLI ships on its own: an executable, no dependency on the library.
+  // `durable-machine` is not published yet: the library carries it in `dist/vendor/`.
+  for (const file of [
+    "dist/vendor/durable-machine/index.js",
+    "dist/vendor/durable-machine/index.d.ts",
+  ])
+    assert(entries.split("\n").includes(`package/${file}`), `Missing inlined ${file}`);
+  const packed = /** @type {{ dependencies?: Record<string, string> }} */ (
+    JSON.parse(
+      execFileSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }),
+    )
+  );
+  assert(
+    !packed.dependencies?.["durable-machine"],
+    "The library must not depend on durable-machine",
+  );
   run("pnpm", ["--filter", cli.name, "pack", "--pack-destination", directory], root);
   const cliTarball = join(directory, `${cli.name}-${cli.version}.tgz`);
   const cliEntries = execFileSync("tar", ["-tzf", cliTarball], { encoding: "utf8" }).split("\n");
@@ -92,7 +107,14 @@ try {
   );
   await writeFile(
     join(directory, "pnpm-workspace.yaml"),
-    "autoInstallPeers: false\nminimumReleaseAge: 1440\nallowBuilds: {}\n",
+    [
+      "autoInstallPeers: false",
+      "minimumReleaseAge: 1440",
+      "minimumReleaseAgeExclude:",
+      `  - "@cloudflare/workers-types@${manifest.devDependencies["@cloudflare/workers-types"]}"`,
+      "allowBuilds: {}",
+      "",
+    ].join("\n"),
   );
   run("pnpm", ["install", "--prefer-offline", "--ignore-scripts"], directory);
   await writeFile(

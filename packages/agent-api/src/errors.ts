@@ -108,6 +108,7 @@ const STORED_OBJECTS = {
   file_content: "File content not found",
   skill_content: "Skill content not found",
   artifact_content: "Artifact content not found",
+  workspace_backup: "Workspace backup not found",
 } as const;
 
 /**
@@ -279,6 +280,8 @@ const DEFINITE = {
     "checkpoint_missing",
     fixed<{ key: string }>("Native checkpoint is missing"),
   ],
+  /** The harness answered with a native checkpoint past the Worker's bound. */
+  CheckpointTooLarge: [413, "checkpoint_too_large", "Native checkpoint exceeds 64 MiB"],
   AssignmentConflict: [
     409,
     "assignment_conflict",
@@ -289,6 +292,10 @@ const DEFINITE = {
     "network_policy_conflict",
     "Network access must be configured before the environment starts",
   ],
+  /** The session was deleted: its objects refuse to start a container again. */
+  ContainerRetired: [409, "session_deleted", "The session was deleted and its compute released"],
+  /** The deployment lacks an export or image the container objects need. */
+  ContainerMisconfigured: [503, "container_misconfigured", (p: { reason: string }) => p.reason],
   ArtifactListFailed: [503, "artifact_list_failed", "Artifact listing failed"],
   ArtifactLimitExceeded: [
     413,
@@ -339,13 +346,6 @@ const DEFINITE = {
     503,
     "environment_unavailable",
     "Environment driver is unavailable",
-  ],
-  /** The Sandbox SDK signs backup URLs with R2 secrets the deployment did not set. */
-  BackupCredentialsMissing: [
-    503,
-    "environment_unavailable",
-    (p: { missing: readonly string[] }) =>
-      `Sandbox backups need the secrets ${p.missing.join(", ")}; set them with wrangler secret put (LOCAL_BACKUPS=true under wrangler dev)`,
   ],
   CapabilityBudgetExceeded: [
     413,
@@ -477,8 +477,11 @@ export class CredentialRotationInvalid extends definite("CredentialRotationInval
 export class HarnessUnknown extends definite("HarnessUnknown") {}
 export class CheckpointHarnessMismatch extends definite("CheckpointHarnessMismatch") {}
 export class CheckpointMissing extends definite("CheckpointMissing") {}
+export class CheckpointTooLarge extends definite("CheckpointTooLarge") {}
 export class AssignmentConflict extends definite("AssignmentConflict") {}
 export class NetworkPolicyConflict extends definite("NetworkPolicyConflict") {}
+export class ContainerRetired extends definite("ContainerRetired") {}
+export class ContainerMisconfigured extends definite("ContainerMisconfigured") {}
 export class ArtifactListFailed extends definite("ArtifactListFailed") {}
 export class ArtifactLimitExceeded extends definite("ArtifactLimitExceeded") {}
 export class EnvironmentNotFound extends definite("EnvironmentNotFound") {}
@@ -489,7 +492,6 @@ export class EnvironmentSetupFailed extends definite("EnvironmentSetupFailed") {
 export class EnvironmentWriteFailed extends definite("EnvironmentWriteFailed") {}
 export class EnvironmentListFailed extends definite("EnvironmentListFailed") {}
 export class EnvironmentDriverUnavailable extends definite("EnvironmentDriverUnavailable") {}
-export class BackupCredentialsMissing extends definite("BackupCredentialsMissing") {}
 export class CapabilityBudgetExceeded extends definite("CapabilityBudgetExceeded") {}
 export class StoredObjectMissing extends definite("StoredObjectMissing") {}
 export class ObjectStorageUnavailable extends definite("ObjectStorageUnavailable") {}
@@ -783,6 +785,7 @@ const PERMANENT_TAGS: readonly StaticTag[] = [
   "CredentialRefreshIndeterminate",
   "EnvironmentSetupIndeterminate",
   "NetworkPolicyConflict",
+  "ContainerRetired",
   "InvalidSessionState",
   "SessionNotDeleted",
   "EnvironmentConflict",

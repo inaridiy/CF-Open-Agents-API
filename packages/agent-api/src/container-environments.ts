@@ -1,10 +1,10 @@
-import { getSandbox, type ISandbox } from "@cloudflare/sandbox";
 import { Effect, Exit } from "effect";
 import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/environments";
 import type { z } from "zod";
 
 import { installCapabilityArchive } from "./capability-archive.js";
-import type { ContainerBindings } from "./containers.js";
+import type { ContainerBindings } from "./containers/host.js";
+import { sandboxOf, type Workspace, workspaceOf } from "./containers/workspace.js";
 import { attempt, io, type ServiceError } from "./effect.js";
 import {
   base64Size,
@@ -83,8 +83,8 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
   private state(): State | undefined {
     return this.db.get(Kinds.state, "current");
   }
-  private sandbox(spec: EnvironmentSpec) {
-    return getSandbox(this.env.SANDBOX, spec.sessionId);
+  private sandbox(spec: EnvironmentSpec): Workspace {
+    return workspaceOf(this.env, spec.sessionId);
   }
   private configuration(spec: EnvironmentSpec) {
     return Effect.gen(this, function* () {
@@ -160,14 +160,18 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         inherited.sessionId,
         inherited.environmentId,
       );
-      // Network policy, variables and packages belong to this session's own sandbox and
-      // must be in place before anything starts it. Files, skills and setup commands
+      // Network policy and variables belong to this session's own sandbox and must be in
+      // place before anything starts it; packages follow. Files, skills and setup commands
       // already ran in the source session; only their committed results are adopted.
-      yield* this.configure(spec);
+      const config = yield* this.configuration(spec);
+      yield* this.configure(spec, config);
       const base = inherited.workspace ?? source.base;
       // The fresh sandbox now holds the inherited workspace, so the first turn continues in it.
       if (base)
-        yield* io("environment.adopt.restore", () => this.sandbox(spec).restoreBackup(base));
+        yield* io("environment.adopt.restore", () =>
+          sandboxOf(this.env, spec.sessionId).restore(base),
+        );
+      yield* this.installPackages(spec, config);
       yield* attempt("environment.adopt", () =>
         this.db.put(Kinds.state, "current", {
           version: 1,
@@ -185,7 +189,8 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const sandbox = this.sandbox(spec);
       const config = yield* this.configuration(spec);
       yield* this.configure(spec, config);
-      yield* io("environment.mkdir", () => sandbox.mkdir("/workspace", { recursive: true }));
+      yield* io("environment.mkdir", () => sandbox.mkdir("/workspace"));
+      yield* this.installPackages(spec, config);
       yield* Effect.forEach(config.files ?? [], (file) => this.write(sandbox, spec, file), {
         discard: true,
       });
@@ -236,18 +241,19 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
           return yield* Effect.acquireUseRelease(
             Effect.gen(this, function* () {
               const source = capability.source;
-              if (source.type === "base64")
-                return yield* io("environment.capability.write", () =>
-                  sandbox.writeFile(archive, source.data, { encoding: "base64" }),
+              if (source.type === "base64") {
+                const bytes = yield* attempt("environment.capability.decode", () =>
+                  Uint8Array.from(atob(source.data), (char) => char.charCodeAt(0)),
                 );
+                return yield* io("environment.capability.write", () =>
+                  sandbox.writeFile(archive, bytes),
+                );
+              }
               const key = source.key;
-              const object = yield* io("environment.skill.get", () =>
-                this.env.CHECKPOINTS.get(key),
+              const written = yield* io("environment.capability.stream", () =>
+                sandboxOf(this.env, spec.sessionId).writeObject(archive, key),
               );
-              if (!object) return yield* new StoredObjectMissing({ object: "skill_bundle" });
-              return yield* io("environment.capability.stream", () =>
-                sandbox.writeFile(archive, object.body),
-              );
+              if (!written) return yield* new StoredObjectMissing({ object: "skill_bundle" });
             }),
             () =>
               this.command(sandbox, [
@@ -270,7 +276,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
                 ),
               ),
             () =>
-              io("environment.capability.release", () => sandbox.deleteFile(archive)).pipe(
+              io("environment.capability.release", () => sandbox.remove(archive)).pipe(
                 Effect.ignore,
               ),
           );
@@ -284,11 +290,7 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         { discard: true },
       );
       const base = yield* io("environment.backup", () =>
-        sandbox.createBackup({
-          dir: "/workspace",
-          localBucket: this.env.LOCAL_BACKUPS === "true",
-          ttl: 30 * 24 * 60 * 60,
-        }),
+        sandboxOf(this.env, spec.sessionId).backup(),
       );
       yield* attempt("environment.commit", () =>
         this.db.put(Kinds.state, "current", {
@@ -301,13 +303,26 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       );
     });
   }
+  /**
+   * Store the network policy and variables in the session's SandboxDO. The container starts
+   * with them, so this runs before anything starts it.
+   */
   configure(spec: EnvironmentSpec, configuration?: z.infer<typeof hostedConfigurationSchema>) {
     return Effect.gen(this, function* () {
       const config = configuration ?? (yield* this.configuration(spec));
-      const stub = this.env.SANDBOX.getByName(spec.sessionId);
-      yield* io("environment.network", () => stub.configureNetwork(config.network));
+      yield* io("environment.network", () =>
+        sandboxOf(this.env, spec.sessionId).configure(config.network, config.env ?? {}),
+      );
+    });
+  }
+  /** Install the configured packages into a fresh container; they live outside /workspace. */
+  installPackages(
+    spec: EnvironmentSpec,
+    configuration?: z.infer<typeof hostedConfigurationSchema>,
+  ) {
+    return Effect.gen(this, function* () {
+      const config = configuration ?? (yield* this.configuration(spec));
       const sandbox = this.sandbox(spec);
-      yield* io("environment.variables", () => sandbox.setEnvVars(config.env ?? {}));
       if (config.packages?.system?.length) {
         yield* this.command(sandbox, ["apt-get", "update"]);
         yield* this.command(sandbox, ["apt-get", "install", "-y", "--", ...config.packages.system]);
@@ -325,47 +340,35 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         yield* this.command(sandbox, ["npm", "install", "--global", "--", ...config.packages.npm]);
     });
   }
-  private command(sandbox: ISandbox, argv: [string, ...string[]], cwd = "/workspace") {
-    return Effect.acquireUseRelease(
-      io("environment.command.start", () => sandbox.exec(argv, { cwd, timeout: 120_000 })),
-      (process) =>
-        io("environment.command.output", () => process.output({ encoding: "utf8" })).pipe(
-          Effect.filterOrFail(
-            (output) => output.exitCode === 0,
-            () => new EnvironmentSetupFailed({ reason: "command" }),
-          ),
-        ),
-      (process, exit) =>
-        Exit.isFailure(exit)
-          ? io("environment.command.kill", () => process.kill()).pipe(Effect.ignore)
-          : Effect.void,
+  /** A setup command: two minutes, and the whole process group ends with it. */
+  private command(sandbox: Workspace, argv: [string, ...string[]], cwd = "/workspace") {
+    return io("environment.command", () => sandbox.exec(argv, { cwd, timeoutMs: 120_000 })).pipe(
+      Effect.filterOrFail(
+        (output) => output.exitCode === 0 && !output.timedOut,
+        () => new EnvironmentSetupFailed({ reason: "command" }),
+      ),
     );
   }
-  private write(sandbox: ISandbox, spec: EnvironmentSpec, file: EnvironmentFileInput) {
+  private write(sandbox: Workspace, spec: EnvironmentSpec, file: EnvironmentFileInput) {
     return Effect.gen(this, function* () {
-      const reference = file.type === "file_id" ? spec.inputFiles?.[file.file_id] : undefined;
-      const object = reference
-        ? yield* io("environment.file.get", () => this.env.CHECKPOINTS.get(reference.key))
-        : undefined;
-      if (file.type === "file_id" && !object)
-        return yield* new StoredObjectMissing({ object: "input_file" });
-      const size = file.type === "inline" ? base64Size(file.data) : (object?.size ?? 0);
-      if (file.type === "inline" && size > 5 * 1024 * 1024)
-        return yield* new FileTooLarge({ kind: "inline" });
-      yield* io("environment.file.mkdir", () =>
-        sandbox.mkdir(file.path.slice(0, file.path.lastIndexOf("/")), { recursive: true }),
-      );
-      const body = file.type === "inline" ? file.data : object?.body;
-      if (body === undefined) return yield* new StoredObjectMissing({ object: "input_file" });
+      if (file.type === "inline") {
+        const size = base64Size(file.data);
+        if (size > 5 * 1024 * 1024) return yield* new FileTooLarge({ kind: "inline" });
+        const body = yield* attempt("environment.file.decode", () =>
+          Uint8Array.from(atob(file.data), (char) => char.charCodeAt(0)),
+        );
+        yield* io("environment.file.write", () => sandbox.writeFile(file.path, body)).pipe(
+          Effect.mapError(() => new EnvironmentWriteFailed({ reason: "file" })),
+        );
+        return size;
+      }
+      const reference = spec.inputFiles?.[file.file_id];
+      if (!reference) return yield* new StoredObjectMissing({ object: "input_file" });
       const written = yield* io("environment.file.write", () =>
-        sandbox.writeFile(
-          file.path,
-          body,
-          file.type === "inline" ? { encoding: "base64" } : undefined,
-        ),
-      );
-      if (!written.success) return yield* new EnvironmentWriteFailed({ reason: "file" });
-      return size;
+        sandboxOf(this.env, spec.sessionId).writeObject(file.path, reference.key),
+      ).pipe(Effect.mapError(() => new EnvironmentWriteFailed({ reason: "file" })));
+      if (!written) return yield* new StoredObjectMissing({ object: "input_file" });
+      return reference.size;
     });
   }
   base() {
@@ -385,13 +388,10 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
       const state = yield* attempt("environment.state", () => this.state());
       if (!state || state.spec.id !== spec.id) return "pending" as const;
       if (state.status !== "connected") return state.status;
-      const runtime = yield* io(
-        "environment.status",
-        async () => await this.env.SANDBOX.getByName(spec.sessionId).getState(),
+      const running = yield* io("environment.status", () =>
+        sandboxOf(this.env, spec.sessionId).running(),
       );
-      return runtime.status === "running" || runtime.status === "healthy"
-        ? ("connected" as const)
-        : ("disconnected" as const);
+      return running ? ("connected" as const) : ("disconnected" as const);
     });
   }
   upload(spec: EnvironmentSpec, file: EnvironmentFileInput) {
@@ -453,7 +453,6 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
     return Effect.gen(this, function* () {
       const spec = yield* attempt("environment.state", () => this.spec());
       if (!spec) return;
-      const sandbox = this.sandbox(spec);
       const uploads = yield* attempt("environment.upload.list", () => [
         ...eachRecord(this.db, Kinds.upload),
       ]);
@@ -462,19 +461,10 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         (upload) =>
           Effect.gen(this, function* () {
             if (upload.version <= afterVersion) return;
-            const object = yield* io("environment.upload.get", () =>
-              this.env.CHECKPOINTS.get(upload.key),
-            );
-            if (!object) return yield* new EnvironmentWriteFailed({ reason: "upload_missing" });
-            yield* io("environment.upload.mkdir", () =>
-              sandbox.mkdir(upload.path.slice(0, upload.path.lastIndexOf("/")), {
-                recursive: true,
-              }),
-            );
-            const result = yield* io("environment.upload.apply", () =>
-              sandbox.writeFile(upload.path, object.body),
-            );
-            if (!result.success) return yield* new EnvironmentWriteFailed({ reason: "upload" });
+            const written = yield* io("environment.upload.apply", () =>
+              sandboxOf(this.env, spec.sessionId).writeObject(upload.path, upload.key),
+            ).pipe(Effect.mapError(() => new EnvironmentWriteFailed({ reason: "upload" })));
+            if (!written) return yield* new EnvironmentWriteFailed({ reason: "upload_missing" });
             yield* attempt("environment.upload.applied", () =>
               this.db.put(Kinds.fileVersion, "applied_file_version", upload.version),
             );
@@ -493,16 +483,16 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         () => this.db.get(Kinds.fileVersion, "applied_file_version") ?? 0,
       );
       yield* this.applyUploads(applied);
-      const result = yield* io("environment.files.list", () =>
-        this.sandbox(spec).listFiles("/workspace", { recursive: true, includeHidden: true }),
-      );
-      if (!result.success) return yield* new EnvironmentListFailed();
-      let files = result.files
+      const listed = yield* io("environment.files.list", () =>
+        this.sandbox(spec).list("/workspace"),
+      ).pipe(Effect.mapError(() => new EnvironmentListFailed()));
+      let files = listed
         .filter(
           (file) =>
             file.type === "file" &&
-            (!query.path || file.absolutePath.startsWith(`${query.path.replace(/\/$/, "")}/`)),
+            (!query.path || file.path.startsWith(`${query.path.replace(/\/$/, "")}/`)),
         )
+        .map((file) => ({ absolutePath: file.path, size: file.size }))
         .sort((a, b) => comparePaths(a.absolutePath, b.absolutePath));
       if (query.order === "desc") files.reverse();
       if (query.page) {

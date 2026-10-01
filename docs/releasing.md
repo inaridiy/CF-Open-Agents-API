@@ -1,12 +1,12 @@
 # Releasing
 
-Releases are driven by [changesets](https://github.com/changesets/changesets). A pull request that changes what a release ships adds a file under `.changeset/` (`pnpm changeset`); the publish workflow turns pending changesets into a "Version packages" pull request, and merging that pull request publishes both npm packages and pushes the tags. Nobody bumps a version or pushes a tag by hand. `v0.1.0` was tagged but never released to npm; `v0.2.0` was the first published alpha; `v0.4.0` was the last release made by hand.
+Releases are driven by [changesets](https://github.com/changesets/changesets). A pull request that changes what a release ships adds a file under `.changeset/` (`pnpm changeset`); the publish workflow turns pending changesets into a "Version packages" pull request, and merging that pull request publishes the npm packages and pushes the tags. Nobody bumps a version or pushes a tag by hand. `v0.1.0` was tagged but never released to npm; `v0.2.0` was the first published alpha; `v0.4.0` was the last release made by hand.
 
 ## Versions and changelogs
 
-The three packages share one version: `.changeset/config.json` lists `cf-open-agents-api`, `create-cf-open-agents-api` and the private `cf-open-agents-api-supervisor` as a `fixed` group, so a changeset for any of them bumps all three, and `pnpm check:docs` verifies that the library and the CLI agree. The examples are ignored. Pre-release versions stay under `0.x` and publish under the npm `alpha` dist-tag, never `latest`; the release script passes `--tag alpha` explicitly, because `changeset publish` picks `latest` on its own and ignores `publishConfig.tag`.
+The four packages share one version: `.changeset/config.json` lists `cf-open-agents-api`, `create-cf-open-agents-api` and the private `cf-open-agents-api-supervisor` and `durable-machine` as a `fixed` group, so a changeset for any of them bumps all four, and `pnpm check:docs` verifies that the library and the CLI agree. The examples are ignored. Pre-release versions stay under `0.x` and publish under the npm `alpha` dist-tag, never `latest`; the release script passes `--tag alpha` explicitly, because `changeset publish` picks `latest` on its own and ignores `publishConfig.tag`.
 
-`changeset version` writes each package's changelog, `packages/agent-api/CHANGELOG.md` and `packages/create-cf-open-agents-api/CHANGELOG.md`, with `@changesets/changelog-github`, which links the pull request and its author; the root `CHANGELOG.md` only points at them. The library's file also holds the history before 0.4.1, when one changelog covered both packages. Write a changeset summary the way a changelog reader needs it: what changed for a user of the package, in one or two sentences.
+`changeset version` writes each package's changelog, `packages/agent-api/CHANGELOG.md`, `packages/create-cf-open-agents-api/CHANGELOG.md` and `packages/durable-machine/CHANGELOG.md`, with `@changesets/changelog-github`, which links the pull request and its author; the root `CHANGELOG.md` only points at them. The library's file also holds the history before 0.4.1, when one changelog covered both packages. Write a changeset summary the way a changelog reader needs it: what changed for a user of the package, in one or two sentences.
 
 ## The publish workflow
 
@@ -21,6 +21,12 @@ The three packages share one version: `.changeset/config.json` lists `cf-open-ag
 
 Inspect the tarball and the npm version metadata (`npm view cf-open-agents-api@<version>`, `npm view create-cf-open-agents-api@<version>`, both under the `alpha` dist-tag), install the package in a clean consumer, and link the tag and changelog in any announcement. Publication and announcements are maintainer actions, separate from review.
 
+## `durable-machine`
+
+`durable-machine` is private until it has settled: `changeset publish` skips it, and the library carries its own copy instead of depending on it. `packages/agent-api/scripts/inline-machine.mjs`, run by the library's build, copies the built package to `dist/vendor/durable-machine/` and points the compiled imports at it; `pnpm test:package` checks that the tarball contains it and does not depend on it.
+
+To publish it later: drop `"private": true`, add `publishConfig` like the library's, make it a dependency of the library again in place of the inline step, and remember that npm trusted publishing is configured per package, so the workflow cannot publish its first version. The owner publishes it once by hand (or creates it on npm), then adds a trusted publisher for it (this repository, workflow `publish.yml`, environment `npm`, with publishing allowed).
+
 ## Before the first public release
 
 Done on 2026-09-18 for `v0.2.0`; kept as the record of what the workflow relies on.
@@ -31,4 +37,4 @@ Done on 2026-09-18 for `v0.2.0`; kept as the record of what the workflow relies 
 
 ## Dependency policy
 
-Renovate opens updates on Monday mornings (Asia/Tokyo) and only for releases that are at least 24 hours old (`minimumReleaseAge`). The native runtime pins (`@openai/codex`, `@anthropic-ai/claude-agent-sdk`, `opencode-ai`, `@opencode-ai/sdk`) and `@cloudflare/sandbox` are excluded because they define resumable state formats and image pairs; bump them by hand together with `docker/`, `packages/agent-api/src/harnesses.ts` and the compatibility profile. To take a release that is younger than 24 hours, wait, or open the bump manually and say why in the pull request.
+Renovate opens updates on Monday mornings (Asia/Tokyo) and only for releases that are at least 24 hours old (`minimumReleaseAge`). The native runtime pins (`@openai/codex`, `@anthropic-ai/claude-agent-sdk`, `opencode-ai`, `@opencode-ai/sdk`) are excluded because they define resumable state formats; bump them by hand together with `docker/`, `packages/agent-api/src/harnesses.ts` and the compatibility profile. `@cloudflare/sandbox` is excluded too: it defines the workspace backup record that checkpoints store, and the `sandbox-shim` tag in `docker/Sandbox.Dockerfile` must move with it. To take a release that is younger than 24 hours, wait, or open the bump manually and say why in the pull request.

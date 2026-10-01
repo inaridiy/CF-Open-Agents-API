@@ -7,7 +7,12 @@ import {
   setValue,
 } from "../jsonc.js";
 import { CliError } from "../plan.js";
-import type { WranglerBinding, WranglerConfig, WranglerMigration } from "../project.js";
+import type {
+  WranglerBinding,
+  WranglerConfig,
+  WranglerContainer,
+  WranglerMigration,
+} from "../project.js";
 import { CTX_EXPORTS_DATE, VENDOR_DIRECTORY } from "../versions.js";
 
 export interface WranglerInput {
@@ -30,29 +35,35 @@ export const DURABLE_OBJECTS: readonly { name: string; class_name: string }[] = 
   { name: "HARNESS", class_name: "HarnessDO" },
   { name: "SANDBOX", class_name: "SandboxDO" },
 ];
+/**
+ * The container objects start their own containers (`scheduling_policy: "durable_object"`)
+ * from the named image their code selects; sizes are chosen in code too. `name` gives each
+ * a container application of its own, so moving a project from the default policy creates
+ * new applications instead of trying to change the old ones.
+ */
 export interface ContainerSpec {
   class_name: string;
-  image: string;
-  image_build_context: string;
-  instance_type: string;
-  max_instances: number;
+  name: string;
+  scheduling_policy: "durable_object";
+  images: Record<string, { dockerfile: string; build_context: string }>;
 }
-export const CONTAINERS: readonly ContainerSpec[] = [
-  {
-    class_name: "HarnessDO",
-    image: `${VENDOR_DIRECTORY}/docker/Harness.Dockerfile`,
-    image_build_context: VENDOR_DIRECTORY,
-    instance_type: "basic",
-    max_instances: 10,
+const container = (worker: string, className: string, image: string, dockerfile: string) => ({
+  class_name: className,
+  name: `${worker}-${image}`,
+  scheduling_policy: "durable_object" as const,
+  images: {
+    [image]: {
+      dockerfile: `${VENDOR_DIRECTORY}/docker/${dockerfile}`,
+      build_context: VENDOR_DIRECTORY,
+    },
   },
-  {
-    class_name: "SandboxDO",
-    image: `${VENDOR_DIRECTORY}/docker/Sandbox.Dockerfile`,
-    image_build_context: VENDOR_DIRECTORY,
-    instance_type: "standard-1",
-    max_instances: 10,
-  },
+});
+export const containers = (worker: string): readonly ContainerSpec[] => [
+  container(worker, "HarnessDO", "harness", "Harness.Dockerfile"),
+  container(worker, "SandboxDO", "sandbox", "Sandbox.Dockerfile"),
 ];
+/** Keys of the default scheduling policy that a `durable_object` entry must not carry. */
+const LEGACY_CONTAINER_KEYS = ["image", "image_build_context", "instance_type", "max_instances"];
 export const BUCKETS = [
   { binding: "CHECKPOINTS", suffix: "checkpoints" },
   { binding: "BACKUP_BUCKET", suffix: "workspaces" },
@@ -87,7 +98,7 @@ export function upsertWranglerConfig(
   ensureContainers(state);
   ensureBuckets(state);
   ensureServices(state);
-  ensureBackupVariable(state);
+  noteBackupVariable(state);
   ensureAi(state);
   noteNamedEnvironments(state);
   if (state.document.text !== text) state.document = collapsePrimitiveArrays(state.document);
@@ -106,7 +117,7 @@ function ensureFlags(state: State): void {
     wanted.push("enable_ctx_exports");
     if (!flags.includes("enable_ctx_exports"))
       state.notes.push(
-        `compatibility_date is before ${CTX_EXPORTS_DATE}; enable_ctx_exports was added because the Container SDK needs ctx.exports.`,
+        `compatibility_date is before ${CTX_EXPORTS_DATE}; enable_ctx_exports was added because the container objects find their egress and backup entrypoints through ctx.exports.`,
       );
   }
   const missing = wanted.filter((flag) => !flags.includes(flag));
@@ -209,28 +220,39 @@ function ensureMigrations(state: State): void {
   });
 }
 
+/** The entry already is the snapshot's `durable_object` application. */
+function matchesSpec(existing: WranglerContainer, entry: ContainerSpec): boolean {
+  const [image, wanted] = Object.entries(entry.images)[0] ?? [];
+  const current = image ? existing.images?.[image] : undefined;
+  return (
+    existing.scheduling_policy === "durable_object" &&
+    Boolean(existing.name) &&
+    current?.dockerfile === wanted?.dockerfile &&
+    current?.build_context === wanted?.build_context &&
+    !LEGACY_CONTAINER_KEYS.some((key) => key in existing)
+  );
+}
+
 function ensureContainers(state: State): void {
-  const containers = config(state).containers ?? [];
-  for (const entry of CONTAINERS) {
-    const index = containers.findIndex((container) => container.class_name === entry.class_name);
-    const existing = containers[index];
+  const current = config(state).containers ?? [];
+  for (const entry of containers(state.input.name)) {
+    const index = current.findIndex((existing) => existing.class_name === entry.class_name);
+    const existing = current[index];
     if (!existing) {
       append(state, ["containers"], entry);
       continue;
     }
-    if (
-      existing.image === entry.image &&
-      existing.image_build_context === entry.image_build_context
-    )
-      continue;
+    const [image, wanted] = Object.entries(entry.images)[0] ?? [];
+    if (matchesSpec(existing, entry)) continue;
     if (!state.input.force) {
       state.notes.push(
-        `containers[${entry.class_name}] keeps image ${existing.image ?? "?"}; the snapshot Dockerfile is ${entry.image} (--force rewrites it).`,
+        existing.scheduling_policy === "durable_object"
+          ? `containers[${entry.class_name}] differs from the snapshot (images.${image ?? "?"}.dockerfile ${wanted?.dockerfile ?? "?"}); --force rewrites it.`
+          : `containers[${entry.class_name}] uses the default scheduling policy; this library starts its containers itself and needs scheduling_policy "durable_object" with images.${image ?? "?"}. That switch creates a new container application and cannot be undone; --force rewrites the entry (docs/deployment.md: upgrading from 0.5).`,
       );
       continue;
     }
-    set(state, ["containers", index, "image"], entry.image);
-    set(state, ["containers", index, "image_build_context"], entry.image_build_context);
+    set(state, ["containers", index], entry);
   }
 }
 
@@ -268,19 +290,12 @@ function ensureServices(state: State): void {
   }
 }
 
-function ensureBackupVariable(state: State): void {
-  const current = config(state);
-  const bucket = current.r2_buckets?.find(
-    (entry) => entry.binding === "BACKUP_BUCKET",
-  )?.bucket_name;
-  if (!bucket) return;
-  const value = current.vars?.BACKUP_BUCKET_NAME;
-  if (value === bucket) return;
-  if (value !== undefined)
+/** Sandbox SDK 0.x read the bucket name from a variable; backups now go through the binding. */
+function noteBackupVariable(state: State): void {
+  if (config(state).vars?.BACKUP_BUCKET_NAME !== undefined)
     state.notes.push(
-      `vars.BACKUP_BUCKET_NAME now equals the BACKUP_BUCKET bucket name (${bucket}); it was ${JSON.stringify(value)}.`,
+      "vars.BACKUP_BUCKET_NAME is no longer read: workspace backups go through the BACKUP_BUCKET binding. Remove it.",
     );
-  set(state, ["vars", "BACKUP_BUCKET_NAME"], bucket);
 }
 
 function ensureAi(state: State): void {

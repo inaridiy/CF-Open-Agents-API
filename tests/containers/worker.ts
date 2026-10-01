@@ -6,12 +6,14 @@ import {
   type AgentBindings,
   CatalogObject,
   type ContainerBindings,
-  ContainerProxy,
+  ContainerEgress,
   containerEnvironments,
   containerHarnesses,
   createAgentService,
   createHarness,
+  DirectoryBackupGateway,
   SandboxContainer,
+  SandboxEgress,
 } from "../../packages/agent-api/src/cloudflare.js";
 import { aiSDKModel, createModelGateway } from "../../packages/agent-api/src/models.js";
 import { installSkill, publishSkill } from "../../packages/agent-api/src/tools.js";
@@ -42,36 +44,32 @@ const Harness = createHarness<Bindings>(async (sandbox, _execution, env) => {
   await installSkill(env.CHECKPOINTS, reference, sandbox);
 });
 
-/**
- * Smoke-only hooks: shorten the idle timeout instead of waiting ten minutes, and keep the
- * sandbox when the harness stops so the sandbox's own orphan check is exercised.
- */
+/** Smoke-only hooks: shorten the idle timeout instead of waiting ten minutes, and read liveness. */
 export class HarnessDO extends Harness {
-  async idleAfter(seconds: number, keepSandbox: boolean): Promise<void> {
-    await this.ctx.storage.put("smoke-keep-sandbox", keepSandbox);
-    this.sleepAfter = `${seconds}s`;
-    this.renewActivityTimeout();
-    await this.scheduleNextAlarm();
+  protected override idleMs(): number {
+    return this.ctx.storage.kv.get<number>("smoke-idle-ms") ?? super.idleMs();
   }
-  override async onStop(): Promise<void> {
-    if (!(await this.ctx.storage.get<boolean>("smoke-keep-sandbox"))) await super.onStop();
-  }
-  running(): boolean {
-    return this.ctx.container?.running ?? false;
-  }
-}
-// Outbound handlers are registered per class name.
-HarnessDO.outboundByHost = Harness.outboundByHost ?? {};
-export class SandboxDO extends SandboxContainer {
   async idleAfter(seconds: number): Promise<void> {
-    await this.setSleepAfter(seconds);
-    await this.scheduleNextAlarm();
+    this.ctx.storage.kv.put("smoke-idle-ms", seconds * 1000);
+    await this.renewLease();
   }
   running(): boolean {
     return this.ctx.container?.running ?? false;
   }
 }
-export { ContainerProxy };
+export class SandboxDO extends SandboxContainer {
+  protected override idleMs(): number {
+    return this.ctx.storage.kv.get<number>("smoke-idle-ms") ?? super.idleMs();
+  }
+  async idleAfter(seconds: number): Promise<void> {
+    this.ctx.storage.kv.put("smoke-idle-ms", seconds * 1000);
+    await this.renewLease();
+  }
+  override running(): boolean {
+    return this.ctx.container?.running ?? false;
+  }
+}
+export { ContainerEgress, DirectoryBackupGateway, SandboxEgress };
 export default class AgentWorker extends service.AgentWorker {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -85,10 +83,10 @@ export default class AgentWorker extends service.AgentWorker {
       sessionId,
     ) as unknown as DurableObjectStub<SandboxDO>;
     const seconds = Number(url.searchParams.get("seconds") ?? "3");
-    if (action === "idle-harness")
-      await harness.idleAfter(seconds, url.searchParams.get("keep-sandbox") === "true");
-    else if (action === "idle-sandbox") await sandbox.idleAfter(seconds);
-    else if (action !== "state") return new Response(null, { status: 404 });
+    if (action === "idle") {
+      await harness.idleAfter(seconds);
+      await sandbox.idleAfter(seconds);
+    } else if (action !== "state") return new Response(null, { status: 404 });
     return Response.json({
       harness: await harness.running(),
       sandbox: await sandbox.running(),
@@ -413,6 +411,18 @@ async function scripted(options: StreamOptions): Promise<StreamResult> {
   if (restored && !history.includes("Container execution complete"))
     throw new Error("Missing native history");
   if (request.includes("programmatic-proof")) return programmaticProof(context);
+  // A restricted sandbox: HTTPS and HTTP to the allowed domain pass through SandboxEgress
+  // (HTTPS through the intercept's CA), anything else is refused there with 520.
+  if (request.includes("egress-proof"))
+    return once(
+      shell(
+        'code() { curl -s -o /dev/null -w \'%{http_code}\' --max-time 8 "$1"; }; printf \'https=%s http=%s blocked=%s\' "$(code https://example.com/)" "$(code http://example.com/)" "$(code https://blocked.example.org/)"',
+        codex,
+        definitions,
+      ),
+      "Egress proof done.",
+      toolResults,
+    );
   if (request.includes("idle-proof"))
     return once(
       shell("printf IDLE > /workspace/idle.txt", codex, definitions),

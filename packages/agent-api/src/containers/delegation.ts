@@ -5,6 +5,7 @@ import { attempt, decodeEffect, io } from "../effect.js";
 import type { Assignment } from "../persistence/harness-kinds.js";
 import type { Execution } from "../runtime.js";
 import { batchSchema, commandSchema } from "../runtime.js";
+import { superseded } from "./assignment.js";
 import { assignment, type HarnessHost, read, write } from "./host.js";
 
 const spawnRequestSchema = z.object({
@@ -127,10 +128,6 @@ function spawnChild(
     if (!parsed.success) return new Response("Invalid spawn request", { status: 400 });
     const delegate = delegation.delegates.find((entry) => entry.alias === parsed.data.alias);
     if (!delegate) return new Response("Unknown delegate", { status: 404 });
-    const children = current.children ?? [];
-    const active = yield* read((tx) => children.filter((id) => !tx.child(id)?.terminal).length);
-    if (active >= delegation.maxConcurrentSubagents)
-      return new Response("Concurrent subagent limit reached", { status: 409 });
     const subagentId = `subagent_${crypto.randomUUID().replaceAll("-", "")}`;
     const turnId = `turn_${crypto.randomUUID().replaceAll("-", "")}`;
     const execution = childExecution(current, delegation, delegate, {
@@ -139,10 +136,24 @@ function spawnChild(
       prompt: parsed.data.prompt,
       capabilityRoots: host.environment.capabilityRoots(),
     });
-    yield* write((tx) => {
+    // The assignment was read before the request body arrived; overlapping spawns must not
+    // each pass the limit and overwrite the child list. Check and append in one transaction.
+    const reserved = yield* write((tx) => {
+      const latest = tx.requireAssignment();
+      if (latest.revoked || superseded(latest, current)) return "superseded" as const;
+      const children = latest.children ?? [];
+      if (
+        children.filter((id) => !tx.child(id)?.terminal).length >= delegation.maxConcurrentSubagents
+      )
+        return "limit" as const;
       tx.putChild(subagentId, { execution });
-      tx.putAssignment({ ...current, children: [...children, subagentId] });
+      tx.putAssignment({ ...latest, children: [...children, subagentId] });
+      return "reserved" as const;
     });
+    if (reserved === "superseded")
+      return new Response("Execution authority was revoked", { status: 409 });
+    if (reserved === "limit")
+      return new Response("Concurrent subagent limit reached", { status: 409 });
     const started = yield* io("delegate.start", () =>
       host.child(subagentId).startExecution(execution, `${turnId}:start`),
     ).pipe(Effect.either);

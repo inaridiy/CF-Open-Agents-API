@@ -47,7 +47,7 @@ for (const file of [
   "tests/containers/wrangler.jsonc",
 ]) {
   const config =
-    /** @type {{ name: string, services: { binding: string, service: string }[], vars: Record<string, string>, r2_buckets: { binding: string, bucket_name: string }[] }} */ (
+    /** @type {{ name: string, services: { binding: string, service: string }[], vars?: Record<string, string>, r2_buckets: { binding: string, bucket_name: string }[], containers: { class_name: string, name?: string, scheduling_policy?: string, images?: Record<string, { dockerfile?: string }>, image?: string, instance_type?: unknown, max_instances?: unknown }[] }} */ (
       JSON.parse(await readFile(new URL(`../${file}`, import.meta.url), "utf8"))
     );
   assert.equal(
@@ -55,11 +55,27 @@ for (const file of [
     config.name,
     `${file}: the private model gateway must bind to its own Worker`,
   );
-  assert.equal(
-    config.vars.BACKUP_BUCKET_NAME,
-    config.r2_buckets.find((bucket) => bucket.binding === "BACKUP_BUCKET").bucket_name,
-    `${file}: sandbox backup configuration must match the R2 binding`,
+  assert(
+    config.r2_buckets.some((bucket) => bucket.binding === "BACKUP_BUCKET"),
+    `${file}: DirectoryBackup needs the BACKUP_BUCKET binding`,
   );
+  for (const [className, image] of [
+    ["HarnessDO", "harness"],
+    ["SandboxDO", "sandbox"],
+  ]) {
+    const entry = config.containers.find((container) => container.class_name === className);
+    assert(entry, `${file}: ${className} needs a containers entry`);
+    assert.equal(
+      entry.scheduling_policy,
+      "durable_object",
+      `${file}: ${className} scheduling policy`,
+    );
+    assert(entry.name, `${file}: ${className} needs a container application name`);
+    assert(entry.images?.[image]?.dockerfile, `${file}: ${className} needs the "${image}" image`);
+    for (const key of ["image", "instance_type", "max_instances"])
+      assert(!(key in entry), `${file}: ${className} keeps the default-policy key ${key}`);
+  }
+  assert(!config.vars?.BACKUP_BUCKET_NAME, `${file}: BACKUP_BUCKET_NAME is no longer read`);
 }
 const cli = /** @type {{ name: string, version: string, bin: Record<string, string> }} */ (
   JSON.parse(
@@ -82,8 +98,10 @@ for (const command of ["init", "setup", "doctor", "vendor"])
   );
 const dockerfile = await readFile(new URL("../docker/Sandbox.Dockerfile", import.meta.url), "utf8");
 assert(
-  dockerfile.includes(`cloudflare/sandbox:${library.dependencies["@cloudflare/sandbox"]}\n`),
-  "Sandbox package and Docker image versions must match",
+  dockerfile.includes(
+    `COPY --from=docker.io/cloudflare/sandbox:${library.dependencies["@cloudflare/sandbox"]} /usr/local/bin/sandbox-shim`,
+  ),
+  "The sandbox-shim image tag must match the @cloudflare/sandbox version",
 );
 const supervisor = /** @type {{ dependencies: Record<string, string> }} */ (
   JSON.parse(

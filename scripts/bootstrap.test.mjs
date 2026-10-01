@@ -56,7 +56,10 @@ void test("the rest of each file is that example's own template", (t) => {
       example,
     );
   }
-  assert.match(readFileSync(join(root, "examples/worker/.dev.vars"), "utf8"), /LOCAL_BACKUPS=true/);
+  assert.doesNotMatch(
+    readFileSync(join(root, "examples/worker/.dev.vars"), "utf8"),
+    /LOCAL_BACKUPS/,
+  );
 });
 void test("existing files are kept unless forced", (t) => {
   const root = fixture(t);

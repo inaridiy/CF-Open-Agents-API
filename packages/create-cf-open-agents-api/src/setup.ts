@@ -34,10 +34,6 @@ export interface SetupOptions {
 }
 
 const PROVIDER_SECRETS = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MODEL_API_KEY"];
-const R2_SECRETS = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"] as const;
-const ACCOUNT_SECRET = "CLOUDFLARE_R2_ACCOUNT_ID";
-const R2_TOKEN_HELP =
-  "R2 → Manage R2 API Tokens in the Cloudflare dashboard: create a token with Object Read & Write on the workspaces bucket.";
 
 /** Creates the R2 buckets the configuration names; an existing bucket is a skip. */
 export function ensureBuckets(
@@ -66,30 +62,6 @@ export function ensureBuckets(
   }
 }
 
-/** The 32-hex account ids `wrangler whoami` prints. */
-export function accountIds(output: string): string[] {
-  return [...new Set(output.match(/\b[0-9a-f]{32}\b/g) ?? [])];
-}
-
-async function resolveAccountId(
-  wrangler: Wrangler,
-  prompter: Prompter,
-  env: NodeJS.ProcessEnv,
-): Promise<string> {
-  const fromEnv = env.CLOUDFLARE_R2_ACCOUNT_ID ?? env.CLOUDFLARE_ACCOUNT_ID;
-  if (fromEnv) return fromEnv;
-  const whoami = wrangler(["whoami"]);
-  const ids = accountIds(whoami.stdout);
-  if (ids.length === 1 && ids[0]) return ids[0];
-  if (ids.length > 1)
-    return prompter.select(
-      "Cloudflare account",
-      ids.map((id) => ({ value: id, label: id })),
-      ids[0] ?? "",
-    );
-  return prompter.text("Cloudflare account id (dashboard → Workers & Pages → Account details)", "");
-}
-
 /**
  * Every provider key the project uses: the one the recorded composition needs, so a
  * generated project is asked for it even before it reaches `.dev.vars`, and every provider
@@ -101,7 +73,7 @@ function secretNames(root: string, devVars: ReadonlyMap<string, string>): string
   const recorded = readCompositionRecord(root);
   const recordedSecret = recorded && providerSecret(recorded.provider);
   const provider = PROVIDER_SECRETS.filter((name) => name === recordedSecret || devVars.has(name));
-  return ["API_TOKEN", ...provider, ...R2_SECRETS, ACCOUNT_SECRET];
+  return ["API_TOKEN", ...provider];
 }
 
 async function collectSecrets(
@@ -120,7 +92,7 @@ async function collectSecrets(
       values[name] = value;
       continue;
     }
-    values[name] = await promptSecret(name, devVars.get(name), wrangler, prompter, env);
+    values[name] = await promptSecret(name, devVars.get(name), prompter);
   }
   return values;
 }
@@ -128,11 +100,8 @@ async function collectSecrets(
 async function promptSecret(
   name: string,
   local: string | undefined,
-  wrangler: Wrangler,
   prompter: Prompter,
-  env: NodeJS.ProcessEnv,
 ): Promise<string> {
-  if (name === ACCOUNT_SECRET) return resolveAccountId(wrangler, prompter, env);
   if (name === "API_TOKEN") {
     if (
       local &&
@@ -143,7 +112,6 @@ async function promptSecret(
     if (await prompter.confirm("Generate a new API_TOKEN? (No = type one)", true))
       return randomToken();
   }
-  if (name === "R2_ACCESS_KEY_ID") console.log(R2_TOKEN_HELP);
   const value = await prompter.password(`${name}`);
   if (name === "API_TOKEN" && value.length < MINIMUM_TOKEN_LENGTH)
     throw new CliError(`API_TOKEN must be at least ${MINIMUM_TOKEN_LENGTH} characters`);
@@ -185,9 +153,6 @@ export async function runSetup(options: SetupOptions): Promise<Plan> {
       plan.add({ status: "updated", file: `secrets ${names.join(", ")}` });
     }
   }
-  plan.note(
-    "LOCAL_BACKUPS stays out of production: the Sandbox SDK then signs presigned R2 URLs with the R2 secrets.",
-  );
   plan.note(
     `Deploy with ${wrangler.describe(["deploy"])}; the first deploy pushes both images and takes several minutes.`,
   );

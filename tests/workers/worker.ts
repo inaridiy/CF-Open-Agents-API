@@ -5,7 +5,7 @@ import type { EnvironmentInfo } from "openai/resources/beta/agents/environments/
 import ExampleCallerWorker from "../../examples/caller/src/index.js";
 import { CatalogObject } from "../../packages/agent-api/src/catalog.js";
 import type { EnvironmentDriver } from "../../packages/agent-api/src/environments.js";
-import { BackupCredentialsMissing } from "../../packages/agent-api/src/errors.js";
+import { ContainerMisconfigured } from "../../packages/agent-api/src/errors.js";
 import { ApiError } from "../../packages/agent-api/src/protocol.js";
 import type {
   Execution,
@@ -21,9 +21,11 @@ import {
   createAgentService,
 } from "../../packages/agent-api/src/service.js";
 import { defineAgentWorker } from "../../packages/agent-api/src/worker.js";
+import type { MachineFixture } from "./machine-fixture.js";
 
 export interface TestEnv extends AgentBindings {
   SCRIPTED: DurableObjectNamespace<ScriptedHarness>;
+  MACHINES: DurableObjectNamespace<MachineFixture>;
   ASSETS: R2Bucket;
   AGENTS: Service<InstanceType<typeof BindingAgentWorker>>;
   MODEL_GATEWAY: Fetcher;
@@ -271,12 +273,12 @@ function scriptedEnvironments(env: TestEnv): EnvironmentDriver {
       new ApiError(503, "environment_unavailable", "Scripted environments hold no files"),
     );
   return {
-    // A stored marker stands in for a deployment without backup credentials.
+    // A stored marker stands in for a deployment that cannot host environments.
     preflight: () =>
       Effect.promise(() => env.ASSETS.get("environment-preflight")).pipe(
         Effect.flatMap((blocked) =>
           blocked
-            ? Effect.fail(new BackupCredentialsMissing({ missing: ["R2_ACCESS_KEY_ID"] }))
+            ? Effect.fail(new ContainerMisconfigured({ reason: 'Add an image named "sandbox"' }))
             : Effect.void,
         ),
       ),
@@ -373,3 +375,4 @@ export const { Agents: BindingAgentWorker, Models } = defineAgentWorker<TestEnv>
   pollIntervalMs: 60_000,
 });
 export class CallerWorker extends ExampleCallerWorker {}
+export { MachineFixture } from "./machine-fixture.js";

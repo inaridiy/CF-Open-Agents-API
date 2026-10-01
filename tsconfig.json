@@ -14,7 +14,9 @@
     "types": ["@cloudflare/workers-types", "node"],
     "paths": {
       "cf-open-agents-api": ["./packages/agent-api/src/index.ts"],
-      "cf-open-agents-api/*": ["./packages/agent-api/src/*.ts"]
+      "cf-open-agents-api/*": ["./packages/agent-api/src/*.ts"],
+      "durable-machine": ["./packages/durable-machine/src/index.ts"],
+      "durable-machine/*": ["./packages/durable-machine/src/*.ts"]
     },
     "plugins": [
       {

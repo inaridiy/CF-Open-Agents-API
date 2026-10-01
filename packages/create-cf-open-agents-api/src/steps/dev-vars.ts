@@ -11,8 +11,6 @@ export interface DevVarsOptions {
   token?: () => string;
 }
 
-const LOCAL_BACKUPS_COMMENT =
-  "# Store sandbox backups on the local R2 emulator during `wrangler dev`; unset in production.";
 const TOKEN_COMMENT =
   "# Bearer token clients send; at least 32 characters. A caller must use the same value.";
 
@@ -35,7 +33,7 @@ function upsertLine(lines: string[], key: string, value: string, comment?: strin
   appendBlock(lines, [...(comment ? [comment] : []), `${key}=${value}`]);
 }
 
-/** `.dev.vars` with a usable API token, the provider key line and local backups. */
+/** `.dev.vars` with a usable API token and the provider key line. */
 export function ensureDevVars(options: DevVarsOptions): StepResult {
   const path = join(options.files.root, ".dev.vars");
   const existing = options.files.read(path) ?? "";
@@ -52,8 +50,6 @@ export function ensureDevVars(options: DevVarsOptions): StepResult {
   }
   if (options.secret && !values.has(options.secret.name))
     upsertLine(lines, options.secret.name, "", options.secret.comment);
-  if (!values.has("LOCAL_BACKUPS"))
-    upsertLine(lines, "LOCAL_BACKUPS", "true", LOCAL_BACKUPS_COMMENT);
   return options.files.write(
     path,
     `${lines.join("\n")}\n`,
@@ -71,6 +67,5 @@ export function ensureDevVarsExample(options: DevVarsOptions): StepResult {
   if (!values.has("API_TOKEN")) append(["API_TOKEN=replace-with-at-least-32-random-characters"]);
   if (options.secret && !values.has(options.secret.name))
     append([options.secret.comment, `${options.secret.name}=`]);
-  if (!values.has("LOCAL_BACKUPS")) append([LOCAL_BACKUPS_COMMENT, "LOCAL_BACKUPS=true"]);
   return options.files.write(path, `${lines.join("\n")}\n`);
 }

@@ -1,4 +1,3 @@
-import { getSandbox } from "@cloudflare/sandbox";
 import { Effect } from "effect";
 
 import { sha256Hex } from "../bytes.js";
@@ -8,17 +7,46 @@ import {
   ArtifactListFailed,
   CheckpointIncompatible,
   CheckpointMissing,
+  CheckpointTooLarge,
   Superseded,
   TransportFailure,
 } from "../errors.js";
-import { copyKnownLength } from "../files.js";
 import { HARNESSES } from "../harnesses.js";
 import type { Checkpoint, Execution } from "../runtime.js";
 import { superseded } from "./assignment.js";
 import { assignment, HarnessBindings, type HarnessHost, read, releaseBody, write } from "./host.js";
-import { rememberSandbox } from "./sandbox.js";
+import { rememberSandbox, sandboxOf, workspaceOf } from "./workspace.js";
 
 const ARTIFACT_FILE_LIMIT = 200 * 1024 * 1024;
+/** The serialized native checkpoint the Worker buffers: the supervisor caps contents at 32 MiB. */
+const CHECKPOINT_LIMIT = 64 * 1024 * 1024;
+
+/** The stream's bytes, or `undefined` (and the stream cancelled) once it passes `limit`. */
+async function readBounded(
+  body: ReadableStream<Uint8Array>,
+  limit: number,
+): Promise<Uint8Array | undefined> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
 const ARTIFACT_TURN_LIMIT = 500 * 1024 * 1024;
 /**
  * Publish `/workspace/outputs` to R2 under a durable manifest: the manifest is committed
@@ -27,15 +55,16 @@ const ARTIFACT_TURN_LIMIT = 500 * 1024 * 1024;
  */
 const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Execution) {
   const env = yield* HarnessBindings;
-  const sandbox = getSandbox(env.SANDBOX, execution.sessionId);
-  if (!(yield* io("artifact.exists", () => sandbox.exists("/workspace/outputs"))).exists) return [];
+  const sandbox = sandboxOf(env, execution.sessionId);
+  if (!(yield* io("artifact.exists", () => sandbox.exists("/workspace/outputs")))) return [];
   let manifest = yield* read((tx) => tx.artifacts(execution.generation));
   if (!manifest) {
-    const listing = yield* io("artifact.list", () =>
-      sandbox.listFiles("/workspace/outputs", { recursive: true, includeHidden: true }),
+    const listing = yield* io("artifact.list", () => sandbox.list("/workspace/outputs")).pipe(
+      Effect.mapError(() => new ArtifactListFailed()),
     );
-    if (!listing.success) return yield* new ArtifactListFailed();
-    const files = listing.files.filter((file) => file.type === "file");
+    const files = listing
+      .filter((file) => file.type === "file")
+      .map((file) => ({ absolutePath: file.path, size: file.size }));
     if (
       files.some((file) => file.size > ARTIFACT_FILE_LIMIT) ||
       files.reduce((sum, file) => sum + file.size, 0) > ARTIFACT_TURN_LIMIT
@@ -68,13 +97,11 @@ const publishArtifacts = Effect.fn("harness.artifacts")(function* (execution: Ex
     (artifact) =>
       Effect.gen(function* () {
         if (yield* io("artifact.head", () => env.CHECKPOINTS.head(artifact.key))) return;
-        const source = yield* io("artifact.read", () =>
-          sandbox.readFile(artifact.path, { encoding: "none" }),
-        );
-        yield* copyKnownLength(source.content, artifact.size_bytes, (stream) =>
-          env.CHECKPOINTS.put(artifact.key, stream, {
-            httpMetadata: { contentType: "application/octet-stream" },
-          }),
+        // The object names this upload in the committed manifest: observe its outcome.
+        yield* Effect.uninterruptible(
+          io("artifact.copy", () =>
+            sandbox.copyToObject(artifact.path, artifact.key, artifact.size_bytes),
+          ),
         );
       }),
     { concurrency: 4, discard: true },
@@ -89,6 +116,10 @@ export function loadCheckpoint(previousCheckpoint: Checkpoint | null) {
     if (!previousCheckpoint) return;
     const object = yield* io("startAttempt", () => env.CHECKPOINTS.get(previousCheckpoint.native));
     if (!object) return yield* new CheckpointMissing({ key: previousCheckpoint.native });
+    if (object.size > CHECKPOINT_LIMIT) {
+      yield* io("startAttempt.release", () => object.body.cancel()).pipe(Effect.ignore);
+      return yield* new CheckpointTooLarge();
+    }
     return yield* io("startAttempt", () => object.json());
   });
 }
@@ -118,24 +149,20 @@ export function snapshot(host: HarnessHost, execution: Execution) {
       });
     }
     // containerFetch may return a chunked stream; R2 requires a known length.
-    const bytes = yield* io("snapshot", () => response.arrayBuffer());
+    const body = response.body as ReadableStream<Uint8Array>;
+    const bytes = yield* io("snapshot", () => readBounded(body, CHECKPOINT_LIMIT));
+    if (!bytes) return yield* new CheckpointTooLarge();
     // The checkpoint record below names this object: its outcome must be observed.
     yield* Effect.uninterruptible(io("snapshot", () => host.env.CHECKPOINTS.put(key, bytes)));
-    const sandbox = getSandbox(host.env.SANDBOX, execution.sessionId);
     const workspace = execution.sandbox
-      ? yield* io("snapshot", () =>
-          sandbox.createBackup({
-            dir: "/workspace",
-            localBucket: host.env.LOCAL_BACKUPS === "true",
-            ttl: 30 * 24 * 60 * 60,
-          }),
-        )
+      ? yield* io("snapshot", () => sandboxOf(host.env, execution.sessionId).backup())
       : undefined;
     // The live filesystem now equals the committed workspace; the next turn may continue in it.
     if (workspace)
-      yield* rememberSandbox(sandbox, { workspaceId: workspace.id, provisioned: true }).pipe(
-        Effect.catchAll(() => write((tx) => tx.forgetSandbox())),
-      );
+      yield* rememberSandbox(workspaceOf(host.env, execution.sessionId), {
+        workspaceId: workspace.id,
+        provisioned: true,
+      }).pipe(Effect.catchAll(() => write((tx) => tx.forgetSandbox())));
     const artifacts =
       execution.sandbox && execution.environmentId ? yield* publishArtifacts(execution) : [];
     const checkpoint: Checkpoint = {

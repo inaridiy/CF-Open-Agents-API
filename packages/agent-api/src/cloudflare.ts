@@ -1,7 +1,9 @@
-export { ContainerProxy } from "@cloudflare/sandbox";
+export { DirectoryBackupGateway } from "@cloudflare/sandbox";
 export { CatalogObject } from "./catalog.js";
 export {
   type ContainerBindings,
+  ContainerEgress,
+  type ContainerInstance,
   claudeCodeDriver,
   codexDriver,
   containerDriver,
@@ -10,7 +12,11 @@ export {
   createHarness,
   HarnessContainer,
   openCodeDriver,
+  type LegacyWorkspaceBackup,
   SandboxContainer,
+  SandboxEgress,
+  type Workspace,
+  type WorkspaceBackup,
 } from "./containers.js";
 export type { EnvironmentDriver, EnvironmentSpec } from "./environments.js";
 export {

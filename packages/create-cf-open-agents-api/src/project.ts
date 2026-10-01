@@ -26,6 +26,8 @@ export interface WranglerBinding {
 export interface WranglerContainer {
   class_name?: string;
   name?: string;
+  scheduling_policy?: string;
+  images?: Record<string, { dockerfile?: string; build_context?: string; image?: string }>;
   image?: string;
   image_build_context?: string;
   instance_type?: string;

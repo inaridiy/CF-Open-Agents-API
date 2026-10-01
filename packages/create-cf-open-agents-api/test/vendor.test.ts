@@ -57,7 +57,11 @@ it("copies what the Dockerfiles need from a local checkout, and nothing else", a
       ".git",
     ])
       expect(existsSync(join(vendor, excluded)), excluded).toBe(false);
-    expect(readdirSync(join(vendor, "packages")).sort()).toEqual(["agent-api", "supervisor"]);
+    expect(readdirSync(join(vendor, "packages")).sort()).toEqual([
+      "agent-api",
+      "durable-machine",
+      "supervisor",
+    ]);
     const manifest = readVendorManifest(root);
     expect(manifest).toMatchObject({
       name: "cf-open-agents-api",

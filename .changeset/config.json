@@ -2,7 +2,14 @@
   "$schema": "https://unpkg.com/@changesets/config@4.0.1/schema.json",
   "changelog": ["@changesets/changelog-github", { "repo": "inaridiy/CF-Open-Agents-API" }],
   "commit": false,
-  "fixed": [["cf-open-agents-api", "create-cf-open-agents-api", "cf-open-agents-api-supervisor"]],
+  "fixed": [
+    [
+      "cf-open-agents-api",
+      "create-cf-open-agents-api",
+      "cf-open-agents-api-supervisor",
+      "durable-machine"
+    ]
+  ],
   "linked": [],
   "access": "public",
   "baseBranch": "main",

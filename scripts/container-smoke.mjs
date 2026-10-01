@@ -574,7 +574,43 @@ try {
       }
       assert.deepEqual(await smoke(id), expected, "Containers did not reach the expected state");
     };
-    // Codex leaves exec-server running in the sandbox, which alone keeps it awake.
+    // A restricted network policy: only the allowed domain is reachable, over HTTP and HTTPS.
+    const restricted = await sessions.create({
+      agent: { model: "codex" },
+      environment: {
+        type: "openai_hosted",
+        network: { access: "restricted", allowed_domains: ["example.com"] },
+      },
+      input: "egress-proof: reach an allowed and a refused host.",
+    });
+    sessionId = restricted.id;
+    await complete();
+    await remember();
+    const egress = (await sessions.items.list(restricted.id, { limit: 100 })).data.find(
+      (item) => item.type === "command_execution",
+    );
+    const codes = /** @type {Record<string, string>} */ (
+      Object.fromEntries(
+        (egress?.type === "command_execution" ? egress.output : "")
+          .trim()
+          .split(" ")
+          .map((pair) => pair.split("=")),
+      )
+    );
+    // The refused host is answered by the policy itself; the allowed one must pass it (its
+    // answer depends on the runner's own Internet access, so only "not refused" is asserted).
+    assert.equal(codes.blocked, "520", `Restricted egress: ${JSON.stringify(codes)}`);
+    for (const scheme of ["https", "http"])
+      assert(
+        codes[scheme] && codes[scheme] !== "520",
+        `Restricted egress refused the allowed host over ${scheme}: ${JSON.stringify(codes)}`,
+      );
+    await sessions.delete(restricted.id);
+    sessionId = "";
+    console.log(
+      "PASS: a restricted sandbox passes its allowed domain over HTTP and HTTPS and is refused elsewhere.",
+    );
+    // Codex leaves exec-server running in the sandbox; only the objects' idle timers end it.
     const completed = async () => {
       const session = await sessions.create({
         agent: { model: "codex" },
@@ -587,23 +623,17 @@ try {
       assert.deepEqual(await smoke(session.id), { harness: true, sandbox: true });
       return session.id;
     };
-    // An idle harness stops after the turn, and its sandbox goes with it.
+    // After an idle completed turn, each object's alarm destroys its own container.
     const idle = await completed();
-    await smoke(idle, "idle-harness", "?seconds=3");
+    await smoke(idle, "idle", "?seconds=3");
     await until(idle, { harness: false, sandbox: false });
-    // A harness that stopped without releasing its sandbox: the sandbox ends itself.
-    const orphan = await completed();
-    await smoke(orphan, "idle-harness", "?seconds=3&keep-sandbox=true");
-    await until(orphan, { harness: false, sandbox: true });
-    await smoke(orphan, "idle-sandbox", "?seconds=3");
-    await until(orphan, { harness: false, sandbox: false });
-    // Deleting a completed session releases both containers at once.
+    // Deleting a completed session releases both containers at once, for good.
     const deleted = await completed();
     await sessions.delete(deleted);
     sessionId = "";
     await until(deleted, { harness: false, sandbox: false });
     console.log(
-      "PASS: codex harness and sandbox containers stop after an idle turn, after an orphaned harness, and on deletion.",
+      "PASS: codex harness and sandbox containers stop on their idle timers after a turn, and on deletion.",
     );
   }
 } catch (error) {

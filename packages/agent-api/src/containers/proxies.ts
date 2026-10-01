@@ -1,4 +1,3 @@
-import { getSandbox } from "@cloudflare/sandbox";
 import { Effect, Stream } from "effect";
 import { z } from "zod";
 
@@ -12,15 +11,9 @@ import { readModelBodyEffect } from "../models/body.js";
 import { constrainCodexSearch } from "../models/codex-search.js";
 import { programmaticInputSchema, type ProgrammaticResult } from "../programmatic-contract.js";
 import { runProgrammatic } from "../programmatic.js";
-import { executeWorkspaceTool } from "../sandbox-tools.js";
 import { modelAllowed, permittedCodeTool, superseded } from "./assignment.js";
-import {
-  assignment,
-  type ContainerBindings,
-  type HarnessHost,
-  releaseBody,
-  write,
-} from "./host.js";
+import { assignment, type HarnessHost, releaseBody, write } from "./host.js";
+import { sandboxOf } from "./workspace.js";
 
 /**
  * The outbound hosts a harness container reaches through the Container's handler, each
@@ -128,7 +121,7 @@ export function programmaticRequest(host: HarnessHost, request: Request) {
           });
           if (revoked && current.sandbox && !current.parent)
             yield* io("programmatic.destroy", () =>
-              getSandbox(host.env.SANDBOX, current.sessionId).destroy(),
+              sandboxOf(host.env, current.sessionId).stop("programmatic_outcome_uncertain"),
             );
         }
         return Response.json({
@@ -217,11 +210,8 @@ export function sandboxRequest(host: HarnessHost, request: Request) {
             });
           return yield* io("workspace.tool", async (signal) => {
             signal.throwIfAborted();
-            return executeWorkspaceTool(
-              getSandbox(host.env.SANDBOX, current.sessionId),
-              input,
-              onOutput ? { onOutput, signal } : undefined,
-            );
+            const lines = await sandboxOf(host.env, current.sessionId).workspaceTool(input);
+            return readToolLines(lines, signal, onOutput);
           });
         }),
       );
@@ -304,38 +294,44 @@ function programmaticFailureText(error: ServiceError): string {
   }
 }
 
-// The SDK registers handlers through its static setter. Class fields bypass it.
-export const outboundByHost = {
-  "media.internal": async (request: Request, bindings: unknown, ctx: { containerId: string }) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).mediaRequest(request);
-  },
-  "programmatic.internal": async (
-    request: Request,
-    bindings: unknown,
-    ctx: { containerId: string },
-  ) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).programmaticRequest(request);
-  },
-  "mcp.internal": async (request: Request, bindings: unknown, ctx: { containerId: string }) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).mcpRequest(request);
-  },
-  "delegate.internal": async (
-    request: Request,
-    bindings: unknown,
-    ctx: { containerId: string },
-  ) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).delegateRequest(request);
-  },
-  "sandbox.internal": async (request: Request, bindings: unknown, ctx: { containerId: string }) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).fetch(request);
-  },
-  "model.internal": async (request: Request, bindings: unknown, ctx: { containerId: string }) => {
-    const env = bindings as ContainerBindings;
-    return env.HARNESS.get(env.HARNESS.idFromString(ctx.containerId)).modelRequest(request);
-  },
-};
+/** A failure this cleanup cannot act on. */
+const ignore = (): void => {};
+const toolLineSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("delta"), text: z.string() }),
+  z.object({ type: z.literal("result"), text: z.string(), exitCode: z.number().nullable() }),
+  z.object({ type: z.literal("error"), message: z.string() }),
+]);
+/**
+ * Follows the NDJSON a SandboxDO tool call streams back. Cancelling the stream, as the
+ * fiber's interruption does, stops the command in the sandbox.
+ */
+async function readToolLines(
+  lines: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  onOutput?: (text: string) => void,
+): Promise<{ text: string; exitCode: number | null }> {
+  const reader = lines.getReader();
+  const decoder = new TextDecoder();
+  const cancel = () => void reader.cancel().catch(ignore);
+  signal.addEventListener("abort", cancel, { once: true });
+  let buffer = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("Workspace tool stream ended without a result");
+      buffer += decoder.decode(value, { stream: true });
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const event = toolLineSchema.parse(JSON.parse(buffer.slice(0, newline)));
+        buffer = buffer.slice(newline + 1);
+        if (event.type === "delta") onOutput?.(event.text);
+        else if (event.type === "result") return { text: event.text, exitCode: event.exitCode };
+        else throw new Error(event.message);
+        newline = buffer.indexOf("\n");
+      }
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    cancel();
+  }
+}

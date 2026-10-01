@@ -10,7 +10,7 @@ import { readVendorManifest, type VendorManifest } from "./steps/vendor.js";
 import {
   BUCKETS,
   classOrigin,
-  CONTAINERS,
+  containers,
   DURABLE_OBJECTS,
   isSqliteClass,
 } from "./steps/wrangler.js";
@@ -53,19 +53,7 @@ const serviceCheck = (config: WranglerConfig, binding: string, entrypoint: strin
 };
 
 function storageChecks(config: WranglerConfig): Check[] {
-  const backup = config.r2_buckets?.find(
-    (bucket) => bucket.binding === "BACKUP_BUCKET",
-  )?.bucket_name;
-  const variable = config.vars?.BACKUP_BUCKET_NAME;
-  const checks = [
-    check(
-      "vars.BACKUP_BUCKET_NAME",
-      backup !== undefined && variable === backup,
-      backup === undefined
-        ? "BACKUP_BUCKET binding missing"
-        : `${JSON.stringify(variable)} vs bucket ${backup}`,
-    ),
-  ];
+  const checks: Check[] = [];
   for (const bucket of BUCKETS) {
     const present = config.r2_buckets?.some((entry) => entry.binding === bucket.binding) ?? false;
     checks.push(check(`r2_buckets.${bucket.binding}`, present, present ? "" : "missing"));
@@ -108,14 +96,20 @@ function objectChecks(config: WranglerConfig): Check[] {
 }
 
 function containerChecks(config: WranglerConfig): Check[] {
-  return CONTAINERS.map((container) => {
+  return containers(config.name ?? "").map((container) => {
     const entry = config.containers?.find((item) => item.class_name === container.class_name);
-    const ok = entry?.image === container.image;
-    return check(
-      `containers.${container.class_name}`,
-      ok,
-      entry ? `image ${entry.image ?? "?"}` : "missing",
-    );
+    const [image, wanted] = Object.entries(container.images)[0] ?? [];
+    const dockerfile = image ? entry?.images?.[image]?.dockerfile : undefined;
+    const ok =
+      entry?.scheduling_policy === "durable_object" &&
+      Boolean(entry.name) &&
+      dockerfile === wanted?.dockerfile;
+    let detail = "missing";
+    if (entry?.scheduling_policy === "durable_object")
+      detail = `images.${image ?? "?"} ${dockerfile ?? "missing"}`;
+    else if (entry)
+      detail = "default scheduling policy; init --force moves it to durable_object (one-way)";
+    return check(`containers.${container.class_name}`, ok, detail);
   });
 }
 

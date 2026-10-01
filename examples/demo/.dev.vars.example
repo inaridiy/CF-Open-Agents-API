@@ -1,5 +1,3 @@
 API_TOKEN=replace-with-at-least-32-random-characters
 # Required for the codex, claude and opencode presets; leave empty to use only `workers`.
 OPENAI_API_KEY=
-# Store sandbox backups on the local R2 emulator during `wrangler dev`; unset in production.
-LOCAL_BACKUPS=true

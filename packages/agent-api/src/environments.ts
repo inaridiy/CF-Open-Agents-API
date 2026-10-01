@@ -7,6 +7,7 @@ import type { ServiceError } from "./effect.js";
 import type { EnvironmentFileInput, HostedConfiguration } from "./environment-config.js";
 import { NetworkPolicyBroadened } from "./errors.js";
 import type { ResolvedInputFile } from "./files.js";
+import type { workspaceBackupSchema } from "./runtime.js";
 import type { ResolvedSkill } from "./skills.js";
 
 export interface EnvironmentSpec {
@@ -23,7 +24,7 @@ export interface EnvironmentSpec {
   inherited?: {
     sessionId: string;
     environmentId: string;
-    workspace?: { id: string; dir: string; localBucket?: boolean };
+    workspace?: typeof workspaceBackupSchema.Type;
   };
 }
 export const environmentFilePageSchema = z.strictObject({

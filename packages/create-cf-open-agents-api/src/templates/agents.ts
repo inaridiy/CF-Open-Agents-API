@@ -1,3 +1,4 @@
+import { EXPORTED_CLASSES } from "../steps/entry.js";
 import type { Choice } from "../ui.js";
 import { PROVIDER_VERSIONS } from "../versions.js";
 
@@ -171,8 +172,8 @@ function portableEntries(
   pieces.helpers.add("aiSDKModel");
   pieces.imports.set(module, [factory]);
   pieces.models.push(
-    arrowEntry("primary", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${primary}"))`, 6),
-    arrowEntry("fast", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${fast}"))`, 6),
+    arrowEntry("primary", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${primary}"))`, 4),
+    arrowEntry("fast", `aiSDKModel(${factory}({ apiKey: env.${secret} })("${fast}"))`, 4),
   );
 }
 function portablePresets(pieces: Pieces, harnesses: readonly Harness[]): void {
@@ -251,12 +252,12 @@ function workersEntries(pieces: Pieces): void {
     arrowEntry(
       "workers",
       `aiSDKModel(createWorkersAI({ binding: env.AI })("${DEFAULT_MODELS.workers}"))`,
-      6,
+      4,
     ),
     arrowEntry(
       "workersQwen",
       `aiSDKModel(createWorkersAI({ binding: env.AI })("${DEFAULT_MODELS.workersQwen}"))`,
-      6,
+      4,
     ),
   );
 }
@@ -365,10 +366,10 @@ function presetLines(preset: Preset, presets: readonly Preset[]): string[] {
   if (preset.name !== "workers" && delegates.length > 0)
     fields.push(`delegates: [${quoted(delegates)}]`);
   if (preset.webSearch) fields.push("webSearch: true");
-  return fitted(`      ${preset.name}: { ${fields.join(", ")} },`, () => [
-    `      ${preset.name}: {`,
-    ...fields.map((field) => `        ${field},`),
-    "      },",
+  return fitted(`    ${preset.name}: { ${fields.join(", ")} },`, () => [
+    `    ${preset.name}: {`,
+    ...fields.map((field) => `      ${field},`),
+    "    },",
   ]);
 }
 
@@ -410,30 +411,32 @@ export function renderComposition(input: CompositionInput): string {
     "}",
     "",
     "// Wrangler binds the Durable Objects by these export names and the private model",
-    "// gateway by the `Models` entrypoint; keep them as they are.",
-    "export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =",
-    "  defineAgentWorker<Bindings>({",
-    "    // Presets: the `agent.model` names clients send. Each maps to a native runtime",
-    "    // (`harness`) and a gateway registry name (`model`). Optional fields: `delegates` lists",
-    "    // the presets a session may start subagents on when multi_agent is enabled (children",
-    "    // share the parent's sandbox); `tiers` names the registry entries Claude Code's",
-    "    // haiku/sonnet/opus subagent tiers resolve to; `webSearch` declares that the model",
-    "    // connection provides hosted web search (a nativeModel connection, not the AI SDK path).",
-    "    agents: {",
+    "// gateway by the `Models` entrypoint; the container objects find the egress and backup",
+    "// entrypoints by theirs. Keep them as they are.",
+    "export const {",
+    ...EXPORTED_CLASSES.map((name) => `  ${name},`),
+    "} = defineAgentWorker<Bindings>({",
+    "  // Presets: the `agent.model` names clients send. Each maps to a native runtime",
+    "  // (`harness`) and a gateway registry name (`model`). Optional fields: `delegates` lists",
+    "  // the presets a session may start subagents on when multi_agent is enabled (children",
+    "  // share the parent's sandbox); `tiers` names the registry entries Claude Code's",
+    "  // haiku/sonnet/opus subagent tiers resolve to; `webSearch` declares that the model",
+    "  // connection provides hosted web search (a nativeModel connection, not the AI SDK path).",
+    "  agents: {",
     ...pieces.presets.flatMap((preset) => presetLines(preset, pieces.presets)),
-    "    },",
-    "    // The private model gateway. Keys are deployment-owned names that presets point at;",
-    "    // runtimes never see provider URLs or keys. Each entry is a factory built only when a",
-    "    // session selects it, so a deployment without one provider's credentials still serves",
-    "    // the other presets. Add a model here, then point a preset's `model` at it.",
-    "    models: (env) => ({",
-    ...pieces.models.flatMap((entry) => entry.lines.map((line) => `      ${line}`)),
-    "    }),",
-    "    // Who may call the API. `bearerTenant` accepts one shared bearer token (API_TOKEN, at",
-    '    // least 32 characters) and maps every caller to the tenant "default"; Service Binding',
-    "    // callers pass the same token. Replace it to resolve tenants from your own auth.",
-    '    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),',
-    "  });",
+    "  },",
+    "  // The private model gateway. Keys are deployment-owned names that presets point at;",
+    "  // runtimes never see provider URLs or keys. Each entry is a factory built only when a",
+    "  // session selects it, so a deployment without one provider's credentials still serves",
+    "  // the other presets. Add a model here, then point a preset's `model` at it.",
+    "  models: (env) => ({",
+    ...pieces.models.flatMap((entry) => entry.lines.map((line) => `    ${line}`)),
+    "  }),",
+    "  // Who may call the API. `bearerTenant` accepts one shared bearer token (API_TOKEN, at",
+    '  // least 32 characters) and maps every caller to the tenant "default"; Service Binding',
+    "  // callers pass the same token. Replace it to resolve tenants from your own auth.",
+    '  authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),',
+    "});",
   ];
   if (input.standalone) lines.push("export default Agents;");
   return `${lines.join("\n")}\n`;
