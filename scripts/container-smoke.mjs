@@ -623,6 +623,20 @@ try {
       assert.deepEqual(await smoke(session.id), { harness: true, sandbox: true });
       return session.id;
     };
+    // A sandbox replaced after a turn (idle stop, platform restart) serves exec-server again.
+    const restarted = await completed();
+    const restart = await fetch(`http://127.0.0.1:8799/smoke/restart/${restarted}`);
+    assert.equal(restart.status, 200, await restart.clone().text());
+    const proxied = /** @type {{ status: number, sandbox: boolean }} */ (await restart.json());
+    assert(
+      proxied.sandbox && proxied.status < 500,
+      `Restarted sandbox: ${JSON.stringify(proxied)}`,
+    );
+    await sessions.delete(restarted);
+    sessionId = "";
+    console.log(
+      "PASS: a restarted sandbox starts its exec-server again on the first proxied request.",
+    );
     // After an idle completed turn, each object's alarm destroys its own container.
     const idle = await completed();
     await smoke(idle, "idle", "?seconds=3");

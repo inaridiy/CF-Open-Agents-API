@@ -86,6 +86,12 @@ export const HARNESS_IMAGE = "harness";
 const SUPERVISOR_PORT = 8080;
 /** How long a fresh harness container may take to answer before the boot fails. */
 const READY_TIMEOUT_MS = 90_000;
+/**
+ * The whole boot, start to a ready supervisor. The platform can leave a start pending
+ * without an answer; bounded, the lease fails the boot, destroys the container and the next
+ * attempt starts a new one, instead of the boot holding the alarm until the runtime ends it.
+ */
+const BOOT_TIMEOUT_MS = 3 * 60 * 1000;
 const IDLE_MS = 10 * 60 * 1000;
 /** The platform's own stop after the object goes inactive; the lease's idle timer decides first. */
 const INACTIVITY_BACKSTOP_MS = IDLE_MS + 5 * 60 * 1000;
@@ -168,6 +174,18 @@ export class HarnessContainer<
    * object, and wait until the supervisor answers. Intercepts last until the container stops.
    */
   private boot() {
+    return this.startAndAwait().pipe(
+      Effect.timeoutFail({
+        duration: BOOT_TIMEOUT_MS,
+        onTimeout: () =>
+          new TransportFailure({
+            operation: "harness.boot",
+            cause: new Error("The harness container did not become ready within 3 minutes"),
+          }),
+      }),
+    );
+  }
+  private startAndAwait() {
     return Effect.gen(this, function* () {
       const container = this.container();
       const image = (container.images as Readonly<Record<string, string>> | undefined)?.[
