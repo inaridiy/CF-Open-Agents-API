@@ -6,12 +6,15 @@ import { expect, it } from "vitest";
 
 import {
   CliError,
+  configChecks,
   parseDevVars,
   readCompositionRecord,
   runInit,
   runSetup,
   versions,
 } from "../src/index.js";
+import { parseJsonc } from "../src/jsonc.js";
+import type { WranglerConfig } from "../src/project.js";
 import {
   cliPath,
   initOptions,
@@ -122,7 +125,7 @@ it("--force rewrites a diverged composition and gateway binding", async () => {
   });
 });
 
-it("a project from 0.5 keeps its container entries until --force moves them, and gets the new exports", async () => {
+it("a project from 0.5 keeps its container entries, even with --force, and gets the new exports", async () => {
   await withFixture("vite-project", async (dir) => {
     await runInit(initOptions(dir));
     // What init wrote before the move to the durable_object scheduling policy.
@@ -145,7 +148,7 @@ it("a project from 0.5 keeps its container entries until --force moves them, and
     const kept = await runInit(initOptions(dir));
     const notes = kept.plan.notes.join("\n");
     expect(notes).toMatch(
-      /containers\[HarnessDO\] uses the default scheduling policy[\s\S]*cannot be undone/,
+      /containers\[HarnessDO\] uses the default scheduling policy[\s\S]*bind HARNESS to HarnessContainerDO/,
     );
     expect(notes).toMatch(/vars\.BACKUP_BUCKET_NAME is no longer read/);
     expect(read(dir, "wrangler.jsonc")).toMatch(/"instance_type": "basic"/);
@@ -153,10 +156,35 @@ it("a project from 0.5 keeps its container entries until --force moves them, and
       /ContainerEgress,\n  SandboxEgress,\n  DirectoryBackupGateway,/,
     );
     expect(read(dir, "src/index.ts")).not.toMatch(/ContainerProxy/);
-    await runInit(initOptions(dir, { force: true }));
-    const moved = read(dir, "wrangler.jsonc");
-    expect(moved).not.toMatch(/instance_type|max_instances|"image":/);
-    expect(moved).toMatch(/"name": "my-app-sandbox",\n\s+"scheduling_policy": "durable_object"/);
+    // Rewritten in place, the entry would keep a class whose containers never start.
+    const forced = await runInit(initOptions(dir, { force: true }));
+    expect(forced.plan.notes.join("\n")).toMatch(/init does not rewrite it/);
+    expect(read(dir, "wrangler.jsonc")).toMatch(/"instance_type": "basic"/);
+  });
+});
+
+it("a project moved from 0.5 to the upgraded container classes passes init and doctor", async () => {
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
+    const upgrade = parseJsonc<WranglerConfig>(read(dir, "wrangler.jsonc"), "wrangler.jsonc");
+    const upgradedNames: Record<string, string> = {
+      HarnessDO: "HarnessContainerDO",
+      SandboxDO: "SandboxContainerDO",
+    };
+    const renamed = (name?: string) => (name && upgradedNames[name]) || name;
+    for (const binding of upgrade.durable_objects?.bindings ?? [])
+      binding.class_name = renamed(binding.class_name);
+    for (const entry of upgrade.containers ?? []) entry.class_name = renamed(entry.class_name);
+    upgrade.migrations = [
+      ...(upgrade.migrations ?? []),
+      { tag: "v9", new_sqlite_classes: ["HarnessContainerDO", "SandboxContainerDO"] },
+    ];
+    const upgraded = `${JSON.stringify(upgrade, null, 2)}\n`;
+    writeFileSync(join(dir, "wrangler.jsonc"), upgraded);
+    const { plan } = await runInit(initOptions(dir));
+    expect(plan.notes.join("\n")).not.toMatch(/containers\[/);
+    expect(read(dir, "wrangler.jsonc")).toBe(upgraded);
+    expect(configChecks(upgrade).filter((item) => !item.ok)).toEqual([]);
   });
 });
 

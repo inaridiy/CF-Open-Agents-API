@@ -8,6 +8,7 @@ import { parseDevVars } from "./steps/dev-vars.js";
 import { DOCKER_INFO_TIMEOUT_MS, dockerInfo, rootlessEngine } from "./steps/rootless.js";
 import { readVendorManifest, type VendorManifest } from "./steps/vendor.js";
 import {
+  boundClass,
   BUCKETS,
   classOrigin,
   containers,
@@ -76,7 +77,8 @@ function objectChecks(config: WranglerConfig): Check[] {
   const checks: Check[] = [];
   for (const object of DURABLE_OBJECTS) {
     const binding = config.durable_objects?.bindings?.find((entry) => entry.name === object.name);
-    const ok = binding?.class_name === object.class_name;
+    const className = boundClass(config, object.class_name);
+    const ok = binding?.class_name === className;
     checks.push(
       check(
         `durable_objects.${object.name}`,
@@ -86,9 +88,9 @@ function objectChecks(config: WranglerConfig): Check[] {
     );
     checks.push(
       check(
-        `migrations.${object.class_name}`,
-        isSqliteClass(config, object.class_name),
-        sqliteDetail(config, object.class_name),
+        `migrations.${className}`,
+        isSqliteClass(config, className),
+        sqliteDetail(config, className),
       ),
     );
   }
@@ -96,7 +98,7 @@ function objectChecks(config: WranglerConfig): Check[] {
 }
 
 function containerChecks(config: WranglerConfig): Check[] {
-  return containers(config.name ?? "").map((container) => {
+  return containers(config.name ?? "", (name) => boundClass(config, name)).map((container) => {
     const entry = config.containers?.find((item) => item.class_name === container.class_name);
     const [image, wanted] = Object.entries(container.images)[0] ?? [];
     const dockerfile = image ? entry?.images?.[image]?.dockerfile : undefined;
@@ -108,7 +110,8 @@ function containerChecks(config: WranglerConfig): Check[] {
     if (entry?.scheduling_policy === "durable_object")
       detail = `images.${image ?? "?"} ${dockerfile ?? "missing"}`;
     else if (entry)
-      detail = "default scheduling policy; init --force moves it to durable_object (one-way)";
+      detail =
+        "default scheduling policy; move it to a new class on durable_object (docs/deployment.md: upgrading from 0.5)";
     return check(`containers.${container.class_name}`, ok, detail);
   });
 }
