@@ -341,14 +341,22 @@ it("pins a preset's model tiers with the session and reports them in capabilitie
 
 it("provides durable replay through a separate extension", async () => {
   const session = await client().beta.agents.sessions.create({ ...params, input: "hello" });
-  await runDurableObjectAlarm(stub(session.id));
-  const response = await exports.default.fetch(
-    new Request(`https://api.test/cf/v1/sessions/${session.id}/events?after=0`, {
-      headers: { authorization: "Bearer tenant-a" },
-    }),
-  );
-  const events = await response.json<{ seq: number; event: { type: string } }[]>();
-  expect(events.some(({ event }) => event.type === "agent.session.turn.completed")).toBe(true);
+  // One alarm does not always finish a turn on a loaded runner; drive it until it does.
+  const replay = async () => {
+    const response = await exports.default.fetch(
+      new Request(`https://api.test/cf/v1/sessions/${session.id}/events?after=0`, {
+        headers: { authorization: "Bearer tenant-a" },
+      }),
+    );
+    return response.json<{ seq: number; event: { type: string } }[]>();
+  };
+  await expect
+    .poll(async () => {
+      await runDurableObjectAlarm(stub(session.id));
+      return (await replay()).some(({ event }) => event.type === "agent.session.turn.completed");
+    })
+    .toBe(true);
+  const events = await replay();
   expect(events.map(({ seq }) => seq)).toEqual(events.map(({ seq }) => seq).sort((a, b) => a - b));
 });
 
