@@ -83,6 +83,14 @@ export default class AgentWorker extends service.AgentWorker {
       sessionId,
     ) as unknown as DurableObjectStub<SandboxDO>;
     const seconds = Number(url.searchParams.get("seconds") ?? "3");
+    if (action === "restart") {
+      // A new container in place of the one the turn used: the first proxied request must
+      // find the exec-server again, not an empty port.
+      await sandbox.stop("smoke restart");
+      const response = await sandbox.fetch(new Request("http://sandbox.internal/"));
+      await response.body?.cancel();
+      return Response.json({ status: response.status, sandbox: await sandbox.running() });
+    }
     if (action === "idle") {
       await harness.idleAfter(seconds);
       await sandbox.idleAfter(seconds);

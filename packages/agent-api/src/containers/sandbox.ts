@@ -109,6 +109,8 @@ export class SandboxContainer<
   /** Set up the running container for this object instance: intercepts, trust, timeout. */
   private prepared: Promise<void> | undefined;
   private backupClient: DirectoryBackup | undefined;
+  /** Ports known to listen in the current container; a new container starts empty. */
+  private readonly listening = new Set<number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -176,6 +178,7 @@ export class SandboxContainer<
         });
       if (!container.running) {
         this.prepared = undefined;
+        this.listening.clear();
         container.start({
           image,
           instance: this.instance,
@@ -358,18 +361,31 @@ export class SandboxContainer<
   }
   /**
    * Starts `argv` as a long-lived server unless something already listens on `port`, and
-   * waits until it does. Its output is not read, so it outlives the request.
+   * waits until it does. Its output is not read, so it outlives the request. The command is
+   * stored, so a proxied request starts it again in a container that replaced this one
+   * (after an idle stop or a platform restart) instead of finding nothing on the port.
    */
   serve(argv: string[], port: number): Promise<void> {
-    return this.use("sandbox.serve", async (container) => {
-      if (await exec.listening(container, port)) return;
-      await exec.spawn(container, argv, { cwd: WORKSPACE, env: this.commandEnv() });
-      for (let attempt = 0; attempt < 60; attempt++) {
-        if (await exec.listening(container, port)) return;
-        await scheduler.wait(500);
+    this.ctx.storage.kv.put(`server:${port}`, argv);
+    return this.use("sandbox.serve", (container) => this.ensureServer(container, port));
+  }
+  private async ensureServer(container: Container, port: number): Promise<void> {
+    if (this.listening.has(port)) return;
+    if (await exec.listening(container, port)) {
+      this.listening.add(port);
+      return;
+    }
+    const argv = this.ctx.storage.kv.get<string[]>(`server:${port}`);
+    if (!argv) return;
+    await exec.spawn(container, argv, { cwd: WORKSPACE, env: this.commandEnv() });
+    for (let attempt = 0; attempt < 60; attempt++) {
+      if (await exec.listening(container, port)) {
+        this.listening.add(port);
+        return;
       }
-      throw new Error(`Nothing listens on port ${port}`);
-    });
+      await scheduler.wait(500);
+    }
+    throw new Error(`Nothing listens on port ${port}`);
   }
   /**
    * One workspace tool call (bash, read, write, edit) as NDJSON: output deltas, then a
@@ -466,6 +482,9 @@ export class SandboxContainer<
     const hostname = new URL(request.url).hostname;
     const port = SANDBOX_PORTS[hostname];
     if (!port) return new Response("Unknown sandbox host", { status: 404 });
-    return this.use("sandbox.proxy", (container) => container.getTcpPort(port).fetch(request));
+    return this.use("sandbox.proxy", async (container) => {
+      await this.ensureServer(container, port);
+      return container.getTcpPort(port).fetch(request);
+    });
   }
 }
