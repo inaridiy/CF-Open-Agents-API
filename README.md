@@ -17,6 +17,9 @@ Keep the official OpenAI SDK on the client and point it at your Worker. The Work
 - **Durable by design.** Every transition is one SQLite transaction in a Durable Object; checkpoints and workspace backups live in R2. A dropped connection never loses a turn, and the next turn resumes from the last committed checkpoint.
 - **Hosted environments and tools.** Shell and file tools in the sandbox, hosted web search, MCP servers with Vault credentials, programmatic tool calling in an isolated Dynamic Worker, and delegation between runtimes.
 
+> [!NOTE]
+> Cloudflare's container platform changed at the end of September 2026, and the new version still has rough edges: a first deploy may need a second `wrangler deploy`, and some new sessions fail to start (create them again). [Cloudflare Containers: known issues](docs/cloudflare-containers.md) has what we have seen and what to do.
+
 ## Quick start
 
 The setup CLI creates a Worker with the API and a small demo app: a prompt form, a job page that streams the turn as it runs, and a download of the files the agent wrote. You need Node 24, pnpm and a running Docker engine. The `workers` preset runs against Workers AI and needs no provider key.
@@ -33,7 +36,7 @@ Open <http://localhost:8787>, type a prompt, pick a preset and press **Build**. 
 
 ![A finished job with the transcript, thinking and the zip download](docs/images/demo-job.png)
 
-Deploying needs the secrets `setup` asks for; `.dev.vars` stays local. The QuickStart's [Deploy](docs/quickstart.md#deploy) section lists them.
+Deploying needs the secrets that the CLI's `setup` command asks for; `.dev.vars` stays local. The QuickStart's [Deploy](docs/quickstart.md#deploy) section lists them.
 
 To add the API to a Worker you already have (a Vite app, a Hono Worker, anything Wrangler deploys), run `init` in its directory instead. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition in `src/agents.ts` and snapshots the Docker build context into `.cf-open-agents-api/`. The [CLI README](packages/create-cf-open-agents-api/README.md) covers `init`, `setup` and `doctor`.
 
@@ -199,6 +202,8 @@ pnpm check            # docs, harness, types, lint, build, scripts, CLI, machine
 | Presets, model adapters, custom drivers      | [Extending](docs/extending.md)                                            |
 | Durability rules and service boundaries      | [Architecture](docs/architecture.md)                                      |
 | Production setup, costs and scaling          | [Deployment](docs/deployment.md)                                          |
+| Cloudflare Containers behaviour to know      | [Cloudflare Containers: known issues](docs/cloudflare-containers.md)      |
+| Moving an existing deployment to a release   | [Upgrading](docs/upgrading.md)                                            |
 | What the official SDK can and cannot do here | [Compatibility profile](docs/compatibility.md)                            |
 
 ## Compatibility and disclaimer

@@ -111,7 +111,7 @@ function containerChecks(config: WranglerConfig): Check[] {
       detail = `images.${image ?? "?"} ${dockerfile ?? "missing"}`;
     else if (entry)
       detail =
-        "default scheduling policy; move it to a new class on durable_object (docs/deployment.md: upgrading from 0.5)";
+        "default scheduling policy; move it to a new class on durable_object (docs/upgrading.md)";
     return check(`containers.${container.class_name}`, ok, detail);
   });
 }

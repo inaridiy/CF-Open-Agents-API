@@ -8,7 +8,7 @@ This is the first document to read. It creates the demo app on your machine, exp
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Node               | 24 or newer                                                                                                                                                                                                                                     |
 | pnpm               | Any current version (`corepack enable` gives you one); npm, yarn and bun also work with the CLI                                                                                                                                                 |
-| Docker             | A running engine. Wrangler builds the harness and sandbox images on the first `wrangler dev` (roughly 4 GB, several minutes). With rootless Docker see [Rootless Docker](#rootless-docker)                                                      |
+| Docker             | A running engine. Wrangler builds the harness and sandbox images on the first `wrangler dev` (roughly 4 GB, several minutes). With rootless Docker see [Questions](#questions)                                                                  |
 | Cloudflare account | Free for local development. Deployment needs the Workers Paid plan (Containers require it). Workers AI has no local emulator, so the `workers` preset needs `wrangler login` even locally and counts against your Workers AI usage              |
 | Model credentials  | None with Workers AI. An OpenAI, Anthropic or OpenAI-compatible key otherwise; `init` writes the variable name into `.dev.vars` and the composition reads it from there. Keys never reach the runtimes or the sandbox, only the private gateway |
 
@@ -77,7 +77,9 @@ Change a model: add an entry to `models` and point a preset's `model` (or a `tie
 
 **Rootless Docker?** The session and containers start but every turn fails with `internal_error` or `connection_failed`, because Wrangler's local container proxy assumes a rootful Docker bridge in workerd's network namespace. `init` detects a rootless engine and offers `pnpm dev:rootless`, which runs `wrangler dev` inside rootlesskit's namespace and bridges the port back; `init --rootless` adds it later. It is a temporary workaround, to be removed when Wrangler supports rootless engines. See [known issues](known-issues.md).
 
-**A second `wrangler dev` broke the first one?** With Wrangler 4.131.1, two `wrangler dev` sessions on the same Docker engine with the same Dockerfile removed each other's image tags; this is unverified on 4.145.0, so run one at a time. See [known issues](known-issues.md).
+**A second `wrangler dev` broke the first one?** Run one `wrangler dev` per Docker engine at a time; a second one on the same Dockerfile can remove the first one's images. See [known issues](known-issues.md).
+
+**Creating a session failed with `environment_setup_failed`?** Run `pnpm exec wrangler tail` and look for `Environment setup failed` with the session id. If it shows `The container connection is temporarily unavailable`, create the session again; see [Cloudflare Containers: known issues](cloudflare-containers.md#some-new-sessions-fail-to-start-their-containers). Otherwise a setup command of the environment failed, and the log says how.
 
 ## Deploy
 
@@ -97,7 +99,7 @@ pnpm dlx create-cf-open-agents-api@alpha setup
 pnpm exec wrangler deploy
 ```
 
-By hand, that is `pnpm exec wrangler r2 bucket create <worker>-checkpoints` and `<worker>-workspaces`, then `pnpm exec wrangler secret put <NAME>` for each secret. Secrets take effect on the next request without a redeploy. See [deployment](deployment.md) for the cost model and the rest of the walkthrough.
+By hand, that is `pnpm exec wrangler r2 bucket create <worker>-checkpoints` and `<worker>-workspaces`, then `pnpm exec wrangler secret put <NAME>` for each secret. Secrets take effect on the next request without a redeploy. The first deploy waits while Cloudflare prepares the container images; if it stops after 15 minutes with `Timed out while preparing the container image`, run `pnpm exec wrangler deploy` again later ([Cloudflare Containers: known issues](cloudflare-containers.md)). See [deployment](deployment.md) for the cost model and the rest of the walkthrough.
 
 ## Next
 

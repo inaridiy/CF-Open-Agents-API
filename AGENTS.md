@@ -11,6 +11,7 @@ This is a pnpm TypeScript workspace: a Workers API with SQLite Durable Objects, 
 | Native runtime, model gateway, checkpoint changes | [native-harness-change](.agents/skills/native-harness-change/SKILL.md)                                                          |
 | The setup CLI or the generated project files      | [packages/create-cf-open-agents-api/README.md](packages/create-cf-open-agents-api/README.md); `examples/worker` is its template |
 | Worker bindings, Docker, R2 or deployment         | [docs/deployment.md](docs/deployment.md)                                                                                        |
+| Cloudflare Containers behaviour, upgrades         | [docs/cloudflare-containers.md](docs/cloudflare-containers.md) and [docs/upgrading.md](docs/upgrading.md)                       |
 | Toolchain, vendored skills, checkers              | [docs/development-harness.md](docs/development-harness.md)                                                                      |
 | Scope, authorization or completion decisions      | [Contribution scope](CONTRIBUTING.md#scope-and-completion)                                                                      |
 | Resumable experiments or a handoff                | [.agents/PLANS.md](.agents/PLANS.md)                                                                                            |
