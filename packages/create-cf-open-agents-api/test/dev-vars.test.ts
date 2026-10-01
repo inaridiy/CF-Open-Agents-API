@@ -23,13 +23,12 @@ it("keeps comments and unknown lines, replaces a short token and adds the provid
     files.flush();
     expect(first.note).toMatch(/shorter than 32/);
     const text = read(root, ".dev.vars");
-    expect(text).toMatch(
-      /^# mine\nOTHER=x\nAPI_TOKEN=T{40}\n\n# key\nOPENAI_API_KEY=\n\n# Store sandbox backups/,
+    expect(text).toBe(
+      "# mine\nOTHER=x\nAPI_TOKEN=" + "T".repeat(40) + "\n\n# key\nOPENAI_API_KEY=\n",
     );
-    expect(text.endsWith("LOCAL_BACKUPS=true\n")).toBe(true);
     const values = parseDevVars(text);
     expect(values.get("OTHER")).toBe("x");
-    expect(values.get("LOCAL_BACKUPS")).toBe("true");
+    expect(values.has("LOCAL_BACKUPS")).toBe(false);
   });
 });
 
@@ -38,9 +37,7 @@ it("creates the file with a token comment when it is missing", async () => {
     const files = new Files(root, false);
     ensureDevVars({ files, token: () => "T".repeat(40) });
     files.flush();
-    expect(read(root, ".dev.vars")).toMatch(
-      /^# Bearer token clients send.*\nAPI_TOKEN=T{40}\n\n# Store sandbox/,
-    );
+    expect(read(root, ".dev.vars")).toMatch(/^# Bearer token clients send.*\nAPI_TOKEN=T{40}\n$/);
   });
 });
 
@@ -51,7 +48,7 @@ it("keeps an existing .dev.vars.example and appends the missing keys", async () 
     ensureDevVarsExample({ files, secret: { name: "OPENAI_API_KEY", comment: "# key" } });
     files.flush();
     expect(read(root, ".dev.vars.example")).toBe(
-      "# app\nOTHER=\nAPI_TOKEN=replace-with-at-least-32-random-characters\n# key\nOPENAI_API_KEY=\n# Store sandbox backups on the local R2 emulator during `wrangler dev`; unset in production.\nLOCAL_BACKUPS=true\n",
+      "# app\nOTHER=\nAPI_TOKEN=replace-with-at-least-32-random-characters\n# key\nOPENAI_API_KEY=\n",
     );
   });
 });

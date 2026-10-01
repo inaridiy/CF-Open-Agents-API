@@ -9,7 +9,7 @@ export { Files } from "./fs.js";
 export { type InitOptions, type InitResult, runInit } from "./init.js";
 export { CliError } from "./plan.js";
 export { workerNameFrom } from "./project.js";
-export { accountIds, runSetup, type SetupOptions } from "./setup.js";
+export { runSetup, type SetupOptions } from "./setup.js";
 export { ensureDevVars, ensureDevVarsExample, parseDevVars } from "./steps/dev-vars.js";
 export { ensurePnpmBuilds } from "./steps/pnpm-builds.js";
 export { detectRootlessDocker } from "./steps/rootless.js";

@@ -36,7 +36,7 @@ This is an independent implementation. It aims to let the official client work u
 ## Wire details
 
 - Unknown or unsupported fields are rejected with `400 invalid_request`.
-- Every response carries `x-request-id`. Permanent `409` conflicts (`idempotency_conflict`, `active_turn`, `session_failed`, `turn_checkpointing`, `active_turn_not_steerable`, `outcome_unknown`, `network_policy_conflict`, `invalid_session_state`, `not_deleted`, `environment_conflict`) carry `x-should-retry: false`, which the SDK honors.
+- Every response carries `x-request-id`. Permanent `409` conflicts (`idempotency_conflict`, `active_turn`, `session_failed`, `turn_checkpointing`, `active_turn_not_steerable`, `outcome_unknown`, `network_policy_conflict`, `session_deleted`, `invalid_session_state`, `not_deleted`, `environment_conflict`) carry `x-should-retry: false`, which the SDK honors.
 - An absent or empty request body means `{}`; a fork needs no body.
 - Errors use the OpenAI envelope: `{ error: { message, type, code, param } }`. `type` follows the status (`authentication_error`, `rate_limit_error`, `server_error`, otherwise `invalid_request_error`). Every `code` is projected from one tagged failure class by a single table (`toApiError` in `packages/agent-api/src/errors.ts`); the codes themselves are unchanged from earlier snapshots.
 - Function tool names and MCP `server_label` values match `[A-Za-z0-9_-]{1,64}`. `cf_execute`, `cf_tool_search`, `cf_call_tool`, `cf_delegate`, `cf_wait`, `cf_close` and the workspace tool names (`bash`, `read`, `write`, `edit`) are reserved while the corresponding feature is enabled.
@@ -114,7 +114,7 @@ A `completed` turn means its native checkpoint, workspace backup and artifact re
 
 A failed turn returns the session to `idle` with `session.error` set unless the outcome is indeterminate (`outcome_unknown` or any `*_uncertain` code), in which case the session stays `failed`. Cancellation supersedes queued steers and function results and returns the session to `idle` after the native outcome is confirmed. In both cases the next turn restores the last committed checkpoint: uncommitted workspace changes and native history are discarded, explicit environment uploads are reapplied from a durable journal.
 
-While a session's sandbox holds the last committed workspace it is reused between turns, including state outside `/workspace`. After a cancel, a failure, a container loss or a fork, the sandbox is destroyed and restored from R2. Environment setup with an unknown outcome is not replayed.
+While a session's sandbox holds the last committed workspace it is reused between turns, including state outside `/workspace`. After a cancel, a failure, a container loss or a fork, the sandbox is destroyed and restored from R2. Each idle container is destroyed after 10 minutes, and deleting a session ends both of its containers for good. Workspace backups have no expiry; retention is the operator's bucket lifecycle rule. Environment setup with an unknown outcome is not replayed.
 
 Programmatic code runs with no network, filesystem or credentials. Every tool call it makes must be awaited; code that returns with calls outstanding, or whose workspace effects cannot be confirmed, ends the turn as `programmatic_execution_uncertain`, and the sandbox is destroyed before the next turn restores the checkpoint. A delegated child in that state fails its parent the same way.
 
@@ -147,7 +147,6 @@ Tenant catalogs isolate session discovery, input files, skills, templates and va
 | Delegated children                       | `max_concurrent_subagents` (default 6); prompt up to 128,000 characters                                                                 |
 | Fork transcript                          | 96,000 characters, 4,000 per entry; older entries are omitted first                                                                     |
 | SSE                                      | 64 KiB queue per listener; 64 listeners per session (`429 stream_limit`); keepalive every 15 seconds; 64 events read per pull           |
-| Workspace backup TTL                     | 30 days                                                                                                                                 |
 
 The SQL budget stays below the platform's [2 MB row limit](https://developers.cloudflare.com/durable-objects/platform/limits/#sql-storage-limits). Records repeat input fields, so a body well under 16 MiB can still exceed a row; the transaction rolls back. Session configuration bodies live in R2. The same storage budget applies to Service Binding RPC.
 

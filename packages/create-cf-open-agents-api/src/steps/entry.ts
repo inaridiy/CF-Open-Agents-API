@@ -10,7 +10,9 @@ export const EXPORTED_CLASSES = [
   "TenantCatalogDO",
   "HarnessDO",
   "SandboxDO",
-  "ContainerProxy",
+  "ContainerEgress",
+  "SandboxEgress",
+  "DirectoryBackupGateway",
 ] as const;
 
 /** The module specifier from the entry file to the composition, matching its import style. */
@@ -26,7 +28,14 @@ export function agentsSpecifier(
   return extensioned ? `${withDot}.js` : withDot;
 }
 
-/** Appends the class re-export to the existing entry once. */
+const exportStatement = (specifier: string) =>
+  `export {\n${EXPORTED_CLASSES.map((name) => `  ${name},`).join("\n")}\n} from "${specifier}";`;
+
+/**
+ * Appends the class re-export to the existing entry once. An entry that re-exports the
+ * classes of an older release (with `ContainerProxy`, without the egress and backup
+ * entrypoints) gets the current list in place of its statement.
+ */
 export function ensureEntryExports(
   files: Files,
   entryPath: string,
@@ -38,10 +47,33 @@ export function ensureEntryExports(
       `The Wrangler entry ${entryPath} does not exist; point main at your Worker entry first.`,
     );
   const file = display(files.root, entryPath);
-  if (/export\s*\{[^}]*\bSessionDO\b[^}]*\}\s*from/.test(source))
-    return { status: "skipped", file };
   const specifier = agentsSpecifier(entryPath, agentsPath, source);
-  const line = `export { ${EXPORTED_CLASSES.join(", ")} } from "${specifier}";`;
+  const existing = /export\s*\{([^}]*\bSessionDO\b[^}]*)\}\s*from\s*["'][^"']+["'];?/.exec(source);
+  if (existing) {
+    const names = new Set(
+      (existing[1] ?? "")
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean),
+    );
+    if (EXPORTED_CLASSES.every((name) => names.has(name)) && !names.has("ContainerProxy"))
+      return { status: "skipped", file };
+    // Rewrite only a plain list over a module that exports every current name: a kept
+    // composition from an older release, or aliases, would not survive the rewrite.
+    const agents = files.read(agentsPath) ?? "";
+    const plain = [...names].every((name) => /^\w+$/.test(name));
+    if (!plain || !EXPORTED_CLASSES.every((name) => new RegExp(`\\b${name}\\b`).test(agents)))
+      return {
+        status: "skipped",
+        file,
+        note: `${file} re-exports the classes of an older release; export ${EXPORTED_CLASSES.join(", ")} from ${display(files.root, agentsPath)} (regenerate it with --force) and from the entry.`,
+      };
+    return files.write(
+      entryPath,
+      source.replace(existing[0], exportStatement(specifier)),
+      "The class re-export now lists the egress and backup entrypoints in place of ContainerProxy.",
+    );
+  }
   const separator = source.endsWith("\n") ? "" : "\n";
-  return files.write(entryPath, `${source}${separator}${line}\n`);
+  return files.write(entryPath, `${source}${separator}${exportStatement(specifier)}\n`);
 }

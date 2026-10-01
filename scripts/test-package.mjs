@@ -53,6 +53,18 @@ try {
   }
   assert.equal(library.peerDependencies.effect, "^3.22.2");
   // The setup CLI ships on its own: an executable, no dependency on the library.
+  // The library depends on the workspace's state machine package; pack it the same way so
+  // the consumer installs the release's own copy, not one from the registry.
+  const machine = /** @type {{ name: string, version: string }} */ (
+    JSON.parse(
+      await readFile(new URL("../packages/durable-machine/package.json", import.meta.url), "utf8"),
+    )
+  );
+  run("pnpm", ["--filter", machine.name, "pack", "--pack-destination", directory], root);
+  const machineTarball = join(directory, `${machine.name}-${machine.version}.tgz`);
+  const machineEntries = execFileSync("tar", ["-tzf", machineTarball], { encoding: "utf8" });
+  for (const file of ["dist/index.js", "dist/index.d.ts", "dist/check.js", "README.md", "LICENSE"])
+    assert(machineEntries.split("\n").includes(`package/${file}`), `Missing packaged ${file}`);
   run("pnpm", ["--filter", cli.name, "pack", "--pack-destination", directory], root);
   const cliTarball = join(directory, `${cli.name}-${cli.version}.tgz`);
   const cliEntries = execFileSync("tar", ["-tzf", cliTarball], { encoding: "utf8" }).split("\n");
@@ -92,7 +104,16 @@ try {
   );
   await writeFile(
     join(directory, "pnpm-workspace.yaml"),
-    "autoInstallPeers: false\nminimumReleaseAge: 1440\nallowBuilds: {}\n",
+    [
+      "autoInstallPeers: false",
+      "minimumReleaseAge: 1440",
+      "minimumReleaseAgeExclude:",
+      `  - "@cloudflare/workers-types@${manifest.devDependencies["@cloudflare/workers-types"]}"`,
+      "allowBuilds: {}",
+      "overrides:",
+      `  ${machine.name}: "file:${machineTarball}"`,
+      "",
+    ].join("\n"),
   );
   run("pnpm", ["install", "--prefer-offline", "--ignore-scripts"], directory);
   await writeFile(

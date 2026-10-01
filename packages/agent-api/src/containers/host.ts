@@ -1,4 +1,3 @@
-import type { ISandbox } from "@cloudflare/sandbox";
 import { Context, Effect } from "effect";
 
 import type { CatalogObject } from "../catalog.js";
@@ -8,23 +7,18 @@ import type { HarnessRepository, HarnessTx } from "../persistence/harness-tx.js"
 import type { Sync } from "../persistence/repo.js";
 import type { Execution } from "../runtime.js";
 import type { SandboxContainer } from "./sandbox.js";
+import type { Workspace } from "./workspace.js";
 
 export interface ContainerBindings {
   HARNESS: DurableObjectNamespace<HarnessContainer>;
   SANDBOX: DurableObjectNamespace<SandboxContainer>;
   CHECKPOINTS: R2Bucket;
+  /** Workspace backups; `DirectoryBackupGateway` reads it by this binding name. */
   BACKUP_BUCKET: R2Bucket;
   MODEL_GATEWAY: Fetcher;
   CODE_LOADER?: WorkerLoader;
   /** Optional trusted service that sends configured service-origin MCP requests. */
   MCP?: Fetcher;
-  LOCAL_BACKUPS?: string;
-  /** Read by `@cloudflare/sandbox` to sign backup URLs; unset, only `LOCAL_BACKUPS` works. */
-  R2_ACCESS_KEY_ID?: string;
-  R2_SECRET_ACCESS_KEY?: string;
-  CLOUDFLARE_R2_ACCOUNT_ID?: string;
-  CLOUDFLARE_ACCOUNT_ID?: string;
-  BACKUP_BUCKET_NAME?: string;
   CATALOG: DurableObjectNamespace<CatalogObject>;
 }
 
@@ -43,11 +37,7 @@ export const read = <A>(f: (tx: HarnessTx) => Sync<A>) =>
 export const write = <A>(f: (tx: HarnessTx) => Sync<A>) =>
   Effect.flatMap(HarnessRepo, (repo) => repo.transaction(f));
 export const assignment = read((tx) => tx.requireAssignment());
-/**
- * `@cloudflare/containers` counts a proxied response as in flight until its body has been
- * read, and a Container with a request in flight never reaches `sleepAfter`. Every
- * `containerFetch` answer whose body is not read is released with this.
- */
+/** Every supervisor answer whose body is not read is released with this, so no stream is left open. */
 export const releaseBody = (response: Response): Promise<void> =>
   response.body?.cancel() ?? Promise.resolve();
 
@@ -66,8 +56,9 @@ export interface HarnessHost {
   readonly workspace: Effect.Semaphore;
   /** Running programmatic tool executions, aborted by a newer start, a cancel or a stop. */
   readonly codeExecutions: Set<AbortController>;
+  /** A request to the supervisor in the harness container, which runs when this returns. */
   containerFetch(request: Request | string, init?: RequestInit): Promise<Response>;
   child(subagentId: string): DurableObjectStub<HarnessContainer>;
   abortCodeExecutions(): void;
-  prepareSandbox(sandbox: ISandbox, execution: Execution): Promise<void>;
+  prepareSandbox(workspace: Workspace, execution: Execution): Promise<void>;
 }

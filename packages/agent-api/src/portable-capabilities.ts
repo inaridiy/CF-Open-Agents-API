@@ -1,8 +1,8 @@
-import type { ISandbox } from "@cloudflare/sandbox";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 
 import { type McpToolConfig, mcpToolSchema } from "./agent-tools.js";
+import type { Workspace } from "./containers/workspace.js";
 
 /** Discovery reads bounded metadata only. Skill bodies remain in the Sandbox. */
 const discover = `
@@ -94,19 +94,18 @@ export interface DiscoveryOptions {
  * their contents must not be able to prevent a turn from starting.
  */
 export async function discoverCapabilities(
-  sandbox: ISandbox,
+  sandbox: Pick<Workspace, "exec">,
   roots: readonly string[],
   options: DiscoveryOptions = {},
 ) {
   if (!roots.length) return { instructions: "", mcp: [] as McpToolConfig[] };
   const diagnostics = options.diagnostics ?? (() => {});
-  const process = await sandbox.exec(["python3", "-c", discover, JSON.stringify(roots)]);
-  const result = await process.output({
-    timeout: 30_000,
-    encoding: "utf8",
+  const result = await sandbox.exec(["python3", "-c", discover, JSON.stringify(roots)], {
+    timeoutMs: 30_000,
     maxBytes: 4 * 1024 * 1024,
   });
-  if (result.exitCode !== 0 || result.truncated) throw new Error("Capability discovery failed");
+  if (result.exitCode !== 0 || result.truncated || result.timedOut)
+    throw new Error("Capability discovery failed");
   const found = discoveredSchema.parse(JSON.parse(result.stdout));
   const skills = found.skills.flatMap(({ path, content }) => {
     const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);

@@ -18,12 +18,12 @@ pnpm --filter cf-open-agents-api pack --pack-destination /tmp/cf-open-agents-pac
 
 ## Entry points
 
-| Import                          | Exports                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cf-open-agents-api`            | Wire schemas and types, `deleted` and `DeletedResource`, `parse` and `parseEffect`, the tagged error classes with `DomainError`, `DomainTag`, `Capability`, `isDomainError`, `toApiError`, `caughtFailure`, `projectApiError` and `isPermanent`, `ApiError` and `remoteApiError`, `HARNESSES`, runtime schemas, `RuntimeDriver`, `PromiseRuntimeDriver` and `fromPromiseDriver`, workspace tool contracts, `io`, `attempt`, `OperationError`, `decode`, `decodeEffect`, `runPromise`, `runSync`, `TURN_ERROR_CODES` and `TurnErrorCode`, `programmaticResultSchema` and `ProgrammaticResult` |
-| `cf-open-agents-api/cloudflare` | `defineAgentWorker`, `AgentWorkerOptions`, `AgentWorkerClasses`, `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, `bearerTenant`, `tenantFetch`, `CatalogObject`, `SessionObject`, `HarnessContainer`, `SandboxContainer`, `ContainerProxy`, `createHarness`, `containerHarnesses`, `codexDriver`, `claudeCodeDriver`, `openCodeDriver`, `containerDriver`, `containerEnvironments`, `EnvironmentDriver`, `EnvironmentSpec`                                                                                                                                         |
-| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `modelAdapter`, `createModelGateway`, `ModelRegistration`, `sanitizeProviderError`, `fetchWithoutRedirect`                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `cf-open-agents-api/tools`      | `defineTool`, `webSearch`, `knowledgeSearch`, `publishSkill`, `loadSkill`, `skillReader`, `installSkill`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Import                          | Exports                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cf-open-agents-api`            | Wire schemas and types, `deleted` and `DeletedResource`, `parse` and `parseEffect`, the tagged error classes with `DomainError`, `DomainTag`, `Capability`, `isDomainError`, `toApiError`, `caughtFailure`, `projectApiError` and `isPermanent`, `ApiError` and `remoteApiError`, `HARNESSES`, runtime schemas, `RuntimeDriver`, `PromiseRuntimeDriver` and `fromPromiseDriver`, workspace tool contracts, `io`, `attempt`, `OperationError`, `decode`, `decodeEffect`, `runPromise`, `runSync`, `TURN_ERROR_CODES` and `TurnErrorCode`, `programmaticResultSchema` and `ProgrammaticResult`                |
+| `cf-open-agents-api/cloudflare` | `defineAgentWorker`, `AgentWorkerOptions`, `AgentWorkerClasses`, `createAgentService`, `AgentBindings`, `AgentRPC`, `AgentServiceClasses`, `bearerTenant`, `tenantFetch`, `CatalogObject`, `SessionObject`, `HarnessContainer`, `SandboxContainer`, `ContainerEgress`, `SandboxEgress`, `DirectoryBackupGateway` (from `@cloudflare/sandbox`), `ContainerInstance`, `Workspace`, `WorkspaceBackup`, `LegacyWorkspaceBackup`, `createHarness`, `containerHarnesses`, `codexDriver`, `claudeCodeDriver`, `openCodeDriver`, `containerDriver`, `containerEnvironments`, `EnvironmentDriver`, `EnvironmentSpec` |
+| `cf-open-agents-api/models`     | `nativeModel`, `aiSDKModel`, `openAICompatibleModel`, `modelAdapter`, `createModelGateway`, `ModelRegistration`, `sanitizeProviderError`, `fetchWithoutRedirect`                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `cf-open-agents-api/tools`      | `defineTool`, `webSearch`, `knowledgeSearch`, `publishSkill`, `loadSkill`, `skillReader`, `installSkill`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The root import has no Cloudflare runtime dependency, so its types and schemas can be used from Node. `cf-open-agents-api/cloudflare` composes the model gateway without loading the optional `ai` peer; only `cf-open-agents-api/models` needs it, for `aiSDKModel` and `openAICompatibleModel`.
 
@@ -32,24 +32,33 @@ The root import has no Cloudflare runtime dependency, so its types and schemas c
 `defineAgentWorker(options)` composes the API Worker, the `SessionDO` and the private model gateway in one call and returns every class a deployment exports. [The example composition](../examples/worker/src/index.ts) is the whole file:
 
 ```ts
-export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
-  defineAgentWorker<Bindings>({
-    agents: { codex: { harness: "codex", model: "codex", webSearch: true } },
-    models: (env) => ({
-      codex: () =>
-        nativeModel({
-          protocol: "responses",
-          baseURL: "https://api.openai.com/v1",
-          apiKey: env.OPENAI_API_KEY,
-          model: "gpt-6-astra",
-        }),
-    }),
-    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
-  });
+export const {
+  Agents,
+  Models,
+  SessionDO,
+  TenantCatalogDO,
+  HarnessDO,
+  SandboxDO,
+  ContainerEgress,
+  SandboxEgress,
+  DirectoryBackupGateway,
+} = defineAgentWorker<Bindings>({
+  agents: { codex: { harness: "codex", model: "codex", webSearch: true } },
+  models: (env) => ({
+    codex: () =>
+      nativeModel({
+        protocol: "responses",
+        baseURL: "https://api.openai.com/v1",
+        apiKey: env.OPENAI_API_KEY,
+        model: "gpt-6-astra",
+      }),
+  }),
+  authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
+});
 export default Agents;
 ```
 
-Wrangler binds the Durable Objects by these export names and the model gateway by the `Models` entrypoint (`services: [{ binding: "MODEL_GATEWAY", service: "<this worker>", entrypoint: "Models" }]`). A Worker with its own default export re-exports the classes from a separate module and reaches the API through a second self binding, `AGENTS` → entrypoint `Agents`; the [setup CLI](../packages/create-cf-open-agents-api/README.md) writes both forms. `HarnessDO` is the `HarnessContainer` class itself: the Container SDK keys its outbound handler registry by class name, so never subclass it; pass a `createHarness(...)` class through the `harness` option instead.
+Wrangler binds the Durable Objects by these export names and the model gateway by the `Models` entrypoint (`services: [{ binding: "MODEL_GATEWAY", service: "<this worker>", entrypoint: "Models" }]`). A Worker with its own default export re-exports the classes from a separate module and reaches the API through a second self binding, `AGENTS` → entrypoint `Agents`; the [setup CLI](../packages/create-cf-open-agents-api/README.md) writes both forms. The container objects look up `ContainerEgress`, `SandboxEgress` and `DirectoryBackupGateway` in `ctx.exports` by these names, so the main module exports them unrenamed; a missing one fails with `503 container_misconfigured`. `HarnessDO` and `SandboxDO` start their own containers (Wrangler `scheduling_policy: "durable_object"`, one named image each, `images.harness` and `images.sandbox`); see [deployment](deployment.md).
 
 | Option                       | Purpose                                                                                                                                                                                         |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -60,10 +69,11 @@ Wrangler binds the Durable Objects by these export names and the model gateway b
 | `environments(env)`          | Hosted environment driver; defaults to `containerEnvironments`. Without it `openai_hosted` configuration is rejected                                                                            |
 | `objects(env)`               | R2 bucket for environment configuration, input files, skills and artifacts; defaults to `env.CHECKPOINTS`                                                                                       |
 | `harness`                    | A `createHarness(...)` class to export as `HarnessDO`                                                                                                                                           |
+| `instances`                  | Container sizes, `{ harness?, sandbox? }`: any size `ctx.container.start()` accepts (`lite`, `standard-1` to `standard-4`, or custom resources); `standard-1` by default for both               |
 | `maxTurnMs`                  | Turn deadline; default 15 minutes                                                                                                                                                               |
 | `pollIntervalMs`             | Reconciler alarm interval and the budget of one tick; default 5 seconds. The container drivers long-poll within it                                                                              |
 
-The overloads decide what is required: with `ContainerBindings` in `Env` every driver has a default; without them `harnesses` is required. `createAgentService(options)` remains the lower-level factory: it returns `AgentWorker` and `SessionDO` configured together, and a composition that needs something else (its own gateway entrypoint, several services in one Worker) subclasses and exports those, `CatalogObject`, `HarnessContainer`, `SandboxContainer` and `ContainerProxy`, plus a `WorkerEntrypoint` that delegates to `createModelGateway(...).fetch`.
+The overloads decide what is required: with `ContainerBindings` in `Env` every driver has a default; without them `harnesses` is required. `createAgentService(options)` remains the lower-level factory: it returns `AgentWorker` and `SessionDO` configured together, and a composition that needs something else (its own gateway entrypoint, several services in one Worker) subclasses and exports those, `CatalogObject`, `HarnessContainer` and `SandboxContainer`, exports `ContainerEgress`, `SandboxEgress` and `DirectoryBackupGateway` under those names, plus a `WorkerEntrypoint` that delegates to `createModelGateway(...).fetch`.
 
 `openai_hosted` is the SDK's wire name for this deployment's Cloudflare sandbox. Provider keys belong in the gateway Worker, not in client configuration or native runtime snapshots. [Extending the service](extending.md) describes presets, model adapters, custom drivers and tools.
 
@@ -103,7 +113,7 @@ All results are promises. Defaults and validation match the HTTP operations. Str
 
 `fromPromiseDriver` adapts a `PromiseRuntimeDriver`, whose methods receive the fiber's `AbortSignal` (`start(execution, operationId, signal)`, `poll(execution, after, signal, options)`, `control(execution, operationId, command, signal)`, `checkpoint(execution, signal)`, `stop(execution, signal)`, optionally `release(sessionId, signal)`) and may ignore it when the underlying call cannot be cancelled. A thrown `{ status, code }` answer (an `ApiError`, its RPC wire name, or a plain object) is a definite rejection: `404 execution_missing` and any other answer to `control` become `ExecutionMissing` and `CommandRejected`, an answer to `start` or `checkpoint` becomes `RuntimeRejected`; everything else is a `TransportFailure`. The adapter forwards `longPoll`.
 
-`containerEnvironments(env)` adapts the Container RPC boundary to the `EnvironmentDriver` contract. A custom environment driver implements `prepare`, `status`, `upload` and `files`; `EnvironmentSpec` identifies the session and its private configuration object, and `prepare` receives `inherited` when a fork adopts another session's committed workspace. The environment listing uses the SDK's `page`/`next` token contract.
+`containerEnvironments(env)` adapts the HarnessDO RPC boundary to the `EnvironmentDriver` contract. A custom environment driver implements `prepare`, `status`, `upload` and `files`; `EnvironmentSpec` identifies the session and its private configuration object, and `prepare` receives `inherited` when a fork adopts another session's committed workspace. The environment listing uses the SDK's `page`/`next` token contract.
 
 Use `io(name, (signal) => promise)` for SDK, HTTP and RPC calls; the callback always receives the fiber's interruption signal. Use `attempt(name, () => value)` for synchronous validation or storage, and `parseEffect(schema, input)` to keep a zod validation failure in the error channel as `InvalidRequest`. Run an Effect only at a platform boundary with `runPromise`; `runSync` is for effects that provably never suspend. SQLite transaction callbacks stay synchronous and cannot return Effects or Promises. Failures cross the HTTP boundary through `toApiError`; `isPermanent` names the conflicts the SDK must not retry. The [house rules](effect.md) apply.
 

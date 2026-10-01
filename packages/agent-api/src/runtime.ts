@@ -43,6 +43,25 @@ const json: Schema.Schema<JsonValue> = Schema.suspend(() =>
     Schema.mutable(Schema.Record({ key: Schema.String, value: json })),
   ),
 );
+/**
+ * A backup of `/workspace`: a `DirectoryBackup` record (`@cloudflare/sandbox` 1.0), or a
+ * handle written by Sandbox SDK 0.x, which SandboxDO converts on its first restore.
+ */
+export const workspaceBackupSchema = Schema.Union(
+  Schema.Struct({
+    id: Schema.String,
+    dir: Schema.String,
+    size: Schema.Number,
+    name: Schema.optional(Schema.String),
+    sha256: Schema.String,
+    format: Schema.Literal("tar+zstd/1"),
+  }),
+  Schema.Struct({
+    id: Schema.String,
+    dir: Schema.String,
+    localBucket: Schema.optional(Schema.Boolean),
+  }),
+);
 export const checkpointSchema = Schema.Struct({
   version: Schema.Literal(1),
   driver: Schema.String,
@@ -63,13 +82,7 @@ export const checkpointSchema = Schema.Struct({
     ),
   ),
   environmentFileVersion: Schema.optional(Schema.NonNegativeInt),
-  workspace: Schema.optional(
-    Schema.Struct({
-      id: Schema.String,
-      dir: Schema.String,
-      localBucket: Schema.optional(Schema.Boolean),
-    }),
-  ),
+  workspace: Schema.optional(workspaceBackupSchema),
 });
 /** Gateway names a Claude Code session resolves the `haiku`, `sonnet` and `opus` aliases to. */
 const modelTiersSchema = Schema.Struct({

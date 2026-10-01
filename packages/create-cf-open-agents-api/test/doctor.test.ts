@@ -31,9 +31,18 @@ it("a generated configuration passes every agreement rule", async () => {
       "services.MODEL_GATEWAY",
       "services.AGENTS",
     ]);
-    expect(failing(configChecks({ ...config, vars: { BACKUP_BUCKET_NAME: "other" } }))).toEqual([
-      "vars.BACKUP_BUCKET_NAME",
-    ]);
+    expect(
+      failing(
+        configChecks({
+          ...config,
+          containers: (config.containers ?? []).map((entry) =>
+            entry.class_name === "HarnessDO"
+              ? { class_name: "HarnessDO", image: "./Harness.Dockerfile", instance_type: "basic" }
+              : entry,
+          ),
+        }),
+      ),
+    ).toEqual(["containers.HarnessDO"]);
     expect(failing(configChecks({ ...config, migrations: [] }))).toEqual([
       "migrations.SessionDO",
       "migrations.TenantCatalogDO",

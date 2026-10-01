@@ -1,13 +1,16 @@
-import { ContainerProxy } from "@cloudflare/sandbox";
+import { DirectoryBackupGateway } from "@cloudflare/sandbox";
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 import { CatalogObject } from "./catalog.js";
 import {
   type ContainerBindings,
+  ContainerEgress,
   containerEnvironments,
   containerHarnesses,
+  type ContainerInstance,
   HarnessContainer,
   SandboxContainer,
+  SandboxEgress,
 } from "./containers.js";
 import { createModelGateway, type ModelRegistration } from "./models/gateway.js";
 import type { AgentRegistration, ServiceOptions } from "./runtime.js";
@@ -18,14 +21,15 @@ import { type AgentBindings, type AgentServiceClasses, createAgentService } from
  * names and the model gateway by the `Models` entrypoint; re-export them unchanged:
  *
  * ```ts
- * export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
- *   defineAgentWorker<Bindings>({ ... });
+ * export const {
+ *   Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO,
+ *   ContainerEgress, SandboxEgress, DirectoryBackupGateway,
+ * } = defineAgentWorker<Bindings>({ ... });
  * export default Agents;
  * ```
  *
- * `HarnessDO` is the `HarnessContainer` class itself, never a subclass: the Container
- * SDK keys its outbound handler registry by class name. Use the `harness` option for a
- * `createHarness(...)` class.
+ * The container objects find `ContainerEgress`, `SandboxEgress` and `DirectoryBackupGateway`
+ * through `ctx.exports` by these names, so the main module exports them unrenamed.
  */
 export interface AgentWorkerClasses<Env extends AgentBindings> {
   Agents: AgentServiceClasses<Env>["AgentWorker"];
@@ -34,7 +38,15 @@ export interface AgentWorkerClasses<Env extends AgentBindings> {
   TenantCatalogDO: typeof CatalogObject;
   HarnessDO: typeof HarnessContainer;
   SandboxDO: typeof SandboxContainer;
-  ContainerProxy: typeof ContainerProxy;
+  ContainerEgress: typeof ContainerEgress;
+  SandboxEgress: typeof SandboxEgress;
+  DirectoryBackupGateway: typeof DirectoryBackupGateway;
+}
+
+/** Container sizes; `standard-1` (1/2 vCPU, 4 GiB) by default for both. */
+export interface ContainerInstances {
+  harness?: ContainerInstance;
+  sandbox?: ContainerInstance;
 }
 
 interface BaseAgentWorkerOptions<Env> {
@@ -59,6 +71,7 @@ export interface ContainerAgentWorkerOptions<
   objects?: ServiceOptions<Env>["objects"];
   /** A `createHarness(...)` class to export as `HarnessDO` in place of `HarnessContainer`. */
   harness?: typeof HarnessContainer;
+  instances?: ContainerInstances;
 }
 /** Custom composition without Container bindings: every driver is supplied explicitly. */
 export interface CustomAgentWorkerOptions<
@@ -68,6 +81,7 @@ export interface CustomAgentWorkerOptions<
   environments?: ServiceOptions<Env>["environments"];
   objects?: ServiceOptions<Env>["objects"];
   harness?: undefined;
+  instances?: undefined;
 }
 export type AgentWorkerOptions<Env extends AgentBindings> = Env extends ContainerBindings
   ? ContainerAgentWorkerOptions<Env>
@@ -78,7 +92,17 @@ interface ImplementationOptions<Env> extends BaseAgentWorkerOptions<Env> {
   environments?: ServiceOptions<Env>["environments"];
   objects?: ServiceOptions<Env>["objects"];
   harness?: typeof HarnessContainer;
+  instances?: ContainerInstances;
 }
+
+const sizedHarness = (Base: typeof HarnessContainer, size: ContainerInstance) =>
+  class extends Base {
+    protected override instance = size;
+  } as typeof HarnessContainer;
+const sizedSandbox = (size: ContainerInstance) =>
+  class extends SandboxContainer {
+    protected override instance = size;
+  } as typeof SandboxContainer;
 
 /** One call composes the API Worker, the SessionDO and the private model gateway. */
 export function defineAgentWorker<Env extends AgentBindings & ContainerBindings>(
@@ -111,13 +135,18 @@ export function defineAgentWorker<Env extends AgentBindings>(
       return gateway.fetch(request, this.env);
     }
   }
+  const Harness = options.harness ?? HarnessContainer;
+  const harnessInstance = options.instances?.harness;
+  const sandboxInstance = options.instances?.sandbox;
   return {
     Agents: service.AgentWorker,
     Models,
     SessionDO: service.SessionDO,
     TenantCatalogDO: CatalogObject,
-    HarnessDO: options.harness ?? HarnessContainer,
-    SandboxDO: SandboxContainer,
-    ContainerProxy,
+    HarnessDO: harnessInstance ? sizedHarness(Harness, harnessInstance) : Harness,
+    SandboxDO: sandboxInstance ? sizedSandbox(sandboxInstance) : SandboxContainer,
+    ContainerEgress,
+    SandboxEgress,
+    DirectoryBackupGateway,
   };
 }

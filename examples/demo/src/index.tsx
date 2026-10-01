@@ -511,7 +511,8 @@ app.onError((error, c) => {
 });
 
 export default app;
-// Wrangler binds the library's Durable Objects and the `Models` gateway by these names.
+// Wrangler binds the library's Durable Objects and the `Models` gateway by these names;
+// the container objects find the egress and backup entrypoints by theirs.
 export {
   Agents,
   Models,
@@ -519,5 +520,7 @@ export {
   TenantCatalogDO,
   HarnessDO,
   SandboxDO,
-  ContainerProxy,
+  ContainerEgress,
+  SandboxEgress,
+  DirectoryBackupGateway,
 } from "./agents.js";

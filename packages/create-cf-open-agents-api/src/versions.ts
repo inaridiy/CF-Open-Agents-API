@@ -10,7 +10,7 @@ export const CLI_NAME = "create-cf-open-agents-api";
 export const GITHUB_REPOSITORY = "inaridiy/CF-Open-Agents-API";
 export const VENDOR_DIRECTORY = ".cf-open-agents-api";
 
-/** `ctx.exports`, which the Container SDK needs, is on by default from this compatibility date. */
+/** `ctx.exports`, through which the container objects find their entrypoints, is on by default from this compatibility date. */
 export const CTX_EXPORTS_DATE = "2025-11-17";
 
 /**
@@ -42,8 +42,8 @@ export const DEMO_VERSIONS = {
 } as const;
 
 export const TOOLCHAIN_VERSIONS = {
-  wrangler: "4.131.1",
-  "@cloudflare/workers-types": "5.20260911.1",
+  wrangler: "4.145.0",
+  "@cloudflare/workers-types": "5.20260930.2",
   typescript: "7.0.2",
 } as const;
 

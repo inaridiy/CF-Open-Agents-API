@@ -130,9 +130,12 @@ export function make<S extends Spec, H extends Handlers<S, unknown, unknown>>(
   const pendingTimers = (record: Record_<S>) =>
     machine.timers(record.state).filter((timer) => record.fired[timer.event] !== timer.at);
   const nextWake = (): number | null => {
+    // Commands run strictly in order, so only the first one decides when the outbox can move:
+    // a later command that is due cannot run while the first waits for its retry.
+    const [first] = store.outbox(key);
     const times = [
       ...pendingTimers(load()).map((timer) => timer.at),
-      ...store.outbox(key).map((entry) => entry.due),
+      ...(first ? [first.due] : []),
     ];
     return times.length ? Math.min(...times) : null;
   };

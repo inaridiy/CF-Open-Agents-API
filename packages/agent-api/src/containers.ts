@@ -1,6 +1,5 @@
-import { Container } from "@cloudflare/containers";
-import { getSandbox, type ISandbox } from "@cloudflare/sandbox";
-import { Effect, Layer, ManagedRuntime, Option } from "effect";
+import { DurableObject } from "cloudflare:workers";
+import { Effect, Layer, ManagedRuntime } from "effect";
 
 import { EnvironmentWorkspace, type ExportedEnvironment } from "./container-environments.js";
 import {
@@ -18,6 +17,12 @@ import { loadCheckpoint, snapshot } from "./containers/checkpoint.js";
 import { delegateRequest } from "./containers/delegation.js";
 import { diagnosticsHint } from "./containers/diagnostics.js";
 import {
+  type ContainerEgressProps,
+  type EntrypointLoopback,
+  exported,
+  HARNESS_EGRESS_HOSTS,
+} from "./containers/egress.js";
+import {
   assignment,
   type ContainerBindings,
   HarnessBindings,
@@ -28,18 +33,23 @@ import {
   releaseBody,
   write,
 } from "./containers/host.js";
+import { makeLease } from "./containers/lease.js";
 import * as proxies from "./containers/proxies.js";
+import type { ContainerInstance } from "./containers/sandbox.js";
 import {
   attachCapabilities,
   ensureCodexServer,
   prepareWorkspace,
   rememberSandbox,
-} from "./containers/sandbox.js";
+  sandboxOf,
+  type Workspace,
+  workspaceOf,
+} from "./containers/workspace.js";
 import { decode, io, settle } from "./effect.js";
 import type { EnvironmentDriver } from "./environments.js";
 import {
-  BackupCredentialsMissing,
   CommandRejected,
+  ContainerMisconfigured,
   ExecutionMissing,
   Superseded,
   TransportFailure,
@@ -58,17 +68,41 @@ export {
   HarnessRepo,
   type HarnessServices,
 } from "./containers/host.js";
-export { SandboxContainer } from "./containers/sandbox.js";
+export { ContainerEgress, SandboxEgress } from "./containers/egress.js";
+export {
+  type ContainerInstance,
+  type LegacyWorkspaceBackup,
+  SandboxContainer,
+  type WorkspaceBackup,
+} from "./containers/sandbox.js";
+export type { Workspace } from "./containers/workspace.js";
 
+/** A failure this cleanup cannot act on. */
+const ignore = (): void => {};
 /** Long-poll bound the supervisor accepts; the HarnessDO stays under its fetch timeout. */
 const LONG_POLL_MAX_MS = 25_000;
+/** The named image a HarnessDO starts: `containers[].images.harness` in Wrangler configuration. */
+export const HARNESS_IMAGE = "harness";
+const SUPERVISOR_PORT = 8080;
+/** How long a fresh harness container may take to answer before the boot fails. */
+const READY_TIMEOUT_MS = 90_000;
+const IDLE_MS = 10 * 60 * 1000;
+/** The platform's own stop after the object goes inactive; the lease's idle timer decides first. */
+const INACTIVITY_BACKSTOP_MS = IDLE_MS + 5 * 60 * 1000;
+/** A turn keeps its sandbox from idling out at most this often. */
+const SANDBOX_TOUCH_MS = 60_000;
 
+/**
+ * One session's execution: the harness container with the supervisor and the native
+ * runtime, its egress, and the turn's assignment. A lease boots the container on first
+ * use, keeps it while turns poll it, destroys it after ten idle minutes, and never boots
+ * it again once the session is deleted.
+ */
 export class HarnessContainer<
   Env extends ContainerBindings = ContainerBindings,
-> extends Container<Env> {
-  override defaultPort = 8080;
-  override sleepAfter = "10m";
-  override enableInternet = false;
+> extends DurableObject<Env> {
+  /** The size `start()` requests; `defineAgentWorker({ instances })` overrides it. */
+  protected instance: ContainerInstance = "standard-1";
   private readonly lifecycle = Effect.unsafeMakeSemaphore(1);
   private readonly workspace = Effect.unsafeMakeSemaphore(1);
   /** Assignment, child and checkpoint records carry agent configuration; SQLite rows, not KV values. */
@@ -95,10 +129,119 @@ export class HarnessContainer<
       ),
   );
   private readonly codeExecutions = new Set<AbortController>();
+  private readonly lease = makeLease({
+    storage: this.ctx.storage,
+    container: () => this.ctx.container,
+    boot: Effect.suspend(() => this.boot()),
+    destroy: io("harness.destroy", () => this.container().destroy()),
+    idleMs: () => this.idleMs(),
+    label: "harness",
+  });
+  private sandboxTouched = 0;
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // The inactivity timeout does not survive a restart of this object; set it again.
+    const container = ctx.container;
+    if (container?.running)
+      void ctx.blockConcurrencyWhile(() =>
+        container.setInactivityTimeout(INACTIVITY_BACKSTOP_MS).catch(ignore),
+      );
+  }
+  /** How long the harness container runs after its last poll. */
+  protected idleMs(): number {
+    return IDLE_MS;
+  }
+  /** Re-reads `idleMs()` into the lease, booting the container if it is not running. */
+  protected renewLease(): Promise<void> {
+    return this.run(this.lease.renew);
+  }
+  private container(): Container {
+    const container = this.ctx.container;
+    if (!container)
+      throw new ContainerMisconfigured({
+        reason: "HarnessDO has no container: add it to `containers` in the Wrangler configuration",
+      });
+    return container;
+  }
+  /**
+   * Start the supervisor's container with no Internet access, route its egress hosts to this
+   * object, and wait until the supervisor answers. Intercepts last until the container stops.
+   */
+  private boot() {
+    return Effect.gen(this, function* () {
+      const container = this.container();
+      const image = (container.images as Readonly<Record<string, string>> | undefined)?.[
+        HARNESS_IMAGE
+      ];
+      if (!image)
+        return yield* new ContainerMisconfigured({
+          reason: `Add an image named "${HARNESS_IMAGE}" to the HarnessDO container entry (scheduling_policy "durable_object")`,
+        });
+      if (!container.running)
+        container.start({ image, instance: this.instance, enableInternet: false });
+      const egress = yield* Effect.try({
+        try: () =>
+          exported<EntrypointLoopback<ContainerEgressProps>>(
+            this.ctx,
+            "ContainerEgress",
+          )({
+            props: { harness: this.ctx.id.toString() },
+          }),
+        catch: (error) =>
+          error instanceof ContainerMisconfigured
+            ? error
+            : new TransportFailure({ operation: "harness.egress", cause: error }),
+      });
+      yield* io("harness.intercept", async () => {
+        for (const host of HARNESS_EGRESS_HOSTS)
+          await container.interceptOutboundHttp(host, egress);
+        await container.setInactivityTimeout(INACTIVITY_BACKSTOP_MS);
+      });
+      // Each attempt is bounded, and so is the whole wait: a supervisor that accepts a
+      // connection and never answers must not hold the lease's command slot.
+      yield* io("harness.ready", async (signal) => {
+        const deadline = Date.now() + READY_TIMEOUT_MS;
+        for (;;) {
+          try {
+            const response = await container
+              .getTcpPort(SUPERVISOR_PORT)
+              .fetch("http://harness/diagnostics", {
+                signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+              });
+            await releaseBody(response);
+            if (response.ok) return;
+          } catch (error) {
+            if (signal.aborted || Date.now() >= deadline) throw error;
+          }
+          if (Date.now() >= deadline) throw new Error("The supervisor did not become ready");
+          await scheduler.wait(250);
+        }
+      });
+    });
+  }
+  /** A request to the supervisor in the running container; boots it first if needed. */
+  private harnessFetch(operation: string, request: Request | string, init?: RequestInit) {
+    return this.lease.acquire.pipe(
+      Effect.zipRight(
+        io(operation, (signal) =>
+          this.container()
+            .getTcpPort(SUPERVISOR_PORT)
+            .fetch(request, {
+              ...init,
+              signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal,
+            }),
+        ),
+      ),
+    );
+  }
   /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
   private run<A, E>(program: Effect.Effect<A, E, HarnessServices>): Promise<A> {
     // lint: entrypoint
     return this.runtime.runPromiseExit(program).then(settle);
+  }
+  /** An entrypoint that uses the container: it stays busy, so no idle check ends it meanwhile. */
+  private busy<A, E>(program: Effect.Effect<A, E, HarnessServices>): Promise<A> {
+    return this.run(this.lease.hold(program));
   }
   private abortCodeExecutions(): void {
     for (const controller of this.codeExecutions) controller.abort();
@@ -110,29 +253,29 @@ export class HarnessContainer<
     environment: this.environment,
     workspace: this.workspace,
     codeExecutions: this.codeExecutions,
-    containerFetch: (request, init) => this.containerFetch(request, init),
+    containerFetch: (request, init) => this.run(this.harnessFetch("harness.fetch", request, init)),
     child: (subagentId) => this.child(subagentId),
     abortCodeExecutions: () => this.abortCodeExecutions(),
     prepareSandbox: (sandbox, execution) => this.prepareSandbox(sandbox, execution),
   };
   mediaRequest(request: Request): Promise<Response> {
-    return this.run(proxies.mediaRequest(request));
+    return this.busy(proxies.mediaRequest(request));
   }
   programmaticRequest(request: Request): Promise<Response> {
-    return this.run(proxies.programmaticRequest(this.host, request));
+    return this.busy(proxies.programmaticRequest(this.host, request));
   }
   mcpRequest(request: Request): Promise<Response> {
-    return this.run(proxies.mcpRequest(this.host, request));
+    return this.busy(proxies.mcpRequest(this.host, request));
   }
   /**
    * Private route for the parent supervisor: start, poll and control delegated children;
    * see `containers/delegation.ts`.
    */
   delegateRequest(request: Request): Promise<Response> {
-    return this.run(delegateRequest(this.host, request));
+    return this.busy(delegateRequest(this.host, request));
   }
   modelRequest(request: Request): Promise<Response> {
-    return this.run(proxies.modelRequest(this.host, request));
+    return this.busy(proxies.modelRequest(this.host, request));
   }
   prepareEnvironment(...args: Parameters<EnvironmentDriver["prepare"]>) {
     const [spec] = args;
@@ -145,7 +288,7 @@ export class HarnessContainer<
             Effect.gen(this, function* () {
               const base = this.environment.base();
               if ((yield* read((tx) => tx.sandbox())) || !base) return;
-              yield* rememberSandbox(getSandbox(this.env.SANDBOX, spec.sessionId), {
+              yield* rememberSandbox(workspaceOf(this.env, spec.sessionId), {
                 workspaceId: base.id,
                 provisioned: this.environment.inherited(),
               });
@@ -167,17 +310,19 @@ export class HarnessContainer<
   environmentFiles(...args: Parameters<EnvironmentDriver["files"]>) {
     return this.run(this.workspace.withPermits(1)(this.environment.files(...args)));
   }
-  protected async prepareSandbox(_sandbox: ISandbox, _execution: Execution): Promise<void> {}
+  /** Deployment-owned provisioning of a fresh workspace, before any model call; see `createHarness`. */
+  protected async prepareSandbox(_workspace: Workspace, _execution: Execution): Promise<void> {}
   private child(subagentId: string) {
     return this.env.HARNESS.getByName(`${this.ctx.id.toString()}/${subagentId}`);
   }
+  /** `sandbox.internal` from the harness container: workspace tools and Codex's `exec-server`. */
   override async fetch(request: Request): Promise<Response> {
     if (new URL(request.url).hostname === "sandbox.internal")
-      return this.run(proxies.sandboxRequest(this.host, request));
-    return super.fetch(request);
+      return this.busy(proxies.sandboxRequest(this.host, request));
+    return new Response("Unknown host", { status: 404 });
   }
   startExecution(execution: Execution, operationId: string): Promise<void> {
-    return this.run(
+    return this.busy(
       this.lifecycle.withPermits(1)(
         this.workspace.withPermits(1)(this.startAttempt(execution, operationId)),
       ),
@@ -195,55 +340,45 @@ export class HarnessContainer<
       const assigned = buildAssignment(execution, harness, digests);
       this.abortCodeExecutions();
       yield* write((tx) => tx.putAssignment(assigned));
-      const sandbox = getSandbox(this.env.SANDBOX, execution.sessionId);
       const previousCheckpoint = execution.checkpoint;
       const previousWorkspace = previousCheckpoint?.workspace ?? this.environment.base();
       // A delegated child joins the parent's live sandbox; only the parent resets it.
       if (execution.sandbox && !execution.parent)
-        yield* prepareWorkspace(this.host, sandbox, execution, previousWorkspace);
-      if (execution.sandbox && harness === "codex") yield* ensureCodexServer(sandbox);
+        yield* prepareWorkspace(this.host, execution, previousWorkspace);
+      if (execution.sandbox && harness === "codex") yield* ensureCodexServer(execution.sessionId);
       const capabilityRoots = execution.parent
         ? [...(execution.capabilityRoots ?? [])]
         : this.environment.capabilityRoots();
       let portableInstructions = "";
       if (harness !== "codex" && execution.sandbox) {
-        const attached = yield* attachCapabilities(
-          sandbox,
-          execution,
-          assigned.mcp ?? [],
-          capabilityRoots,
-        );
+        const attached = yield* attachCapabilities(execution, assigned.mcp ?? [], capabilityRoots);
         portableInstructions = attached.instructions;
         assigned.mcp = attached.mcp;
       }
       const checkpoint = yield* loadCheckpoint(previousCheckpoint);
-      yield* io("startAttempt", (signal) =>
-        this.startAndWaitForPorts(undefined, { abort: signal }),
-      );
+      yield* this.lease.acquire;
       // Durable dispatch tombstone: retries may inspect, but cannot replay a lost job. The
       // marker and the dispatch it describes are one uninterruptible step: an interrupt
       // between them, or mid-request, would leave a marker for a job that never started.
       const result = yield* Effect.uninterruptible(
         write((tx) => tx.putAssignment({ ...assigned, dispatched: true })).pipe(
           Effect.zipRight(
-            io("startAttempt", () =>
-              this.containerFetch("http://harness/jobs", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: jobBody(
-                  execution,
-                  assigned,
-                  capabilityRoots,
-                  portableInstructions,
-                  operationId,
-                  checkpoint,
-                ),
-              }),
-            ),
+            this.harnessFetch("startAttempt", "http://harness/jobs", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: jobBody(
+                execution,
+                assigned,
+                capabilityRoots,
+                portableInstructions,
+                operationId,
+                checkpoint,
+              ),
+            }),
           ),
         ),
       );
-      // The job is dispatched either way; releasing the body only lets the Container sleep.
+      // The job is dispatched either way; the body carries nothing more.
       yield* io("startAttempt.release", () => releaseBody(result)).pipe(Effect.ignore);
       if (!result.ok)
         return yield* new TransportFailure({
@@ -258,20 +393,29 @@ export class HarnessContainer<
    * outcome; the reconciler stays under its alarm interval, and this stays under 25 s.
    */
   pollExecution(execution: Execution, after: number, waitMs = 0): Promise<Response> {
-    return this.run(
+    return this.busy(
       Effect.gen(this, function* () {
         const current = yield* assignment;
         if (superseded(current, execution))
           return Response.json({ status: "missing", events: [], cursor: 0 });
+        // The turn uses its sandbox through sockets this object does not see; keep it alive.
+        if (
+          current.sandbox &&
+          !current.parent &&
+          Date.now() - this.sandboxTouched > SANDBOX_TOUCH_MS
+        ) {
+          this.sandboxTouched = Date.now();
+          yield* io("pollExecution.sandbox", () =>
+            sandboxOf(this.env, current.sessionId).touch(),
+          ).pipe(Effect.ignore);
+        }
         const wait =
           current.dispatched && !current.revoked
             ? Math.min(Math.max(0, Math.floor(waitMs)), LONG_POLL_MAX_MS)
             : 0;
-        return yield* io("pollExecution", (signal) =>
-          this.containerFetch(
-            `http://harness/jobs/${execution.turnId}?after=${after}${wait > 0 ? `&wait=${wait}` : ""}`,
-            { signal },
-          ),
+        return yield* this.harnessFetch(
+          "pollExecution",
+          `http://harness/jobs/${execution.turnId}?after=${after}${wait > 0 ? `&wait=${wait}` : ""}`,
         );
       }),
     );
@@ -281,7 +425,7 @@ export class HarnessContainer<
     operationId: string,
     command: RuntimeCommand,
   ): Promise<void> {
-    return this.run(
+    return this.busy(
       Effect.gen(this, function* () {
         const current = yield* assignment;
         if (superseded(current, execution))
@@ -297,13 +441,14 @@ export class HarnessContainer<
         }
         // Interruptible: the supervisor deduplicates control by operationId, so an aborted
         // delivery is retried by the next alarm without applying the command twice.
-        const result = yield* io("controlExecution", (signal) =>
-          this.containerFetch(`http://harness/jobs/${execution.turnId}/control`, {
+        const result = yield* this.harnessFetch(
+          "controlExecution",
+          `http://harness/jobs/${execution.turnId}/control`,
+          {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ operationId, command }),
-            signal,
-          }),
+          },
         );
         if (command.type === "cancel") this.abortCodeExecutions();
         if (result.ok)
@@ -327,7 +472,7 @@ export class HarnessContainer<
     );
   }
   checkpointExecution(execution: Execution): Promise<Checkpoint> {
-    return this.run(
+    return this.busy(
       this.lifecycle.withPermits(1)(this.workspace.withPermits(1)(snapshot(this.host, execution))),
     );
   }
@@ -342,12 +487,15 @@ export class HarnessContainer<
       if (superseded(current, execution)) return;
       this.abortCodeExecutions();
       yield* write((tx) => tx.putAssignment({ ...current, revoked: true }));
-      // Native stderr is lost with the Container; keep a bounded tail in Worker logs.
-      if (current.dispatched)
+      // Native stderr is lost with the container; keep a bounded tail in Worker logs. A
+      // container that is gone has nothing to say, and is not started to say it.
+      if (current.dispatched && this.ctx.container?.running)
         yield* io("stopAttempt.diagnostics", async (signal) => {
-          const response = await this.containerFetch("http://harness/diagnostics", {
-            signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
-          });
+          const response = await this.container()
+            .getTcpPort(SUPERVISOR_PORT)
+            .fetch("http://harness/diagnostics", {
+              signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+            });
           if (!response.ok) return releaseBody(response);
           const { lines } = (await response.json()) as { lines?: string[] };
           if (lines?.length) {
@@ -371,18 +519,21 @@ export class HarnessContainer<
         yield* io("stopAttempt.child", () =>
           this.child(child.subagentId).stopExecution(child.execution),
         ).pipe(Effect.ignore);
-      yield* io("stopAttempt", () => this.destroy());
+      yield* this.lease.stop("turn stopped");
       if (current.sandbox && !current.parent) {
         // Uncommitted workspace state is discarded; the next turn restores the last checkpoint.
         yield* write((tx) => tx.forgetSandbox());
-        yield* io("stopAttempt", () => getSandbox(this.env.SANDBOX, execution.sessionId).destroy());
+        yield* io("stopAttempt", () =>
+          sandboxOf(this.env, execution.sessionId).stop("turn stopped"),
+        );
       }
     });
   }
   /**
-   * The session was deleted: revoke the assignment, then end the delegated children's
-   * containers, this one, and the sandbox it owns. Deletion is refused while a turn is
-   * active, so nothing here discards uncommitted work.
+   * The session was deleted: revoke the assignment, then retire the delegated children's
+   * containers, this one, and the sandbox it owns. A retired object never starts a
+   * container again. Deletion is refused while a turn is active, so nothing here discards
+   * uncommitted work.
    */
   releaseCompute(): Promise<void> {
     return this.run(
@@ -397,101 +548,27 @@ export class HarnessContainer<
               yield* io("releaseCompute.child", () => this.child(subagentId).releaseCompute()).pipe(
                 Effect.ignore,
               );
-            if (this.ctx.container?.running) yield* io("releaseCompute", () => this.destroy());
+            yield* this.lease.retire;
             if (current?.parent) return;
-            // A session prepared before its first turn has a sandbox but no assignment yet;
-            // a child whose start failed early has neither.
-            const prepared = yield* read((tx) => tx.sandbox());
-            const sessionId = current?.sessionId ?? (prepared ? this.ctx.id.name : undefined);
-            if (!sessionId || !(current?.sandbox || prepared)) return;
+            // A session prepared before its first turn has a sandbox but no assignment yet.
+            const sessionId = current?.sessionId ?? this.ctx.id.name;
+            if (!sessionId) return;
             yield* write((tx) => tx.forgetSandbox());
-            yield* io("releaseCompute", () => getSandbox(this.env.SANDBOX, sessionId).destroy());
+            yield* io("releaseCompute", () => sandboxOf(this.env, sessionId).release());
           }),
         ),
       ),
     );
   }
-  /**
-   * Whether the session's sandbox is in use: the harness container runs, or a workspace
-   * operation (setup, a fork's restore, a starting turn) holds it before the harness does.
-   * The sandbox asks before its idle timeout ends it.
-   */
-  sandboxHeld(): Promise<boolean> {
-    return this.run(
-      Effect.map(
-        this.workspace.withPermitsIfAvailable(1)(Effect.void),
-        (free) => (this.ctx.container?.running ?? false) || Option.isNone(free),
-      ),
-    );
+  /** The lease's timers: the idle check that ends an unused container. */
+  override alarm(): Promise<void> {
+    return this.run(this.lease.wake);
   }
-  /**
-   * Polls renew this container's activity throughout a turn, so reaching `sleepAfter`
-   * means no turn is being reconciled. Nothing needs a graceful exit then, and a
-   * supervisor that hangs on SIGTERM must not keep the container, or its sandbox, alive.
-   */
-  override async onActivityExpired(): Promise<void> {
-    if (!this.ctx.container?.running) return;
-    console.log("Activity expired, destroying the harness container", {
-      harness: this.ctx.id.name,
-    });
-    await this.destroy();
-  }
-  /**
-   * However the harness container stopped (idle, crashed, replaced), the sandbox it owns
-   * goes with it: the Sandbox SDK keeps a container awake while any process it started
-   * runs, and Codex's `exec-server` never exits. The next turn restores the committed
-   * workspace. A start, checkpoint, stop or release in progress owns the sandbox and
-   * decides for itself.
-   */
-  override onStop(): Promise<void> {
-    return this.run(
-      this.lifecycle
-        .withPermitsIfAvailable(1)(
-          this.workspace.withPermits(1)(
-            Effect.gen(this, function* () {
-              const current = yield* read((tx) => tx.assignment());
-              if (!current?.sandbox || current.parent) return;
-              yield* write((tx) => tx.forgetSandbox());
-              yield* io("onStop.sandbox", () =>
-                getSandbox(this.env.SANDBOX, current.sessionId).destroy(),
-              );
-            }),
-          ),
-        )
-        .pipe(
-          Effect.asVoid,
-          // A rejection would fail the Container's alarm and enter its retry loop.
-          Effect.catchAllCause((cause) =>
-            Effect.logWarning("Releasing the sandbox of a stopped harness failed", cause),
-          ),
-        ),
-    );
-  }
-}
-
-/**
- * The secrets `@cloudflare/sandbox` signs backup URLs with. The SDK only checks them when
- * the first backup runs, after the container booted, and its message never leaves the
- * harness; naming them before a session exists turns a misdeployment into a 503.
- */
-export function missingBackupCredentials(env: ContainerBindings): string[] {
-  if (env.LOCAL_BACKUPS === "true") return [];
-  const missing: string[] = [];
-  if (!(env.CLOUDFLARE_R2_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID))
-    missing.push("CLOUDFLARE_R2_ACCOUNT_ID");
-  if (!env.R2_ACCESS_KEY_ID) missing.push("R2_ACCESS_KEY_ID");
-  if (!env.R2_SECRET_ACCESS_KEY) missing.push("R2_SECRET_ACCESS_KEY");
-  if (!env.BACKUP_BUCKET_NAME) missing.push("BACKUP_BUCKET_NAME");
-  return missing;
 }
 
 export function containerEnvironments(env: ContainerBindings): EnvironmentDriver {
   const stub = (sessionId: string) => env.HARNESS.getByName(sessionId);
   return {
-    preflight: () => {
-      const missing = missingBackupCredentials(env);
-      return missing.length ? Effect.fail(new BackupCredentialsMissing({ missing })) : Effect.void;
-    },
     prepare: (spec) =>
       io("environment.prepare", () => stub(spec.sessionId).prepareEnvironment(spec)),
     status: (spec) => io("environment.status", () => stub(spec.sessionId).environmentStatus(spec)),
@@ -502,21 +579,15 @@ export function containerEnvironments(env: ContainerBindings): EnvironmentDriver
   };
 }
 
-// The SDK registers handlers through its static setter. Class fields bypass it.
-HarnessContainer.outboundByHost = proxies.outboundByHost;
-
 /** Deployment-owned provisioning runs once per fresh workspace, before any model call. */
 export function createHarness<Env extends ContainerBindings>(
-  prepare: (sandbox: ISandbox, execution: Execution, env: Env) => Promise<void>,
+  prepare: (workspace: Workspace, execution: Execution, env: Env) => Promise<void>,
 ): typeof HarnessContainer<Env> {
-  class ConfiguredHarness extends HarnessContainer<Env> {
-    protected override prepareSandbox(sandbox: ISandbox, execution: Execution): Promise<void> {
-      return prepare(sandbox, execution, this.env);
+  return class ConfiguredHarness extends HarnessContainer<Env> {
+    protected override prepareSandbox(workspace: Workspace, execution: Execution): Promise<void> {
+      return prepare(workspace, execution, this.env);
     }
-  }
-  // Register the concrete constructor: SDK handler registries are keyed by class name.
-  ConfiguredHarness.outboundByHost = HarnessContainer.outboundByHost ?? {};
-  return ConfiguredHarness;
+  };
 }
 export function containerDriver(env: ContainerBindings, harness: HarnessName): RuntimeDriver {
   const stub = (execution: Execution) => env.HARNESS.getByName(execution.sessionId);

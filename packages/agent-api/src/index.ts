@@ -10,7 +10,6 @@ export {
 } from "./effect.js";
 export {
   ArtifactLimitExceeded,
-  BackupCredentialsMissing,
   ArtifactListFailed,
   AssignmentConflict,
   BodyTooLarge,
@@ -22,6 +21,8 @@ export {
   CheckpointIncompatible,
   CheckpointMissing,
   CommandRejected,
+  ContainerMisconfigured,
+  ContainerRetired,
   ContainerUnassigned,
   CredentialAmbiguous,
   CredentialChanged,

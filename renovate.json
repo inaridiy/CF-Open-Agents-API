@@ -22,8 +22,12 @@
       "enabled": false
     },
     {
-      "description": "The Sandbox SDK and its Docker image must stay on the same preview build.",
-      "matchPackageNames": ["@cloudflare/sandbox"],
+      "description": "The Sandbox package and the sandbox-shim image it talks to move together, by hand: they define the workspace backup record checkpoints store.",
+      "matchPackageNames": [
+        "@cloudflare/sandbox",
+        "docker.io/cloudflare/sandbox",
+        "cloudflare/sandbox"
+      ],
       "enabled": false
     },
     {

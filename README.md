@@ -33,7 +33,7 @@ Open <http://localhost:8787>, type a prompt, pick a preset and press **Build**. 
 
 ![A finished job with the transcript, thinking and the zip download](docs/images/demo-job.png)
 
-Deploying needs the R2 API token and the other secrets `setup` asks for; `.dev.vars` stays local. The QuickStart's [Deploy](docs/quickstart.md#deploy) section lists them.
+Deploying needs the secrets `setup` asks for; `.dev.vars` stays local. The QuickStart's [Deploy](docs/quickstart.md#deploy) section lists them.
 
 To add the API to a Worker you already have (a Vite app, a Hono Worker, anything Wrangler deploys), run `init` in its directory instead. It writes the bindings into `wrangler.jsonc` without losing your comments, generates the composition in `src/agents.ts` and snapshots the Docker build context into `.cf-open-agents-api/`. The [CLI README](packages/create-cf-open-agents-api/README.md) covers `init`, `setup` and `doctor`.
 
@@ -118,28 +118,39 @@ interface Bindings extends AgentBindings, ContainerBindings {
   OPENAI_API_KEY: string;
 }
 
-export const { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } =
-  defineAgentWorker<Bindings>({
-    // Presets: what clients name in agent.model. They never see the connection behind it.
-    agents: {
-      codex: { harness: "codex", model: "codex", webSearch: true, delegates: ["claude"] },
-      claude: { harness: "claude-code", model: "primary", tiers: { haiku: "fast" } },
-    },
-    // The private gateway: deployment-owned names mapped to provider connections.
-    models: (env) => ({
-      codex: () =>
-        nativeModel({
-          protocol: "responses",
-          baseURL: "https://api.openai.com/v1",
-          apiKey: env.OPENAI_API_KEY,
-          model: "gpt-6-astra",
-        }),
-      primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
-      fast: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-5.6-luna")),
-    }),
-    // Who is calling: the HTTP path maps a bearer token to a tenant.
-    authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
-  });
+// Wrangler binds the classes by these names, and the container objects find the egress
+// and backup entrypoints by theirs; export them unrenamed.
+export const {
+  Agents,
+  Models,
+  SessionDO,
+  TenantCatalogDO,
+  HarnessDO,
+  SandboxDO,
+  ContainerEgress,
+  SandboxEgress,
+  DirectoryBackupGateway,
+} = defineAgentWorker<Bindings>({
+  // Presets: what clients name in agent.model. They never see the connection behind it.
+  agents: {
+    codex: { harness: "codex", model: "codex", webSearch: true, delegates: ["claude"] },
+    claude: { harness: "claude-code", model: "primary", tiers: { haiku: "fast" } },
+  },
+  // The private gateway: deployment-owned names mapped to provider connections.
+  models: (env) => ({
+    codex: () =>
+      nativeModel({
+        protocol: "responses",
+        baseURL: "https://api.openai.com/v1",
+        apiKey: env.OPENAI_API_KEY,
+        model: "gpt-6-astra",
+      }),
+    primary: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-6-astra")),
+    fast: () => aiSDKModel(createOpenAI({ apiKey: env.OPENAI_API_KEY })("gpt-5.6-luna")),
+  }),
+  // Who is calling: the HTTP path maps a bearer token to a tenant.
+  authenticate: (request, env) => bearerTenant(request, env.API_TOKEN, "default"),
+});
 
 export default Agents;
 ```
@@ -157,21 +168,21 @@ It is also more than some jobs need. If a single model call with tools is enough
 | Requirement        | Detail                                                                                                                            |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | Node and pnpm      | Node 24 or newer; pnpm `11.1.2`, the pinned `packageManager`                                                                      |
-| Docker             | A running engine for local development. The two images need roughly 5 GB; the first build takes several minutes                   |
+| Docker             | A running engine for local development. The two images need roughly 4 GB; the first build takes several minutes                   |
 | Cloudflare account | Workers Paid plan (Containers require it), Durable Objects with SQLite, R2, and Workers AI for the `workers` preset               |
 | Model credentials  | An OpenAI or Anthropic key for the `codex`, `claude` and `opencode` presets; nothing beyond your Cloudflare account for `workers` |
 
-In production you pay for container run time (a harness container on the `basic` instance type and a sandbox on `standard-1`, both idle-stopped after 10 minutes), R2 storage for checkpoints and backups (backups expire after 30 days), Durable Object requests and storage, and whatever your model provider bills. A session keeps its sandbox between turns, so a chatty session pays for one container pair, not one per turn. Nothing here sets a spending limit for you; [Deployment](docs/deployment.md) has the cost model and the scaling knobs.
+In production you pay for container run time (a harness and a sandbox container, both `standard-1` unless you choose other sizes, each destroyed after 10 idle minutes), R2 storage for checkpoints and backups (nothing expires them unless you add a bucket lifecycle rule), Durable Object requests and storage, and whatever your model provider bills. A session keeps its sandbox between turns, so a chatty session pays for one container pair, not one per turn. Nothing here sets a spending limit for you; [Deployment](docs/deployment.md) has the cost model and the scaling knobs.
 
 ## Develop
 
 ```sh
 git clone https://github.com/inaridiy/CF-Open-Agents-API.git && cd CF-Open-Agents-API
 pnpm install --frozen-lockfile
-pnpm check            # docs, harness, types, lint, build, scripts, CLI and Worker tests
+pnpm check            # docs, harness, types, lint, build, scripts, CLI, machine and Worker tests
 ```
 
-`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `packages/create-cf-open-agents-api` the setup CLI, and `examples/` holds the deployable Worker, the demo app and a consuming Worker. The scripted suites need no provider credentials. [CONTRIBUTING](CONTRIBUTING.md) has the first local run, every command, and which checks a change needs.
+`packages/agent-api` is the library, `packages/supervisor` the Node process that drives the native runtimes inside the harness container, `packages/create-cf-open-agents-api` the setup CLI, [`packages/durable-machine`](packages/durable-machine/README.md) the typed durable state machines the container lifecycle is built on, and `examples/` holds the deployable Worker, the demo app and a consuming Worker. The scripted suites need no provider credentials. [CONTRIBUTING](CONTRIBUTING.md) has the first local run, every command, and which checks a change needs.
 
 ## Documentation
 

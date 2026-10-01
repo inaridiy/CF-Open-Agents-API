@@ -46,17 +46,25 @@
   "containers": [
     {
       "class_name": "HarnessDO",
-      "image": "../../docker/Harness.Dockerfile",
-      "image_build_context": "../..",
-      "instance_type": "basic",
-      "max_instances": 10
+      "name": "cf-open-agents-api-demo-harness",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "harness": {
+          "dockerfile": "../../docker/Harness.Dockerfile",
+          "build_context": "../.."
+        }
+      }
     },
     {
       "class_name": "SandboxDO",
-      "image": "../../docker/Sandbox.Dockerfile",
-      "image_build_context": "../..",
-      "instance_type": "standard-1",
-      "max_instances": 10
+      "name": "cf-open-agents-api-demo-sandbox",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "sandbox": {
+          "dockerfile": "../../docker/Sandbox.Dockerfile",
+          "build_context": "../.."
+        }
+      }
     }
   ],
   "r2_buckets": [
@@ -81,9 +89,6 @@
       "entrypoint": "Agents"
     }
   ],
-  "vars": {
-    "BACKUP_BUCKET_NAME": "cf-open-agents-api-demo-workspaces"
-  },
   "ai": {
     "binding": "AI",
     "remote": true

@@ -44,7 +44,7 @@
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
     "@cloudflare/vitest-pool-workers": "0.22.0",
-    "@cloudflare/workers-types": "5.20260911.1",
+    "@cloudflare/workers-types": "5.20260930.2",
     "@effect/tsgo": "0.45.0",
     "@types/node": "24.13.4",
     "ai": "7.0.97",
@@ -58,7 +58,7 @@
     "typescript": "7.0.2",
     "ultracite": "7.11.0",
     "vitest": "4.1.11",
-    "wrangler": "4.131.1"
+    "wrangler": "4.145.0"
   },
   "engines": {
     "node": ">=24"

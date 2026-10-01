@@ -136,6 +136,20 @@ describe("durable runtime", () => {
     expect(w.log.slice(1)).toEqual(["stopContainer released", "dropSandbox"]);
   });
 
+  it("does not wake for commands queued behind one that waits for its retry", async () => {
+    const w = world();
+    const machine = runtime(memoryStore(), w);
+    await run(machine.send({ _tag: "acquire", generation: 1 }));
+    w.failing.add("stopContainer");
+    await run(machine.send({ _tag: "remove" }));
+    // stopContainer waits until 2000; dropSandbox behind it was due at 6000 (enqueue + 5 s).
+    w.now = 7000;
+    expect(machine.nextWake()).toBe(2000);
+    await run(machine.wake);
+    // The retry failed again: the next wake is its next retry, never the blocked command.
+    expect(machine.nextWake()).toBe(7000 + 2000);
+  });
+
   it("recovers commands left behind by an evicted object", async () => {
     const w = world();
     const store = memoryStore();

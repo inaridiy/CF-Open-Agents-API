@@ -39,7 +39,7 @@ export interface VendorManifest {
 
 /**
  * The build context the two Dockerfiles need, and nothing else: the workspace root, the
- * supervisor and its one workspace dependency, which is what the `COPY` lines in
+ * supervisor and its workspace dependencies, which is what the `COPY` lines in
  * `docker/Harness.Dockerfile` name, plus `.dockerignore` (read by the docker CLI from the
  * context root) and the licence documents. It must move with those `COPY` lines.
  */
@@ -52,7 +52,12 @@ const SNAPSHOT_FILES = [
   "LICENSE",
   "NOTICE",
 ] as const;
-const SNAPSHOT_DIRECTORIES = ["docker", "packages/agent-api", "packages/supervisor"] as const;
+const SNAPSHOT_DIRECTORIES = [
+  "docker",
+  "packages/durable-machine",
+  "packages/agent-api",
+  "packages/supervisor",
+] as const;
 const REQUIRED = [
   "docker/Harness.Dockerfile",
   "docker/Sandbox.Dockerfile",

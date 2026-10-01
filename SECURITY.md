@@ -14,7 +14,7 @@ The `main` branch and the latest `0.x` tag are the supported line. Earlier snaps
 
 ## Security boundaries
 
-Models and workspace code are untrusted. Model credentials stay in the private gateway Worker. Deployment code controls presets, container images, tool registrations and provisioning. The harness container has no Internet access; the sandbox container has the network policy the environment configured. Service Binding callers are trusted to authenticate users and supply tenant IDs; HTTP callers are authenticated by the deployment's `authenticate` function.
+Models and workspace code are untrusted. Model credentials stay in the private gateway Worker. Deployment code controls presets, container images, tool registrations and provisioning. The harness container starts without Internet access and reaches only the Worker-side hosts its HarnessDO intercepts; the sandbox container has the network policy the environment configured, and under `restricted` every HTTP and HTTPS request it sends passes an allow-list in the Worker. Neither container holds bucket credentials: a sandbox reaches R2 only for the one backup object its current backup or restore grants. Service Binding callers are trusted to authenticate users and supply tenant IDs; HTTP callers are authenticated by the deployment's `authenticate` function.
 
 Operators must configure authentication, resource budgets, permitted tool effects, network access and R2 retention for their deployment. Container isolation does not make external tools safe or undo their effects. A completed checkpoint records native history and files, not transactional completion of external operations.
 
@@ -24,4 +24,4 @@ A session's sandbox is kept alive between turns while it holds the last committe
 
 ### What to report
 
-Tenant isolation failures, credential exposure (model, Vault or R2), unauthorized gateway or tool access, checkpoint or artifact path traversal, sandbox or harness container escapes, and any way for workspace content to alter Worker bindings or deployment policy. Bugs in upstream runtimes or Cloudflare components may need coordinated upstream fixes. See [deployment](docs/deployment.md) and [compatibility](docs/compatibility.md) for the supported configuration and limits.
+Tenant isolation failures, credential exposure (model or Vault), a sandbox reaching R2 objects beyond its current backup grant, unauthorized gateway or tool access, checkpoint or artifact path traversal, sandbox or harness container escapes, and any way for workspace content to alter Worker bindings or deployment policy. Bugs in upstream runtimes or Cloudflare components may need coordinated upstream fixes. See [deployment](docs/deployment.md) and [compatibility](docs/compatibility.md) for the supported configuration and limits.

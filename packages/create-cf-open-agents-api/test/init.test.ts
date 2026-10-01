@@ -53,21 +53,22 @@ it("retrofit adds the API to an existing Vite Worker project", async () => {
     expect(wrangler).toMatch(
       /"tag": "v2",\n\s+"new_sqlite_classes": \["SessionDO", "TenantCatalogDO", "HarnessDO", "SandboxDO"\]/,
     );
-    expect(wrangler).toMatch(/"BACKUP_BUCKET_NAME": "my-app-workspaces"/);
-    expect(wrangler).toMatch(/"image": ".cf-open-agents-api\/docker\/Harness.Dockerfile"/);
+    expect(wrangler).not.toMatch(/BACKUP_BUCKET_NAME/);
+    expect(wrangler).toMatch(/"name": "my-app-harness",\n\s+"scheduling_policy": "durable_object"/);
+    expect(wrangler).toMatch(/"dockerfile": ".cf-open-agents-api\/docker\/Harness.Dockerfile"/);
     expect(wrangler).toMatch(
       /"binding": "AGENTS",\n\s+"service": "my-app",\n\s+"entrypoint": "Agents"/,
     );
     expect(wrangler).toMatch(/"binding": "CODE_LOADER"/);
     expect(read(dir, "src/index.ts")).toMatch(
-      /export \{ Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy \} from "\.\/agents\.js";\n$/,
+      /export \{\n  Agents,\n  Models,\n  SessionDO,\n  TenantCatalogDO,\n  HarnessDO,\n  SandboxDO,\n  ContainerEgress,\n  SandboxEgress,\n  DirectoryBackupGateway,\n\} from "\.\/agents\.js";\n$/,
     );
     expect(read(dir, "src/agents.ts")).toMatch(/defineAgentWorker<Bindings>/);
     expect(read(dir, "src/agents.ts")).not.toMatch(/export default/);
     const devVars = parseDevVars(read(dir, ".dev.vars"));
     expect(devVars.get("API_TOKEN")).toBe("t".repeat(40));
     expect(devVars.get("OPENAI_API_KEY")).toBe("sk-existing");
-    expect(devVars.get("LOCAL_BACKUPS")).toBe("true");
+    expect(devVars.has("LOCAL_BACKUPS")).toBe(false);
     const manifest = readJson<Manifest>(dir, "package.json");
     expect(manifest.dependencies["cf-open-agents-api"]).toBe(versions.CLI_VERSION);
     expect(manifest.dependencies.effect).toBe("3.21.0");
@@ -121,6 +122,66 @@ it("--force rewrites a diverged composition and gateway binding", async () => {
   });
 });
 
+it("a project from 0.5 keeps its container entries until --force moves them, and gets the new exports", async () => {
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
+    // What init wrote before the move to the durable_object scheduling policy.
+    const legacy = read(dir, "wrangler.jsonc").replace(
+      /"containers": \[[\s\S]*?\n  \],/,
+      `"containers": [
+    { "class_name": "HarnessDO", "image": ".cf-open-agents-api/docker/Harness.Dockerfile", "image_build_context": ".cf-open-agents-api", "instance_type": "basic", "max_instances": 10 },
+    { "class_name": "SandboxDO", "image": ".cf-open-agents-api/docker/Sandbox.Dockerfile", "image_build_context": ".cf-open-agents-api", "instance_type": "standard-1", "max_instances": 10 }
+  ],
+  "vars": { "BACKUP_BUCKET_NAME": "my-app-workspaces" },`,
+    );
+    writeFileSync(join(dir, "wrangler.jsonc"), legacy);
+    writeFileSync(
+      join(dir, "src/index.ts"),
+      read(dir, "src/index.ts").replace(
+        /export \{[^}]*\} from "\.\/agents\.js";/,
+        'export { Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy } from "./agents.js";',
+      ),
+    );
+    const kept = await runInit(initOptions(dir));
+    const notes = kept.plan.notes.join("\n");
+    expect(notes).toMatch(
+      /containers\[HarnessDO\] uses the default scheduling policy[\s\S]*cannot be undone/,
+    );
+    expect(notes).toMatch(/vars\.BACKUP_BUCKET_NAME is no longer read/);
+    expect(read(dir, "wrangler.jsonc")).toMatch(/"instance_type": "basic"/);
+    expect(read(dir, "src/index.ts")).toMatch(
+      /ContainerEgress,\n  SandboxEgress,\n  DirectoryBackupGateway,/,
+    );
+    expect(read(dir, "src/index.ts")).not.toMatch(/ContainerProxy/);
+    await runInit(initOptions(dir, { force: true }));
+    const moved = read(dir, "wrangler.jsonc");
+    expect(moved).not.toMatch(/instance_type|max_instances|"image":/);
+    expect(moved).toMatch(/"name": "my-app-sandbox",\n\s+"scheduling_policy": "durable_object"/);
+  });
+});
+
+it("an entry over a kept 0.5 composition is noted, not rewritten into a broken build", async () => {
+  await withFixture("vite-project", async (dir) => {
+    await runInit(initOptions(dir));
+    const old = "Agents, Models, SessionDO, TenantCatalogDO, HarnessDO, SandboxDO, ContainerProxy";
+    writeFileSync(
+      join(dir, "src/agents.ts"),
+      read(dir, "src/agents.ts").replace(/export const \{[^}]*\}/, `export const { ${old} }`),
+    );
+    const entry = read(dir, "src/index.ts").replace(
+      /export \{[^}]*\} from "\.\/agents\.js";/,
+      `export { ${old} } from "./agents.js";`,
+    );
+    writeFileSync(join(dir, "src/index.ts"), entry);
+    const kept = await runInit(initOptions(dir));
+    expect(kept.plan.notes.join("\n")).toMatch(/re-exports the classes of an older release/);
+    expect(read(dir, "src/index.ts")).toBe(entry);
+    await runInit(initOptions(dir, { force: true }));
+    expect(read(dir, "src/agents.ts")).toMatch(/DirectoryBackupGateway,\n\} = defineAgentWorker/);
+    expect(read(dir, "src/index.ts")).toMatch(/SandboxEgress,\n  DirectoryBackupGateway,\n\} from/);
+  });
+});
+
 it("an edited composition is kept without --force", async () => {
   await withFixture("vite-project", async (dir) => {
     await runInit(initOptions(dir));
@@ -171,9 +232,7 @@ it("a re-run follows the composition it already generated, not the defaults", as
       },
       reporter: silent(),
     });
-    expect(plans.updated).toEqual([
-      "secrets API_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, CLOUDFLARE_R2_ACCOUNT_ID",
-    ]);
+    expect(plans.updated).toEqual(["secrets API_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY"]);
   });
 });
 

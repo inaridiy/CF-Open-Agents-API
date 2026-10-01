@@ -16,7 +16,7 @@ This is a pnpm TypeScript workspace: a Workers API with SQLite Durable Objects, 
 | Resumable experiments or a handoff                | [.agents/PLANS.md](.agents/PLANS.md)                                                                                            |
 | A recurring validation diagnostic                 | [docs/known-issues.md](docs/known-issues.md); match the documented scope                                                        |
 
-The API is an independent implementation; its name does not imply use of Cloudflare's `agents` package. Persistence uses Kysely with synchronous SQLite transactions. The Sandbox package is pinned to the preview line and its image must match. Confirm versions in the package manifests.
+The API is an independent implementation; its name does not imply use of Cloudflare's `agents` package. Persistence uses Kysely with synchronous SQLite transactions. `@cloudflare/sandbox` is pinned and used only for `DirectoryBackup`; the `sandbox-shim` image tag in `docker/Sandbox.Dockerfile` must equal its version. Confirm versions in the package manifests.
 
 Run commands from the repository root with the pinned pnpm. `pnpm lint`, `pnpm format` (ultracite: oxlint and oxfmt) and `pnpm typecheck` (TypeScript 7 with `@effect/tsgo`) are the toolchain; format only the files you touch with `pnpm exec oxfmt <files>`. Select checks from the [validation table](CONTRIBUTING.md#validation). The scripted suites need no production credentials; Docker builds and native binaries have the prerequisites listed in README. `pnpm dev` and `pnpm dev:caller` can call live providers.
 

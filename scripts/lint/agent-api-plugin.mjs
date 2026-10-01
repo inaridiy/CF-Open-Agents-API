@@ -88,6 +88,7 @@ export const DEFAULT_ENTRYPOINTS = [
   "packages/agent-api/src/http/*.ts",
   "packages/agent-api/src/session.ts",
   "packages/agent-api/src/containers.ts",
+  "packages/agent-api/src/containers/sandbox.ts",
   "packages/agent-api/src/catalog.ts",
   "packages/agent-api/src/models.ts",
   "packages/agent-api/src/models/gateway.ts",
