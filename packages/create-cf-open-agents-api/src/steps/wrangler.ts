@@ -47,6 +47,24 @@ export interface ContainerSpec {
   scheduling_policy: "durable_object";
   images: Record<string, { dockerfile: string; build_context: string }>;
 }
+/**
+ * The classes a project moved from 0.5 binds its container objects to. A Durable Object
+ * namespace that has had a default-policy container application does not start
+ * `durable_object` containers, so the upgrade binds HARNESS and SANDBOX to new classes and
+ * the entry exports the library's classes under these names too (docs/deployment.md).
+ */
+export const UPGRADED_CLASSES: Readonly<Record<string, string>> = {
+  HarnessDO: "HarnessContainerDO",
+  SandboxDO: "SandboxContainerDO",
+};
+/** The class the configuration binds in place of `className`: itself, or its upgraded name. */
+export function boundClass(configuration: WranglerConfig, className: string): string {
+  const object = DURABLE_OBJECTS.find((entry) => entry.class_name === className);
+  const bound = configuration.durable_objects?.bindings?.find(
+    (binding) => binding.name === object?.name,
+  )?.class_name;
+  return bound !== undefined && bound === UPGRADED_CLASSES[className] ? bound : className;
+}
 const container = (worker: string, className: string, image: string, dockerfile: string) => ({
   class_name: className,
   name: `${worker}-${image}`,
@@ -58,9 +76,13 @@ const container = (worker: string, className: string, image: string, dockerfile:
     },
   },
 });
-export const containers = (worker: string): readonly ContainerSpec[] => [
-  container(worker, "HarnessDO", "harness", "Harness.Dockerfile"),
-  container(worker, "SandboxDO", "sandbox", "Sandbox.Dockerfile"),
+/** The container entries, keyed by the classes `classOf` says the bindings use. */
+export const containers = (
+  worker: string,
+  classOf: (className: string) => string = (className) => className,
+): readonly ContainerSpec[] => [
+  container(worker, classOf("HarnessDO"), "harness", "Harness.Dockerfile"),
+  container(worker, classOf("SandboxDO"), "sandbox", "Sandbox.Dockerfile"),
 ];
 /** Keys of the default scheduling policy that a `durable_object` entry must not carry. */
 const LEGACY_CONTAINER_KEYS = ["image", "image_build_context", "instance_type", "max_instances"];
@@ -137,7 +159,8 @@ function ensureDurableObjects(state: State): void {
   for (const wanted of DURABLE_OBJECTS) {
     const byName = bindings.find((binding) => binding.name === wanted.name);
     const byClass = bindings.find((binding) => binding.class_name === wanted.class_name);
-    if (byName && (byName.class_name !== wanted.class_name || byName.script_name))
+    const accepted = [wanted.class_name, UPGRADED_CLASSES[wanted.class_name]];
+    if (byName && (!accepted.includes(byName.class_name) || byName.script_name))
       throw new CliError(
         `${state.file}: Durable Object binding ${wanted.name} must be class ${wanted.class_name} in this Worker (found ${byName.class_name ?? "?"}${byName.script_name ? ` in ${byName.script_name}` : ""}). The library reads env.${wanted.name}.`,
       );
@@ -200,7 +223,7 @@ export function isSqliteClass(configuration: WranglerConfig, className: string):
 function ensureMigrations(state: State): void {
   const current = config(state);
   const migrations = current.migrations ?? [];
-  const classes = DURABLE_OBJECTS.map((object) => object.class_name);
+  const classes = DURABLE_OBJECTS.map((object) => boundClass(current, object.class_name));
   for (const name of classes) {
     const origin = classOrigin(migrations, name);
     if (origin?.storage !== "kv") continue;
@@ -233,22 +256,41 @@ function matchesSpec(existing: WranglerContainer, entry: ContainerSpec): boolean
   );
 }
 
+/**
+ * A default-policy entry is only ever noted, with or without --force: rewritten in place it
+ * keeps the class whose namespace had that application, and its containers never start.
+ */
+const legacyNote = (className: string, binding: string) =>
+  `containers[${className}] uses the default scheduling policy. This release starts its containers with scheduling_policy "durable_object", which a class that has had a default-policy container application cannot use: bind ${binding} to ${UPGRADED_CLASSES[className] ?? "a new class"}, export it from the entry, delete the old container application before deploying, and replace this entry (docs/deployment.md: upgrading from 0.5). init does not rewrite it.`;
+
 function ensureContainers(state: State): void {
-  const current = config(state).containers ?? [];
-  for (const entry of containers(state.input.name)) {
+  const configuration = config(state);
+  const current = configuration.containers ?? [];
+  for (const entry of containers(state.input.name, (name) => boundClass(configuration, name))) {
     const index = current.findIndex((existing) => existing.class_name === entry.class_name);
     const existing = current[index];
+    const original = Object.keys(UPGRADED_CLASSES).find(
+      (name) => UPGRADED_CLASSES[name] === entry.class_name,
+    );
+    const leftover = original && current.find((item) => item.class_name === original);
+    if (leftover)
+      state.notes.push(
+        `containers[${original}] is left over from 0.5 next to containers[${entry.class_name}]; remove it once its container application is deleted.`,
+      );
     if (!existing) {
       append(state, ["containers"], entry);
       continue;
     }
     const [image, wanted] = Object.entries(entry.images)[0] ?? [];
     if (matchesSpec(existing, entry)) continue;
+    if (existing.scheduling_policy !== "durable_object") {
+      const binding = DURABLE_OBJECTS.find((object) => object.class_name === entry.class_name);
+      state.notes.push(legacyNote(entry.class_name, binding?.name ?? "?"));
+      continue;
+    }
     if (!state.input.force) {
       state.notes.push(
-        existing.scheduling_policy === "durable_object"
-          ? `containers[${entry.class_name}] differs from the snapshot (images.${image ?? "?"}.dockerfile ${wanted?.dockerfile ?? "?"}); --force rewrites it.`
-          : `containers[${entry.class_name}] uses the default scheduling policy; this library starts its containers itself and needs scheduling_policy "durable_object" with images.${image ?? "?"}. That switch creates a new container application and cannot be undone; --force rewrites the entry (docs/deployment.md: upgrading from 0.5).`,
+        `containers[${entry.class_name}] differs from the snapshot (images.${image ?? "?"}.dockerfile ${wanted?.dockerfile ?? "?"}); --force rewrites it.`,
       );
       continue;
     }

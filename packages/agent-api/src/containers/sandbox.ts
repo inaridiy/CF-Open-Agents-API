@@ -29,6 +29,11 @@ export const WORKSPACE = "/workspace";
 /** R2 key prefix of 1.0 workspace backups in `BACKUP_BUCKET`. */
 const BACKUP_PREFIX = "workspaces/";
 const IDLE_MS = 10 * 60 * 1000;
+/**
+ * A new container that has not taken its intercepts and first command by then will not: the
+ * platform can leave a start pending indefinitely, and the boot must fail instead of hanging.
+ */
+const PREPARE_TIMEOUT_MS = 3 * 60 * 1000;
 /** A backup or restore that takes longer has failed; it must not hold the workspace permit. */
 const BACKUP_TIMEOUT_MS = 15 * 60 * 1000;
 /** Container ports behind the hosts a harness reaches through this object. */
@@ -200,7 +205,21 @@ export class SandboxContainer<
       throw error;
     });
     const prepared = this.prepared;
-    return io("sandbox.prepare", () => prepared);
+    return io("sandbox.prepare", () => prepared).pipe(
+      Effect.timeoutFail({
+        duration: PREPARE_TIMEOUT_MS,
+        onTimeout: () =>
+          new TransportFailure({
+            operation: "sandbox.prepare",
+            cause: new Error("The sandbox container did not become ready within 3 minutes"),
+          }),
+      }),
+      Effect.tapError(() =>
+        Effect.sync(() => {
+          if (this.prepared === prepared) this.prepared = undefined;
+        }),
+      ),
+    );
   }
   /** Boundary runner: a failure is thrown as itself so its RPC wire name survives. */
   private run<A, E>(program: Effect.Effect<A, E>): Promise<A> {
