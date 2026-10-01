@@ -280,6 +280,8 @@ const DEFINITE = {
     "checkpoint_missing",
     fixed<{ key: string }>("Native checkpoint is missing"),
   ],
+  /** The harness answered with a native checkpoint past the Worker's bound. */
+  CheckpointTooLarge: [413, "checkpoint_too_large", "Native checkpoint exceeds 64 MiB"],
   AssignmentConflict: [
     409,
     "assignment_conflict",
@@ -475,6 +477,7 @@ export class CredentialRotationInvalid extends definite("CredentialRotationInval
 export class HarnessUnknown extends definite("HarnessUnknown") {}
 export class CheckpointHarnessMismatch extends definite("CheckpointHarnessMismatch") {}
 export class CheckpointMissing extends definite("CheckpointMissing") {}
+export class CheckpointTooLarge extends definite("CheckpointTooLarge") {}
 export class AssignmentConflict extends definite("AssignmentConflict") {}
 export class NetworkPolicyConflict extends definite("NetworkPolicyConflict") {}
 export class ContainerRetired extends definite("ContainerRetired") {}

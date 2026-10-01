@@ -47,6 +47,12 @@ export class WorkspaceFileError extends Error {
 }
 
 const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+/**
+ * File operations end within these bounds: a model can turn any path into a FIFO or a
+ * device, and an operation that never returns would hold the object's permits forever.
+ */
+const FILE_TIMEOUT_MS = 60_000;
+const TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
 /** Exit codes of `timeout` when it ended the command (SIGTERM, then SIGKILL after the grace). */
 const TIMEOUT_EXITS = new Set([124, 137]);
 
@@ -69,8 +75,9 @@ function bounded(argv: readonly string[], timeoutMs: number | undefined): string
 
 /** Signals the process group `pid` leads; a group that already exited is not an error. */
 async function stopGroup(target: ExecTarget, pid: number): Promise<void> {
+  // bash's kill takes `--` before a negative process group id; dash's rejects it.
   const kill = await target.exec(
-    ["sh", "-c", 'kill -KILL -- "-$1" 2>/dev/null; true', "sh", String(pid)],
+    ["bash", "-c", 'kill -KILL -- "-$1" 2>/dev/null; true', "bash", String(pid)],
     {
       stdout: "ignore",
       stderr: "ignore",
@@ -201,7 +208,7 @@ export async function readText(
   path: string,
   maxBytes: number,
 ): Promise<string> {
-  const result = await run(target, ["cat", "--", path], { maxBytes });
+  const result = await run(target, ["cat", "--", path], { maxBytes, timeoutMs: FILE_TIMEOUT_MS });
   if (result.truncated) throw new WorkspaceFileError("readFile", path, "EFAILED", "file too large");
   if (result.exitCode !== 0) throw failed("readFile", path, result);
   return result.stdout;
@@ -212,7 +219,9 @@ export async function readStream(
   target: ExecTarget,
   path: string,
 ): Promise<ReadableStream<Uint8Array>> {
-  const process = await target.exec(["cat", "--", path], { stderr: "ignore" });
+  const process = await target.exec(bounded(["cat", "--", path], TRANSFER_TIMEOUT_MS), {
+    stderr: "ignore",
+  });
   if (!process.stdout)
     throw new WorkspaceFileError("readFile", path, "EFAILED", "no output stream");
   return process.stdout;
@@ -227,23 +236,33 @@ export async function writeFile(
   const result = await run(
     target,
     ["sh", "-c", 'mkdir -p -- "$(dirname -- "$1")" && cat > "$1"', "sh", path],
-    { stdin: content, maxBytes: 64 * 1024 },
+    { stdin: content, maxBytes: 64 * 1024, timeoutMs: TRANSFER_TIMEOUT_MS },
   );
   if (result.exitCode !== 0) throw failed("writeFile", path, result);
 }
 
 export async function mkdir(target: ExecTarget, path: string): Promise<void> {
-  const result = await run(target, ["mkdir", "-p", "--", path], { maxBytes: 64 * 1024 });
+  const result = await run(target, ["mkdir", "-p", "--", path], {
+    maxBytes: 64 * 1024,
+    timeoutMs: FILE_TIMEOUT_MS,
+  });
   if (result.exitCode !== 0) throw failed("mkdir", path, result);
 }
 
 export async function remove(target: ExecTarget, path: string): Promise<void> {
-  const result = await run(target, ["rm", "-rf", "--", path], { maxBytes: 64 * 1024 });
+  const result = await run(target, ["rm", "-rf", "--", path], {
+    maxBytes: 64 * 1024,
+    timeoutMs: FILE_TIMEOUT_MS,
+  });
   if (result.exitCode !== 0) throw failed("remove", path, result);
 }
 
 export async function exists(target: ExecTarget, path: string): Promise<boolean> {
-  return (await run(target, ["test", "-e", path], { maxBytes: 1024 })).exitCode === 0;
+  const result = await run(target, ["test", "-e", path], {
+    maxBytes: 1024,
+    timeoutMs: FILE_TIMEOUT_MS,
+  });
+  return result.exitCode === 0;
 }
 
 /** `find -printf %y` letters. */
@@ -271,7 +290,7 @@ export async function list(target: ExecTarget, directory: string): Promise<Liste
       "sh",
       directory,
     ],
-    { maxBytes: 32 * 1024 * 1024 },
+    { maxBytes: 32 * 1024 * 1024, timeoutMs: FILE_TIMEOUT_MS },
   );
   if (result.truncated)
     throw new WorkspaceFileError("list", directory, "EFAILED", "listing too large");

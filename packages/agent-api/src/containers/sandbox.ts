@@ -29,6 +29,8 @@ export const WORKSPACE = "/workspace";
 /** R2 key prefix of 1.0 workspace backups in `BACKUP_BUCKET`. */
 const BACKUP_PREFIX = "workspaces/";
 const IDLE_MS = 10 * 60 * 1000;
+/** A backup or restore that takes longer has failed; it must not hold the workspace permit. */
+const BACKUP_TIMEOUT_MS = 15 * 60 * 1000;
 /** Container ports behind the hosts a harness reaches through this object. */
 const SANDBOX_PORTS: Readonly<Record<string, number>> = {
   "sandbox.internal": 4500,
@@ -406,14 +408,19 @@ export class SandboxContainer<
 
   /** Back up `/workspace` to `BACKUP_BUCKET`; the record restores it into any later container. */
   backup(): Promise<DirectoryBackupRecord> {
-    return this.use("sandbox.backup", () => this.backups().backup({ dir: WORKSPACE }));
+    return this.use("sandbox.backup", () =>
+      this.backups().backup({ dir: WORKSPACE, signal: AbortSignal.timeout(BACKUP_TIMEOUT_MS) }),
+    );
   }
   /**
    * Replace `/workspace` with a backup. A handle written by Sandbox SDK 0.x points at a
    * SquashFS image; it is unpacked in place, and the next checkpoint stores the 1.0 form.
    */
   restore(backup: WorkspaceBackup): Promise<void> {
-    if (!isLegacy(backup)) return this.use("sandbox.restore", () => this.backups().restore(backup));
+    if (!isLegacy(backup))
+      return this.use("sandbox.restore", () =>
+        this.backups().restore(backup, { signal: AbortSignal.timeout(BACKUP_TIMEOUT_MS) }),
+      );
     return this.use("sandbox.restore.legacy", async (container) => {
       const image = await this.env.BACKUP_BUCKET.get(`backups/${backup.id}/data.sqsh`);
       if (!image) throw new StoredObjectMissing({ object: "workspace_backup" });

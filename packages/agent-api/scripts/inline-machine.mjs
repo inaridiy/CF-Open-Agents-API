@@ -10,7 +10,12 @@ const vendor = join(dist, "vendor", "durable-machine");
 const source = join(process.cwd(), "..", "durable-machine", "dist");
 await cp(source, vendor, { recursive: true });
 
+/** @type {Record<string, string>} */
 const entries = { "durable-machine": "index.js", "durable-machine/check": "check.js" };
+/**
+ * @param {string} directory
+ * @returns {AsyncGenerator<string>}
+ */
 async function* files(directory) {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
@@ -22,10 +27,15 @@ async function* files(directory) {
 let rewritten = 0;
 for await (const file of files(dist)) {
   const text = await readFile(file, "utf8");
-  const next = text.replace(/(["'])(durable-machine(?:\/check)?)\1/g, (match, quote, name) => {
-    const target = relative(dirname(file), join(vendor, entries[name])).split("\\").join("/");
-    return `${quote}${target.startsWith(".") ? target : `./${target}`}${quote}`;
-  });
+  const next = text.replace(
+    /(["'])(durable-machine(?:\/check)?)\1/g,
+    (/** @type {string} */ _match, /** @type {string} */ quote, /** @type {string} */ name) => {
+      const target = relative(dirname(file), join(vendor, entries[name] ?? "index.js"))
+        .split("\\")
+        .join("/");
+      return `${quote}${target.startsWith(".") ? target : `./${target}`}${quote}`;
+    },
+  );
   if (next !== text) {
     await writeFile(file, next);
     rewritten += 1;

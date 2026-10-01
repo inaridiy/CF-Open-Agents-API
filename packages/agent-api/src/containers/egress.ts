@@ -68,7 +68,10 @@ const matches = (pattern: string, hostname: string): boolean =>
 export class SandboxEgress extends WorkerEntrypoint<ContainerBindings, SandboxEgressProps> {
   override fetch(request: Request): Promise<Response> {
     const hostname = new URL(request.url).hostname.replace(/\.+$/, "");
-    if (this.ctx.props.allowed.some((pattern) => matches(pattern, hostname))) return fetch(request);
+    // Redirects go back to the container, whose next request is checked here again: an
+    // allowed host must not carry the sandbox to a refused one.
+    if (this.ctx.props.allowed.some((pattern) => matches(pattern, hostname)))
+      return fetch(request, { redirect: "manual" });
     return Promise.resolve(new Response("Origin is disallowed", { status: 520 }));
   }
 }

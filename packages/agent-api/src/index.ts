@@ -20,6 +20,7 @@ export {
   CheckpointHarnessMismatch,
   CheckpointIncompatible,
   CheckpointMissing,
+  CheckpointTooLarge,
   CommandRejected,
   ContainerMisconfigured,
   ContainerRetired,

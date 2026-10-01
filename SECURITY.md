@@ -20,7 +20,12 @@ Operators must configure authentication, resource budgets, permitted tool effect
 
 ### Sandbox reuse
 
-A session's sandbox is kept alive between turns while it holds the last committed workspace. State outside `/workspace`, including packages installed and files written by setup commands or by the agent, persists across those turns. It is discarded when the sandbox is restored after a cancel, a failure, a container loss or a fork. Treat everything a setup command or the model writes as visible to every later turn of that session, and do not place secrets in the sandbox: environment variables and MCP credentials for service-origin servers stay in the Worker, and environment-origin MCP servers cannot use Vault credentials for that reason.
+A session's sandbox is kept alive between turns while it holds the last committed workspace. State outside `/workspace`, including packages installed and files written by setup commands or by the agent, persists across those turns. It is discarded when the sandbox is restored after a cancel, a failure, a container loss or a fork. Treat everything a setup command or the model writes as visible to every later turn of that session, and do not place secrets in the sandbox: the environment's `env` variables are passed to every sandbox command by design, while MCP credentials for service-origin servers stay in the Worker, and environment-origin MCP servers cannot use Vault credentials for that reason.
+
+### Known limitations
+
+- Workspace code runs as root in the sandbox and can replace `/usr/local/bin/sandbox-shim`, the helper `@cloudflare/sandbox` 1.0 talks to for backups. A replacement can make a backup or restore fail, or make the SandboxDO allocate a large buffer for a frame it announces (the package checks a frame's size only for error frames). The effect stays within that session's own objects; it can fail the session's checkpoints, not reach another session.
+- Under `restricted`, the sandbox starts without Internet access, so only HTTP and HTTPS through the egress allow-list leave it; redirects are returned to the container and checked again. HTTPS clients must trust the per-container CA through the system bundle or the `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` variables the sandbox sets; a client that pins its own certificates fails instead of bypassing the policy.
 
 ### What to report
 

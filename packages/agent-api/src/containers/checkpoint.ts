@@ -7,6 +7,7 @@ import {
   ArtifactListFailed,
   CheckpointIncompatible,
   CheckpointMissing,
+  CheckpointTooLarge,
   Superseded,
   TransportFailure,
 } from "../errors.js";
@@ -17,6 +18,35 @@ import { assignment, HarnessBindings, type HarnessHost, read, releaseBody, write
 import { rememberSandbox, sandboxOf, workspaceOf } from "./workspace.js";
 
 const ARTIFACT_FILE_LIMIT = 200 * 1024 * 1024;
+/** The serialized native checkpoint the Worker buffers: the supervisor caps contents at 32 MiB. */
+const CHECKPOINT_LIMIT = 64 * 1024 * 1024;
+
+/** The stream's bytes, or `undefined` (and the stream cancelled) once it passes `limit`. */
+async function readBounded(
+  body: ReadableStream<Uint8Array>,
+  limit: number,
+): Promise<Uint8Array | undefined> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
 const ARTIFACT_TURN_LIMIT = 500 * 1024 * 1024;
 /**
  * Publish `/workspace/outputs` to R2 under a durable manifest: the manifest is committed
@@ -86,6 +116,10 @@ export function loadCheckpoint(previousCheckpoint: Checkpoint | null) {
     if (!previousCheckpoint) return;
     const object = yield* io("startAttempt", () => env.CHECKPOINTS.get(previousCheckpoint.native));
     if (!object) return yield* new CheckpointMissing({ key: previousCheckpoint.native });
+    if (object.size > CHECKPOINT_LIMIT) {
+      yield* io("startAttempt.release", () => object.body.cancel()).pipe(Effect.ignore);
+      return yield* new CheckpointTooLarge();
+    }
     return yield* io("startAttempt", () => object.json());
   });
 }
@@ -115,7 +149,9 @@ export function snapshot(host: HarnessHost, execution: Execution) {
       });
     }
     // containerFetch may return a chunked stream; R2 requires a known length.
-    const bytes = yield* io("snapshot", () => response.arrayBuffer());
+    const body = response.body as ReadableStream<Uint8Array>;
+    const bytes = yield* io("snapshot", () => readBounded(body, CHECKPOINT_LIMIT));
+    if (!bytes) return yield* new CheckpointTooLarge();
     // The checkpoint record below names this object: its outcome must be observed.
     yield* Effect.uninterruptible(io("snapshot", () => host.env.CHECKPOINTS.put(key, bytes)));
     const workspace = execution.sandbox

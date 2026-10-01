@@ -437,7 +437,12 @@ export class HarnessContainer<
         const allowedImages = remoteImageURLs(parts);
         if (allowedImages.length) {
           const digests = yield* imageDigests(allowedImages, current.imageDigests ?? []);
-          yield* write((tx) => tx.putAssignment({ ...current, imageDigests: digests }));
+          // Re-read in the write: a revocation or a spawned child may have landed meanwhile.
+          yield* write((tx) => {
+            const latest = tx.requireAssignment();
+            if (!latest.revoked && !superseded(latest, current))
+              tx.putAssignment({ ...latest, imageDigests: digests });
+          });
         }
         // Interruptible: the supervisor deduplicates control by operationId, so an aborted
         // delivery is retried by the next alarm without applying the command twice.
@@ -483,10 +488,16 @@ export class HarnessContainer<
   }
   private stopAttempt(execution: Execution) {
     return Effect.gen(this, function* () {
-      const current = yield* assignment;
-      if (superseded(current, execution)) return;
+      const before = yield* assignment;
+      if (superseded(before, execution)) return;
       this.abortCodeExecutions();
-      yield* write((tx) => tx.putAssignment({ ...current, revoked: true }));
+      // Revoke the latest record, so a child spawned since the read is stopped too.
+      const current = yield* write((tx) => {
+        const latest = tx.requireAssignment();
+        const revoked = { ...latest, revoked: true };
+        tx.putAssignment(revoked);
+        return revoked;
+      });
       // Native stderr is lost with the container; keep a bounded tail in Worker logs. A
       // container that is gone has nothing to say, and is not started to say it.
       if (current.dispatched && this.ctx.container?.running)
@@ -541,9 +552,14 @@ export class HarnessContainer<
         this.workspace.withPermits(1)(
           Effect.gen(this, function* () {
             this.abortCodeExecutions();
-            const current = yield* read((tx) => tx.assignment());
-            if (current && !current.revoked)
-              yield* write((tx) => tx.putAssignment({ ...current, revoked: true }));
+            // Revoke the latest record, so every child spawned before this is released.
+            const current = yield* write((tx) => {
+              const latest = tx.assignment();
+              if (!latest || latest.revoked) return latest;
+              const revoked = { ...latest, revoked: true };
+              tx.putAssignment(revoked);
+              return revoked;
+            });
             for (const subagentId of current?.children ?? [])
               yield* io("releaseCompute.child", () => this.child(subagentId).releaseCompute()).pipe(
                 Effect.ignore,
