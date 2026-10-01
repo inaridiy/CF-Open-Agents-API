@@ -30,13 +30,17 @@
       {
         "name": "SCRIPTED",
         "class_name": "ScriptedHarness"
+      },
+      {
+        "name": "MACHINES",
+        "class_name": "MachineFixture"
       }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["SessionDO", "CatalogDO", "ScriptedHarness"]
+      "new_sqlite_classes": ["SessionDO", "CatalogDO", "ScriptedHarness", "MachineFixture"]
     }
   ],
   "r2_buckets": [

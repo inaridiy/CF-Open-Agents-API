@@ -203,6 +203,12 @@ importers:
         specifier: 4.0.0
         version: 4.0.0(@ai-sdk/anthropic@4.0.53(zod@4.6.2))(@ai-sdk/openai@4.0.65(zod@4.6.2))(@ai-sdk/provider@4.0.13)(ai@7.0.97(zod@4.6.2))
 
+  packages/durable-machine:
+    devDependencies:
+      effect:
+        specifier: 3.22.2
+        version: 3.22.2
+
   packages/supervisor:
     dependencies:
       '@anthropic-ai/claude-agent-sdk':

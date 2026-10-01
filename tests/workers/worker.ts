@@ -21,9 +21,11 @@ import {
   createAgentService,
 } from "../../packages/agent-api/src/service.js";
 import { defineAgentWorker } from "../../packages/agent-api/src/worker.js";
+import type { MachineFixture } from "./machine-fixture.js";
 
 export interface TestEnv extends AgentBindings {
   SCRIPTED: DurableObjectNamespace<ScriptedHarness>;
+  MACHINES: DurableObjectNamespace<MachineFixture>;
   ASSETS: R2Bucket;
   AGENTS: Service<InstanceType<typeof BindingAgentWorker>>;
   MODEL_GATEWAY: Fetcher;
@@ -373,3 +375,4 @@ export const { Agents: BindingAgentWorker, Models } = defineAgentWorker<TestEnv>
   pollIntervalMs: 60_000,
 });
 export class CallerWorker extends ExampleCallerWorker {}
+export { MachineFixture } from "./machine-fixture.js";
