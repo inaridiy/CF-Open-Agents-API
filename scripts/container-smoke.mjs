@@ -589,11 +589,13 @@ try {
     const egress = (await sessions.items.list(restricted.id, { limit: 100 })).data.find(
       (item) => item.type === "command_execution",
     );
-    const codes = Object.fromEntries(
-      (egress?.type === "command_execution" ? egress.output : "")
-        .trim()
-        .split(" ")
-        .map((pair) => pair.split("=")),
+    const codes = /** @type {Record<string, string>} */ (
+      Object.fromEntries(
+        (egress?.type === "command_execution" ? egress.output : "")
+          .trim()
+          .split(" ")
+          .map((pair) => pair.split("=")),
+      )
     );
     // The refused host is answered by the policy itself; the allowed one must pass it (its
     // answer depends on the runner's own Internet access, so only "not refused" is asserted).
