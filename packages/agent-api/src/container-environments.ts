@@ -37,6 +37,9 @@ import { parseEffect } from "./protocol.js";
 import type { Checkpoint } from "./runtime.js";
 import { SqlStore } from "./storage.js";
 
+/** Every setup command (packages, files, skills, `setup_commands`) gets this long. */
+const SETUP_COMMAND_TIMEOUT_MS = 120_000;
+
 type Upload = { id: string; key: string; path: string; size: number; version: number };
 /** A skill or plugin archive to install; inline data or an immutable R2 object. */
 interface Capability {
@@ -340,12 +343,34 @@ export class EnvironmentWorkspace implements EnvironmentDriver {
         yield* this.command(sandbox, ["npm", "install", "--global", "--", ...config.packages.npm]);
     });
   }
-  /** A setup command: two minutes, and the whole process group ends with it. */
+  /**
+   * A setup command: two minutes, and the whole process group ends with it. A failure is
+   * logged with the command and the tail of its output, for the operator; the client sees
+   * the exit code or the timeout.
+   */
   private command(sandbox: Workspace, argv: [string, ...string[]], cwd = "/workspace") {
-    return io("environment.command", () => sandbox.exec(argv, { cwd, timeoutMs: 120_000 })).pipe(
-      Effect.filterOrFail(
-        (output) => output.exitCode === 0 && !output.timedOut,
-        () => new EnvironmentSetupFailed({ reason: "command" }),
+    return io("environment.command", () =>
+      sandbox.exec(argv, { cwd, timeoutMs: SETUP_COMMAND_TIMEOUT_MS }),
+    ).pipe(
+      Effect.flatMap((output) =>
+        output.exitCode === 0 && !output.timedOut
+          ? Effect.succeed(output)
+          : Effect.logWarning("Environment command failed", {
+              command: argv.join(" ").slice(0, 500),
+              cwd,
+              exitCode: output.exitCode,
+              timedOut: output.timedOut,
+              stderr: output.stderr.slice(-4000),
+              stdout: output.stdout.slice(-2000),
+            }).pipe(
+              Effect.zipRight(
+                new EnvironmentSetupFailed({
+                  reason: "command",
+                  exitCode: output.exitCode,
+                  timedOut: output.timedOut,
+                }),
+              ),
+            ),
       ),
     );
   }

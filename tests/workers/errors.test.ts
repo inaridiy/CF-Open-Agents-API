@@ -557,3 +557,16 @@ it("routes answer with the same envelope for every layer's failure", async () =>
     },
   });
 });
+
+it("tells the client how a setup command failed", () => {
+  const message = (error: EnvironmentSetupFailed) => toApiError(error).message;
+  expect(message(new EnvironmentSetupFailed({ reason: "command" }))).toBe(
+    "Environment command failed",
+  );
+  expect(message(new EnvironmentSetupFailed({ reason: "command", exitCode: 127 }))).toBe(
+    "Environment command failed with exit code 127",
+  );
+  expect(
+    message(new EnvironmentSetupFailed({ reason: "command", exitCode: 124, timedOut: true })),
+  ).toBe("Environment command timed out after 120 seconds");
+});

@@ -331,10 +331,19 @@ const DEFINITE = {
   EnvironmentSetupFailed: [
     422,
     "environment_setup_failed",
-    (p: { reason: "command" | "capability_result" }) =>
-      p.reason === "command"
+    (p: {
+      reason: "command" | "capability_result";
+      /** The command's exit code, when it ran. */
+      exitCode?: number;
+      /** The command ran past the per-command bound. */
+      timedOut?: boolean;
+    }) => {
+      if (p.reason !== "command") return "Invalid capability installation result";
+      if (p.timedOut) return "Environment command timed out after 120 seconds";
+      return p.exitCode === undefined
         ? "Environment command failed"
-        : "Invalid capability installation result",
+        : `Environment command failed with exit code ${p.exitCode}`;
+    },
   ],
   EnvironmentWriteFailed: [
     503,
