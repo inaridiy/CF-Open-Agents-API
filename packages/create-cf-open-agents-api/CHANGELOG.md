@@ -1,5 +1,11 @@
 # create-cf-open-agents-api
 
+## 0.6.2
+
+### Patch Changes
+
+- [#26](https://github.com/inaridiy/CF-Open-Agents-API/pull/26) [`d1db41e`](https://github.com/inaridiy/CF-Open-Agents-API/commit/d1db41efd1b925b2bb7e371b6653e910d6e41e4b) Thanks [@inaridiy](https://github.com/inaridiy)! - `init` and `doctor` point a project still on the default scheduling policy at the new upgrade guide, docs/upgrading.md.
+
 ## 0.6.1
 
 ### Patch Changes

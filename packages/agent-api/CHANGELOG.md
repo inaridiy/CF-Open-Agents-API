@@ -2,6 +2,12 @@
 
 Entries from 0.4.1 on are written by `changeset version` from the pull requests' changesets. Earlier entries cover the library and the setup CLI together.
 
+## 0.6.2
+
+### Patch Changes
+
+- [#27](https://github.com/inaridiy/CF-Open-Agents-API/pull/27) [`82aaa1b`](https://github.com/inaridiy/CF-Open-Agents-API/commit/82aaa1bbf5ab95063f5ea55ba4d6afa4301e3bc8) Thanks [@inaridiy](https://github.com/inaridiy)! - A harness container that does not become ready within 3 minutes now fails its boot, and the next attempt starts a new container; a start that never answered used to hold the turn until the runtime ended the alarm (about 15 minutes). A sandbox container that replaced an earlier one (after an idle stop or a platform restart) starts the servers its object served before, such as Codex's exec-server, on the first proxied request; a turn used to continue without a shell.
+
 ## 0.6.1
 
 ### Patch Changes
