@@ -51,7 +51,7 @@ export interface ContainerSpec {
  * The classes a project moved from 0.5 binds its container objects to. A Durable Object
  * namespace that has had a default-policy container application does not start
  * `durable_object` containers, so the upgrade binds HARNESS and SANDBOX to new classes and
- * the entry exports the library's classes under these names too (docs/deployment.md).
+ * the entry exports the library's classes under these names too (docs/upgrading.md).
  */
 export const UPGRADED_CLASSES: Readonly<Record<string, string>> = {
   HarnessDO: "HarnessContainerDO",
@@ -261,7 +261,7 @@ function matchesSpec(existing: WranglerContainer, entry: ContainerSpec): boolean
  * keeps the class whose namespace had that application, and its containers never start.
  */
 const legacyNote = (className: string, binding: string) =>
-  `containers[${className}] uses the default scheduling policy. This release starts its containers with scheduling_policy "durable_object", which a class that has had a default-policy container application cannot use: bind ${binding} to ${UPGRADED_CLASSES[className] ?? "a new class"}, export it from the entry, delete the old container application before deploying, and replace this entry (docs/deployment.md: upgrading from 0.5). init does not rewrite it.`;
+  `containers[${className}] uses the default scheduling policy. This release starts its containers with scheduling_policy "durable_object", which a class that has had a default-policy container application cannot use: bind ${binding} to ${UPGRADED_CLASSES[className] ?? "a new class"}, export it from the entry, delete the old container application before deploying, and replace this entry (docs/upgrading.md). init does not rewrite it.`;
 
 function ensureContainers(state: State): void {
   const configuration = config(state);

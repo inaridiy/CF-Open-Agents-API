@@ -77,7 +77,7 @@ pnpm dlx create-cf-open-agents-api@alpha setup     # buckets and secrets
 pnpm exec wrangler deploy                          # builds and pushes both images; several minutes the first time
 ```
 
-Containers need the Workers Paid plan. Workspace backups go through the `BACKUP_BUCKET` binding and need no R2 API token. A project set up by an earlier release has its own steps; see [upgrading from 0.5](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md#upgrading-from-05). See [deployment](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md) for the cost model.
+Containers need the Workers Paid plan. Workspace backups go through the `BACKUP_BUCKET` binding and need no R2 API token. A project set up by an earlier release has its own steps; see [Upgrading](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/upgrading.md). See [deployment](https://github.com/inaridiy/CF-Open-Agents-API/blob/main/docs/deployment.md) for the cost model.
 
 ## Running an unpublished checkout
 
