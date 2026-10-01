@@ -589,15 +589,24 @@ try {
     const egress = (await sessions.items.list(restricted.id, { limit: 100 })).data.find(
       (item) => item.type === "command_execution",
     );
-    assert.equal(
-      egress?.type === "command_execution" ? egress.output.trim() : undefined,
-      "200 200 520",
-      "Restricted egress",
+    const codes = Object.fromEntries(
+      (egress?.type === "command_execution" ? egress.output : "")
+        .trim()
+        .split(" ")
+        .map((pair) => pair.split("=")),
     );
+    // The refused host is answered by the policy itself; the allowed one must pass it (its
+    // answer depends on the runner's own Internet access, so only "not refused" is asserted).
+    assert.equal(codes.blocked, "520", `Restricted egress: ${JSON.stringify(codes)}`);
+    for (const scheme of ["https", "http"])
+      assert(
+        codes[scheme] && codes[scheme] !== "520",
+        `Restricted egress refused the allowed host over ${scheme}: ${JSON.stringify(codes)}`,
+      );
     await sessions.delete(restricted.id);
     sessionId = "";
     console.log(
-      "PASS: a restricted sandbox reaches its allowed domain over HTTP and HTTPS and is refused elsewhere.",
+      "PASS: a restricted sandbox passes its allowed domain over HTTP and HTTPS and is refused elsewhere.",
     );
     // Codex leaves exec-server running in the sandbox; only the objects' idle timers end it.
     const completed = async () => {

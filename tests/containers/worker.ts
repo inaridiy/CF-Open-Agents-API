@@ -416,7 +416,7 @@ async function scripted(options: StreamOptions): Promise<StreamResult> {
   if (request.includes("egress-proof"))
     return once(
       shell(
-        "for url in https://example.com/ http://example.com/ https://blocked.example.org/; do curl -s -o /dev/null -w '%{http_code} ' --max-time 20 \"$url\"; done",
+        'code() { curl -s -o /dev/null -w \'%{http_code}\' --max-time 8 "$1"; }; printf \'https=%s http=%s blocked=%s\' "$(code https://example.com/)" "$(code http://example.com/)" "$(code https://blocked.example.org/)"',
         codex,
         definitions,
       ),
