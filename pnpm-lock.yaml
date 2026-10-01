@@ -146,9 +146,6 @@ importers:
       '@cloudflare/sandbox':
         specifier: 1.0.0
         version: 1.0.0
-      durable-machine:
-        specifier: workspace:*
-        version: link:../durable-machine
       fflate:
         specifier: 0.8.3
         version: 0.8.3
@@ -168,6 +165,9 @@ importers:
       ai:
         specifier: 7.0.97
         version: 7.0.97(zod@4.6.2)
+      durable-machine:
+        specifier: workspace:*
+        version: link:../durable-machine
       effect:
         specifier: 3.22.2
         version: 3.22.2

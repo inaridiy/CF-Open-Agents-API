@@ -87,13 +87,12 @@ Containers need the Workers Paid plan. Workspace backups go through the `BACKUP_
 git clone https://github.com/inaridiy/CF-Open-Agents-API.git && cd CF-Open-Agents-API
 pnpm install --frozen-lockfile && pnpm build
 pnpm --filter cf-open-agents-api pack --pack-destination /tmp/cfo
-pnpm --filter durable-machine pack --pack-destination /tmp/cfo
 pnpm --filter create-cf-open-agents-api pack --pack-destination /tmp/cfo
 node packages/create-cf-open-agents-api/dist/cli.js init <your-project> \
   --source "$PWD" --library /tmp/cfo/cf-open-agents-api-<version>.tgz --cli-package /tmp/cfo/create-cf-open-agents-api-<version>.tgz
 ```
 
-`--source` snapshots the checkout instead of downloading a tag archive; `--library` and `--cli-package` write `file:` dependencies. The library depends on `durable-machine` at the same version; while that version is not on npm, point the project at its tarball too, for example with `overrides: { durable-machine: "file:/tmp/cfo/durable-machine-<version>.tgz" }` in `pnpm-workspace.yaml`.
+`--source` snapshots the checkout instead of downloading a tag archive; `--library` and `--cli-package` write `file:` dependencies.
 
 ## Requirements
 

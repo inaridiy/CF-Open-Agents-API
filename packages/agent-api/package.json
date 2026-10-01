@@ -45,13 +45,12 @@
     "tag": "alpha"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/inline-machine.mjs",
     "prepack": "node ../../scripts/prepare-package.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.47",
     "@cloudflare/sandbox": "1.0.0",
-    "durable-machine": "workspace:*",
     "fflate": "0.8.3",
     "hono": "^4.13.7",
     "kysely": "^0.29.5",
@@ -60,6 +59,7 @@
   },
   "devDependencies": {
     "ai": "7.0.97",
+    "durable-machine": "workspace:*",
     "effect": "3.22.2",
     "openai": "7.15.0"
   },

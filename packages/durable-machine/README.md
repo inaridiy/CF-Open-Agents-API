@@ -2,6 +2,8 @@
 
 Typed, durable state machines for Cloudflare Durable Objects, built on [Effect](https://effect.website).
 
+Not on npm yet: the package is private while its API settles, and `cf-open-agents-api` ships a copy of it in `dist/vendor/`.
+
 A Durable Object that owns something outside itself (a container, a lease, a job on another service) keeps re-learning the same lessons: a transition applied to a record read before an `await`, a state that forgets to answer an event, a resource left running on one exit path, a timer lost when the object is evicted, I/O started inside a storage transaction. `durable-machine` turns each of those into something the compiler or the runtime refuses:
 
 | Bug                                            | How it is prevented                                                                                                                                      |

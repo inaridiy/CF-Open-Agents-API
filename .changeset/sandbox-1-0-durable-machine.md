@@ -1,7 +1,6 @@
 ---
 "cf-open-agents-api": minor
 "create-cf-open-agents-api": minor
-"durable-machine": minor
 ---
 
 Move the container objects to Cloudflare's Durable Object Container API and `@cloudflare/sandbox` 1.0, and run their lifecycles on the new `durable-machine` package.
@@ -10,4 +9,4 @@ Move the container objects to Cloudflare's Durable Object Container API and `@cl
 
 Breaking: the Worker's main module exports `ContainerEgress`, `SandboxEgress` and `DirectoryBackupGateway` in place of `ContainerProxy`; `createHarness` hooks receive a `Workspace`; `BackupCredentialsMissing` is removed. Moving an existing deployment to the new scheduling policy cannot be undone; see "Upgrading from 0.5" in docs/deployment.md. `create-cf-open-agents-api init` notes legacy container entries and `init --force` rewrites them.
 
-`durable-machine` is a new package: typed state machines for Durable Objects whose transitions run inside one SQLite transaction, with exhaustive event tables, release-on-exit resources, timers on the object's alarm, a fenced outbox run by Effect, and a model-based checker.
+The lifecycles run on `durable-machine`, a new workspace package of typed state machines for Durable Objects (transitions inside one SQLite transaction, exhaustive event tables, release-on-exit resources, timers on the object's alarm, a fenced outbox run by Effect, a model-based checker). It is not published yet; the library ships a copy in `dist/vendor/`.
