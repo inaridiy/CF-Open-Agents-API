@@ -1,6 +1,6 @@
 {
   "name": "durable-machine",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "description": "Typed, durable state machines for Cloudflare Durable Objects: synchronous SQLite transitions, exhaustive event tables, release-on-exit resources, alarm-multiplexed timers, a fenced outbox run by Effect, and a model-based checker",
   "homepage": "https://github.com/inaridiy/CF-Open-Agents-API/tree/main/packages/durable-machine#readme",
