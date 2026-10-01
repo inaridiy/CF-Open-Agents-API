@@ -14,9 +14,9 @@ Each session runs two containers on Cloudflare Containers: one for the agent run
 
 **What you see.** Creating a session fails with `environment_setup_failed` (the demo shows it on the job page), or a turn stays `in_progress` without output. `pnpm exec wrangler tail` shows `Container boot failed` with the exception `The container connection is temporarily unavailable, try again shortly`.
 
-**What happens.** Now and then a newly started container does not answer its first command; the call fails after about 47 seconds. The failure stays with that session's containers: one kept failing on every restart for over ten minutes, while new sessions started normally within seconds. It hit two of five new sessions in our small sample, and none of about a dozen containers we started directly.
+**What happens.** Now and then a newly started container does not answer its first command; the call fails after about 47 seconds, or does not return at all. The failure stays with that session's containers: one kept failing on every restart for over ten minutes, while new sessions started normally within seconds. It hit two of five new sessions in our small sample, and none of about a dozen containers we started directly.
 
-**What the library does.** A container start that fails is destroyed, and the next request starts a new one. A workspace container that is not ready within 3 minutes fails the request, which is `environment_setup_failed` when a session is created. A runtime container is retried until the turn's deadline (`maxTurnMs`, 15 minutes by default).
+**What the library does.** A container that is not ready within 3 minutes fails its start, is destroyed, and the next attempt starts a new one. For the workspace container that fails the request, which is `environment_setup_failed` when a session is created; the runtime container is retried until the turn's deadline (`maxTurnMs`, 15 minutes by default). A workspace container that replaced an earlier one starts the agent's tool server again, so a turn does not continue without a shell. (Runtime start deadline and server restore: 0.6.2.)
 
 **What to do.** Create a new session (in the demo, submit the job again). If it keeps happening on your account, open an issue with the times and session ids.
 
